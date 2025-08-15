@@ -3,8 +3,9 @@ import os
 import re
 import fitz  # PyMuPDF
 import pandas as pd
+from datetime import datetime
 
-# ---------------- Core logic ----------------
+# ============ Excel parsing ============
 
 def load_table_with_dynamic_header(xlsx_path, sheet_name=None):
     """
@@ -34,13 +35,17 @@ def load_table_with_dynamic_header(xlsx_path, sheet_name=None):
 def extract_ecs_codes_from_df(df):
     """
     Pull values from 'ECS Codes' / 'ECS Code' columns and split into code-like tokens.
-    A token is kept if it contains letters & digits and has no spaces.
+    Keep tokens that contain letters AND digits, and have no spaces.
+    Returns:
+      - ecs_lower_set: set of normalized (lowercase) ECS codes
+      - original_map: dict lower->original exemplar (for pretty reporting)
     """
     if df is None or df.empty:
-        return set()
+        return set(), {}
+
     cols = [c for c in df.columns if str(c).strip().lower() in ("ecs codes", "ecs code")]
     if not cols:
-        return set()
+        return set(), {}
 
     raw_values = []
     for c in cols:
@@ -57,27 +62,57 @@ def extract_ecs_codes_from_df(df):
             if re.search(r"[A-Za-z]", t) and re.search(r"\d", t) and " " not in t:
                 tokens.append(t)
 
-    # Deduplicate case-insensitively
-    return set(t.lower() for t in tokens)
+    ecs_lower_set = set()
+    original_map = {}
+    for t in tokens:
+        low = t.lower()
+        if low not in ecs_lower_set:
+            ecs_lower_set.add(low)
+            original_map[low] = t  # preserve a nice exemplar for reports
+    return ecs_lower_set, original_map
 
-def highlight_tokens_anywhere(pdf_file, token_set_lower, out_path):
+# ============ PDF highlighting ============
+
+_SPLIT_RE = re.compile(r"[.\-_]")  # split suffix on first ., -, or _
+
+def normalize_base(token: str) -> str:
+    """Take the base part of a PDF token before the first '.', '-' or '_' (lowercased)."""
+    return _SPLIT_RE.split(token, 1)[0].strip().lower()
+
+def highlight_tokens_anywhere(pdf_file, ecs_lower_set, out_path, per_pdf_hits, matched_codes_set):
+    """
+    Highlight words anywhere in the PDF where the token's base (before '.', '-', or '_')
+    matches one of the ECS codes from Excel (case-insensitive).
+
+    Also fill:
+      - per_pdf_hits[pdf_file] = number of highlight rectangles added
+      - matched_codes_set: set of ECS base codes (lower) seen in this PDF
+    """
     doc = fitz.open(pdf_file)
     hits = 0
+
     for page in doc:
         for (x0, y0, x1, y1, wtext, b, l, n) in page.get_text("words", sort=True):
             tok = (wtext or "").strip()
-            if tok and tok.lower() in token_set_lower:
+            if not tok:
+                continue
+            base = normalize_base(tok)
+            if base and base in ecs_lower_set:
                 ann = page.add_highlight_annot(fitz.Rect(x0, y0, x1, y1))
                 ann.update()
                 hits += 1
+                matched_codes_set.add(base)
+
     # Overwrite if exists
     if os.path.exists(out_path):
         os.remove(out_path)
     doc.save(out_path)
     doc.close()
+
+    per_pdf_hits[pdf_file] = hits
     return hits
 
-# ---------------- Helpers & CLI flow ----------------
+# ============ Console helpers ============
 
 def is_excel(path):
     return path.lower().endswith((".xlsx", ".xls"))
@@ -109,8 +144,32 @@ def parse_dragdrop_line(raw):
                 paths.append(p)
     return paths
 
+# ============ NotSurveyed PDF report ============
+
+def save_missing_codes_pdf(missing_codes_list, week_number, output_folder):
+    """
+    Save a simple PDF named NotSurveyed_WK<week>.pdf listing ECS codes not found.
+    """
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet
+
+    report_pdf = os.path.join(output_folder, f"NotSurveyed_WK{week_number}.pdf")
+    styles = getSampleStyleSheet()
+    doc = SimpleDocTemplate(report_pdf)
+    elements = []
+    elements.append(Paragraph(f"Not Surveyed - Week {week_number}", styles['Title']))
+    elements.append(Spacer(1, 12))
+    elements.append(Paragraph(f"Total ECS Codes not found: {len(missing_codes_list)}", styles['Normal']))
+    elements.append(Spacer(1, 12))
+    for code in missing_codes_list:
+        elements.append(Paragraph(code, styles['Normal']))
+    doc.build(elements)
+    return report_pdf
+
+# ============ Main ============
+
 def main():
-    print("=== ECS PDF Highlighter (multi-PDF + custom output folder) ===")
+    print("=== ECS PDF Highlighter (multi-PDF + NotSurveyed report) ===")
 
     # 1) Week number
     week_number = input("Enter week number (e.g., 34): ").strip()
@@ -120,8 +179,7 @@ def main():
 
     # 2) Drag & drop files (one Excel + multiple PDFs allowed)
     print("\nDrag & drop the Excel AND one or more PDF files here, then press Enter:")
-    raw = input()
-    paths = parse_dragdrop_line(raw)
+    paths = parse_dragdrop_line(input())
 
     excel_file = None
     pdf_files = []
@@ -138,7 +196,7 @@ def main():
         print("❌ Please provide at least one PDF (.pdf).")
         sys.exit(1)
 
-    # 3) Optional: choose an output folder (or press Enter to save next to each PDF)
+    # 3) Optional output folder
     print("\nOutput folder (press Enter to save next to each PDF):")
     out_dir = input().strip()
     use_custom_outdir = bool(out_dir)
@@ -149,45 +207,59 @@ def main():
             print(f"❌ Could not create/use output folder: {e}")
             sys.exit(1)
 
-    # 4) Read Excel (dynamic header detection) and extract ECS tokens
+    # 4) Read Excel and extract ECS tokens
     print("\nReading Excel and extracting ECS codes...")
     df = load_table_with_dynamic_header(excel_file, sheet_name=0)
     if df is None:
         print("❌ Could not find a header row containing 'ECS Codes' or 'ECS Code'.")
         sys.exit(1)
 
-    ecs_tokens = extract_ecs_codes_from_df(df)
-    if not ecs_tokens:
+    ecs_lower_set, original_map = extract_ecs_codes_from_df(df)
+    if not ecs_lower_set:
         print("⚠ No ECS codes found under 'ECS Codes' / 'ECS Code'. Nothing to highlight.")
         sys.exit(0)
 
-    print(f"Found {len(ecs_tokens)} ECS code token(s). Processing PDFs...")
+    print(f"Found {len(ecs_lower_set)} ECS code token(s). Processing PDFs...")
 
-    # 5) Process each PDF
-    total_files = 0
-    total_hits = 0
+    # 5) Process each PDF & collect reporting info
+    per_pdf_hits = {}
+    overall_matched_codes = set()  # union of all bases matched across PDFs
+
     for pdf_path in pdf_files:
         if not os.path.exists(pdf_path):
             print(f" - Skipping (not found): {pdf_path}")
             continue
-        base = os.path.splitext(os.path.basename(pdf_path))[0]
-        ext = ".pdf"
-        out_folder = out_dir if use_custom_outdir else os.path.dirname(pdf_path)
-        out_path = os.path.join(out_folder, f"{base}_WK{week_number}_priorities{ext}")
 
+        base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+        out_folder = out_dir if use_custom_outdir else os.path.dirname(pdf_path)
+        out_path = os.path.join(out_folder, f"{base_name}_WK{week_number}_priorities.pdf")
+
+        matched_codes_this_pdf = set()
         try:
-            hits = highlight_tokens_anywhere(pdf_path, ecs_tokens, out_path)
-            print(f" - {os.path.basename(pdf_path)} → {os.path.basename(out_path)} (highlights: {hits})")
-            total_hits += hits
-            total_files += 1
+            hits = highlight_tokens_anywhere(pdf_path, ecs_lower_set, out_path, per_pdf_hits, matched_codes_this_pdf)
+            overall_matched_codes |= matched_codes_this_pdf
+            print(f" - {os.path.basename(pdf_path)} → {os.path.basename(out_path)} (highlights: {hits}, codes matched: {len(matched_codes_this_pdf)})")
         except Exception as e:
             print(f" - Error processing {pdf_path}: {e}")
 
-    print(f"\n✅ Done. Files processed: {total_files}, total highlights: {total_hits}")
-    if use_custom_outdir:
-        print(f"📁 Outputs saved to: {os.path.abspath(out_dir)}")
-    else:
-        print("📁 Outputs saved next to each source PDF.")
+    # 6) Compute missing (overall) and save NotSurveyed PDF
+    missing_codes_lower = sorted(list(ecs_lower_set - overall_matched_codes))
+    missing_pretty = [original_map.get(c, c) for c in missing_codes_lower]
+
+    print("\n===== Summary =====")
+    for pdf_path, hits in per_pdf_hits.items():
+        print(f"  {os.path.basename(pdf_path)}: {hits} highlights")
+    print(f"\nTotal distinct ECS codes matched across PDFs: {len(overall_matched_codes)}")
+    print(f"ECS codes NOT found (overall): {len(missing_pretty)}")
+
+    report_folder = out_dir if use_custom_outdir else os.path.dirname(pdf_files[0])
+    try:
+        report_pdf = save_missing_codes_pdf(missing_pretty, week_number, report_folder)
+        print(f"📄 NotSurveyed report saved: {report_pdf}")
+    except Exception as e:
+        print(f"⚠ Could not save NotSurveyed PDF: {e}")
+
+    print("\n✅ Done.")
 
 if __name__ == "__main__":
     try:
