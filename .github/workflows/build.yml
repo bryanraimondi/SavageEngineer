@@ -22,7 +22,7 @@ jobs:
 
       - name: Build EXE with PyInstaller
         run: |
-          pyinstaller --onefile --noconsole --name ECS_PDF_Highlighter ecs_pdf_highlighter.py
+          pyinstaller --onefile --name ECS_PDF_Highlighter ecs_pdf_highlighter.py
           echo "Built EXE:"
           dir dist
 
