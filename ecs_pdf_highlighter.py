@@ -3,10 +3,9 @@ import os
 import re
 import fitz  # PyMuPDF
 import pandas as pd
-from datetime import datetime
 
 # ========= Regex helpers =========
-_SPLIT_RE = re.compile(r"[.\-_]")  # suffix split
+_SPLIT_RE = re.compile(r"[.\-_]")  # suffix split for bases
 _STRIP_PUNCT = re.compile(r'^[\s"\'\(\)\[\]\{\}:;,]+|[\s"\'\(\)\[\]\{\}:;,]+$')
 DATE_RE = re.compile(r"\b(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4}|\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2})\b")
 
@@ -19,7 +18,6 @@ CUTS_COLS = [
 ]
 
 # ========== Excel parsing ==========
-
 def load_table_with_dynamic_header(xlsx_path, sheet_name=None):
     df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None, dtype=str)
     target = {"ecs codes", "ecs code"}
@@ -62,8 +60,7 @@ def extract_ecs_codes_from_df(df):
             original_map[low] = t
     return ecs_lower_set, original_map
 
-# ========== PDF token utils ==========
-
+# ========== Token utils ==========
 def normalize_base(token: str) -> str:
     if not token:
         return ""
@@ -78,23 +75,17 @@ def page_words(page):
     return page.get_text("words", sort=True)
 
 # ========== Header field extraction ==========
-
 HEADER_LABELS = {
-    "date": ["date"],
-    "surveyor": ["surveyor"],
-    "unit": ["unit"],
-    "building": ["building"],
-    "room": ["room", "section", "location", "room/section/location"],
-    "reference": ["reference", "references", "ref", "ref(s)"],
-    "revision": ["revision", "rev"],
+    "Date": ["date"],
+    "Surveyor": ["surveyor"],
+    "Unit": ["unit"],
+    "Building": ["building"],
+    "Room/Section/Location": ["room/section/location", "room", "section", "location"],
+    "Reference(s)": ["reference(s)", "references", "reference", "ref(s)", "ref"],
+    "Revision": ["revision", "rev"],
 }
 
 def extract_value_after_label(words, label_candidates):
-    """
-    Find label (e.g., 'Date') and return text to the right on same line,
-    or a regex date if label is missing but date pattern exists.
-    """
-    # group by (block, line)
     from collections import defaultdict
     lines = defaultdict(list)
     for (x0,y0,x1,y1,w,b,l,n) in words:
@@ -102,51 +93,32 @@ def extract_value_after_label(words, label_candidates):
     for k in lines:
         lines[k].sort(key=lambda t: t[0])
 
-    # pass 1: label + value on same line
     for (_bl, lst) in lines.items():
         tokens = [w for *_, w in lst]
         tokens_low = [t.lower().strip(":") for t in tokens]
         for i, t in enumerate(tokens_low):
             if t in label_candidates:
-                # collect remainder of line to the right
                 vals = tokens[i+1:]
                 joined = " ".join(v for v in vals if v.strip())
                 if joined:
                     return joined.strip()
 
-    # pass 2: heuristics for Date if label missing
     if "date" in label_candidates:
         all_text = " ".join(w for *_, w in words)
         m = DATE_RE.search(all_text)
         if m:
             return m.group(0)
-
     return ""
 
 def extract_header_fields_from_page(page):
     w = page_words(page)
-    def val(key):
-        return extract_value_after_label(
-            w, [s.lower() for s in HEADER_LABELS[key]]
-        )
+    out = {}
+    for key, labels in HEADER_LABELS.items():
+        out[key] = extract_value_after_label(w, [s.lower() for s in labels])
+    return out
 
-    return {
-        "Date": val("date"),
-        "Surveyor": val("surveyor"),
-        "Unit": val("unit"),
-        "Building": val("building"),
-        "Room/Section/Location": val("room"),
-        "Reference(s)": val("reference"),
-        "Revision": val("revision"),
-    }
-
-# ========== Table extraction (column-ranged by header positions) ==========
-
-def find_header_line(words, required_labels):
-    """
-    Locate a line that contains at least one of the required labels (fuzzy match by lower).
-    Returns the word-list for that line (sorted), or None.
-    """
+# ========== Table extraction with robust column bands ==========
+def find_header_line(words, required_cols):
     from collections import defaultdict
     lines = defaultdict(list)
     for (x0,y0,x1,y1,w,b,l,n) in words:
@@ -154,104 +126,82 @@ def find_header_line(words, required_labels):
     for k in lines:
         lines[k].sort(key=lambda t: t[0])
 
-    req = set(required_labels)
+    req = [re.sub(r"\s*\([^)]*\)", "", c.lower()).strip() for c in required_cols]
     best = None; best_hits = 0
     for lst in lines.values():
-        lows = [w[4].strip().lower() for w in lst]
+        lows = [re.sub(r"\s*\([^)]*\)", "", w[4].strip().lower()) for w in lst]
         hits = sum(1 for lab in req if any(lab in tok for tok in lows))
         if hits > best_hits and hits >= 1:
             best = lst; best_hits = hits
     return best
 
-def build_column_ranges(header_words, target_cols):
+def build_column_bands(header_words, target_cols):
     """
-    Given a header line (list of word tuples), build x-ranges for the target columns.
-    Strategy: for each target col, find the word in header that contains it (fuzzy),
-    then x0 is its left, x1 is left of next header word; last column extends to far right.
-    Returns dict: {canonical_col_name: (x0, x1)}
+    Build vertical bands centered on header tokens (midpoints to next token).
+    Returns dict: {canonical_col_name: (x_left, x_right, x_center)}
     """
     if not header_words:
         return {}
-
-    # Flatten header tokens
-    hdr = [(x0,y0,x1,y1,w) for (x0,y0,x1,y1,w) in header_words]
-    hdr.sort(key=lambda t: t[0])
-
-    # Build a searchable list of tokens
+    hdr = sorted([(x0,y0,x1,y1,w) for (x0,y0,x1,y1,w) in header_words], key=lambda t: t[0])
+    centers = [(w[0]+w[2])/2.0 for w in hdr]
     tokens = [w[4].strip().lower() for w in hdr]
-    xs = [w[0] for w in hdr]
 
-    col_ranges = {}
+    bands = {}
     for col in target_cols:
-        col_low = col.lower()
-        # find token that contains the column label substring
+        col_nounits = re.sub(r"\s*\([^)]*\)", "", col.lower()).strip()
         idx = None
         for i, tok in enumerate(tokens):
-            if col_low in tok:
+            tok_nounits = re.sub(r"\s*\([^)]*\)", "", tok).strip()
+            if col_nounits in tok_nounits:
                 idx = i; break
         if idx is None:
-            # tolerate exact match without units/parenthesis
-            col_nounits = re.sub(r"\s*\([^)]*\)", "", col_low).strip()
-            for i, tok in enumerate(tokens):
-                tok_nounits = re.sub(r"\s*\([^)]*\)", "", tok).strip()
-                if col_nounits == tok_nounits:
-                    idx = i; break
+            continue
+        left = (centers[idx-1] + centers[idx])/2.0 if idx-1 >= 0 else centers[idx] - 150
+        right = (centers[idx] + centers[idx+1])/2.0 if idx+1 < len(centers) else centers[idx] + 150
+        bands[col] = (left, right, centers[idx])
+    return bands
 
-        if idx is not None:
-            x0 = hdr[idx][0]
-            # x1 = next header token start or +200pt if last
-            x1 = hdr[idx+1][0] if idx+1 < len(hdr) else hdr[idx][0] + 200.0
-            col_ranges[col] = (x0, x1)
-
-    return col_ranges
-
-def extract_table_section(page, required_cols, stop_after_y=None):
+def extract_table_rows(page, target_cols):
     """
-    Extract a table section with the required columns.
-    - Detect header line that mentions at least one required col.
-    - Build column x-ranges from header.
-    - Extract rows below header, mapping cells by x-range.
-    - Stop if we pass 'stop_after_y' (used to split DESIGN and CUT LENGTHS).
-    Returns (rows:list[dict], header_y_bottom:float, col_ranges:dict)
+    Detect table header, derive col bands, then build rows below header.
+    Returns (rows:list[dict], row_y: list[float], header_y_bottom: float, bands: dict)
     """
     words = page_words(page)
-    header_line = find_header_line(words, required_cols)
+    header_line = find_header_line(words, target_cols)
     if not header_line:
-        return [], None, {}
+        return [], [], None, {}
 
     header_y_bottom = max(w[3] for w in header_line)
-    col_ranges = build_column_ranges(header_line, required_cols)
-    if not col_ranges:
-        return [], header_y_bottom, {}
+    bands = build_column_bands(header_line, target_cols)
+    if not bands:
+        return [], [], header_y_bottom, {}
 
-    rows = []
-    # Group words into lines below header
+    # group words by visual line below header
     from collections import defaultdict
     lines = defaultdict(list)
     for (x0,y0,x1,y1,w,b,l,n) in words:
         if y0 <= header_y_bottom + 0.5:
             continue
-        if stop_after_y is not None and y0 > stop_after_y:
-            continue
         lines[y0].append((x0,y0,x1,y1,w))
 
-    # sort lines top→bottom
+    rows = []
+    rows_y = []
     for y in sorted(lines.keys()):
         items = sorted(lines[y], key=lambda t: t[0])
-        row = {col: "" for col in required_cols}
+        row = {col: "" for col in target_cols}
         for (x0,y0,x1,y1,w) in items:
-            for col, (cx0, cx1) in col_ranges.items():
-                if x0 >= cx0 - 1 and x1 <= cx1 + 1:
+            xmid = (x0+x1)/2.0
+            # assign to the first band that contains center x
+            for col, (L,R,_C) in bands.items():
+                if L - 1 <= xmid <= R + 1:
                     row[col] = (row[col] + " " + w).strip()
                     break
-        # keep row if any cell is non-empty
-        if any(row[c] for c in required_cols):
+        if any(row[c] for c in target_cols):
             rows.append(row)
-
-    return rows, header_y_bottom, col_ranges
+            rows_y.append(y)
+    return rows, rows_y, header_y_bottom, bands
 
 # ========== Highlighting (first occurrence per ECS base) ==========
-
 def highlight_tokens_anywhere(pdf_file, ecs_lower_set, out_path, per_pdf_hits, matched_codes_set):
     doc = fitz.open(pdf_file)
     hits = 0
@@ -277,12 +227,10 @@ def highlight_tokens_anywhere(pdf_file, ecs_lower_set, out_path, per_pdf_hits, m
     per_pdf_hits[pdf_file] = hits
     return hits
 
-# ========== Report builders (PDF) ==========
-
+# ========== Reports ==========
 def save_missing_codes_pdf(missing_codes_list, week_number, output_folder):
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
     from reportlab.lib.styles import getSampleStyleSheet
-
     report_pdf = os.path.join(output_folder, f"NotSurveyed_WK{week_number}.pdf")
     styles = getSampleStyleSheet()
     doc = SimpleDocTemplate(report_pdf, title=f"Not Surveyed - Week {week_number}")
@@ -297,14 +245,9 @@ def save_missing_codes_pdf(missing_codes_list, week_number, output_folder):
     return report_pdf
 
 def save_consolidated_report(consolidated, week_number, output_folder):
-    """
-    consolidated: list of dict with keys:
-      'source_pdf', 'header' (dict), 'design_rows' (list of dict), 'cut_rows' (list of dict)
-    """
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.lib import colors
-
     out_pdf = os.path.join(output_folder, f"Consolidated_Survey_WK{week_number}.pdf")
     styles = getSampleStyleSheet()
     elements = []
@@ -312,12 +255,9 @@ def save_consolidated_report(consolidated, week_number, output_folder):
     for idx, item in enumerate(consolidated):
         hdr = item["header"]
         source = os.path.basename(item["source_pdf"])
-
-        # Header title
         elements.append(Paragraph(f"Survey: {source}", styles['Heading2']))
         elements.append(Spacer(1, 6))
-
-        # Header block (exact labels/order you asked)
+        # Header block
         header_lines = [
             f"Date: {hdr.get('Date','')}",
             f"Surveyor: {hdr.get('Surveyor','')}",
@@ -331,11 +271,11 @@ def save_consolidated_report(consolidated, week_number, output_folder):
             elements.append(Paragraph(line, styles['Normal']))
         elements.append(Spacer(1, 10))
 
-        # DESIGN sub-header and table
+        # DESIGN
         elements.append(Paragraph("DESIGN", styles['Heading3']))
         d_rows = item["design_rows"]
         if d_rows:
-            d_data = [ [c for c in DESIGN_COLS] ]
+            d_data = [[c for c in DESIGN_COLS]]
             for r in d_rows:
                 d_data.append([r.get(c,"") for c in DESIGN_COLS])
             t = Table(d_data, hAlign="LEFT")
@@ -350,11 +290,11 @@ def save_consolidated_report(consolidated, week_number, output_folder):
             elements.append(Paragraph("No DESIGN rows found.", styles['Italic']))
         elements.append(Spacer(1, 10))
 
-        # CUT LENGTHS sub-header and table
+        # CUT LENGTHS
         elements.append(Paragraph("CUT LENGTHS", styles['Heading3']))
         c_rows = item["cut_rows"]
         if c_rows:
-            c_data = [ [c for c in CUTS_COLS] ]
+            c_data = [[c for c in CUTS_COLS]]
             for r in c_rows:
                 c_data.append([r.get(c,"") for c in CUTS_COLS])
             t2 = Table(c_data, hAlign="LEFT")
@@ -377,8 +317,7 @@ def save_consolidated_report(consolidated, week_number, output_folder):
     doc.build(elements)
     return out_pdf
 
-# ========== Console & flow helpers ==========
-
+# ========== Console helpers ==========
 def is_excel(path): return path.lower().endswith((".xlsx", ".xls"))
 def is_pdf(path): return path.lower().endswith(".pdf")
 
@@ -397,9 +336,8 @@ def parse_dragdrop_line(raw):
     return paths
 
 # ========== MAIN ==========
-
 def main():
-    print("=== ECS PDF Highlighter + Consolidated Report ===")
+    print("=== ECS PDF Highlighter + Consolidated Report (row-matched) ===")
 
     week_number = input("Enter week number (e.g., 34): ").strip()
     if not week_number:
@@ -434,7 +372,6 @@ def main():
 
     print(f"Found {len(ecs_lower_set)} ECS codes. Processing PDFs...")
 
-    # For downstream reports
     per_pdf_hits = {}
     overall_matched = set()
     consolidated = []
@@ -444,59 +381,100 @@ def main():
             print(f" - Skipping (not found): {pdf_path}")
             continue
 
-        base = os.path.splitext(os.path.basename(pdf_path))[0]
-        out_folder = out_dir if use_custom else os.path.dirname(pdf_path)
-        highlighted_pdf = os.path.join(out_folder, f"{base}_WK{week_number}_priorities.pdf")
-
         # 1) Highlight first occurrence per ECS base
+        out_folder = out_dir if use_custom else os.path.dirname(pdf_path)
+        base = os.path.splitext(os.path.basename(pdf_path))[0]
+        highlighted_pdf = os.path.join(out_folder, f"{base}_WK{week_number}_priorities.pdf")
         matched_this_pdf = set()
         try:
             hits = highlight_tokens_anywhere(pdf_path, ecs_lower_set, highlighted_pdf, per_pdf_hits, matched_this_pdf)
             overall_matched |= matched_this_pdf
-            print(f" - Highlighted: {os.path.basename(highlighted_pdf)} (highlights: {hits}, matched codes: {len(matched_this_pdf)})")
+            print(f" - Highlighted: {os.path.basename(highlighted_pdf)} (highlights: {hits}, matched bases: {len(matched_this_pdf)})")
         except Exception as e:
             print(f" - Error highlighting {pdf_path}: {e}")
 
-        # 2) Extract header + tables (DESIGN + CUT LENGTHS)
+        # 2) Extract headers & tables, then FILTER ROWS by Support base match
         try:
             doc = fitz.open(pdf_path)
-            page = doc[0]  # header + table assumed on page 1 for metadata
-            header_vals = extract_header_fields_from_page(page)
 
-            # DESIGN section
-            d_rows, d_y, d_ranges = extract_table_section(page, DESIGN_COLS)
-            # CUT LENGTHS section — try to locate on same page; if not found, scan subsequent pages
-            c_rows, _, _ = extract_table_section(page, CUTS_COLS)
-            if not c_rows and len(doc) > 1:
+            # Header from first page
+            hdr_vals = extract_header_fields_from_page(doc[0])
+
+            # DESIGN table (page 1; if not found, scan pages)
+            design_rows, design_rows_y, _, _ = extract_table_rows(doc[0], DESIGN_COLS)
+            if not design_rows and len(doc) > 1:
                 for pidx in range(1, len(doc)):
-                    cr, _, _ = extract_table_section(doc[pidx], CUTS_COLS)
-                    if cr:
-                        c_rows = cr
+                    dr, dry, _, _ = extract_table_rows(doc[pidx], DESIGN_COLS)
+                    if dr:
+                        design_rows, design_rows_y = dr, dry
                         break
+
+            # CUT LENGTHS (same strategy)
+            cut_rows, cut_rows_y, _, _ = extract_table_rows(doc[0], CUTS_COLS)
+            if not cut_rows and len(doc) > 1:
+                for pidx in range(1, len(doc)):
+                    cr, cry, _, _ = extract_table_rows(doc[pidx], CUTS_COLS)
+                    if cr:
+                        cut_rows, cut_rows_y = cr, cry
+                        break
+
             doc.close()
 
-            # Filter rows to ECS codes (by Support base)
-            def keep_row(r):
-                sup = r.get("Support","").strip()
-                base = normalize_base(sup)
-                return bool(base) and (base in ecs_lower_set)
+            # FILTER DESIGN rows by Support base ∈ ECS set
+            keep_idx = []
+            filtered_design = []
+            for i, r in enumerate(design_rows):
+                base_sup = normalize_base(r.get("Support",""))
+                if base_sup and base_sup in ecs_lower_set:
+                    filtered_design.append({k: r.get(k,"") for k in DESIGN_COLS})
+                    keep_idx.append(i)
 
-            d_rows_f = [ {k: r.get(k,"") for k in DESIGN_COLS} for r in d_rows if keep_row(r) ]
-            c_rows_f = [ {k: r.get(k,"") for k in CUTS_COLS}   for r in c_rows   if True ]  # cut lengths may not repeat support
+            # Align CUT rows by nearest Y to kept design rows (if both tables exist)
+            filtered_cut = []
+            if cut_rows and keep_idx:
+                # simple nearest-neighbour by y
+                for i in keep_idx:
+                    y = design_rows_y[i]
+                    # find cut row with minimal |y - ycut|
+                    j_best = None; best_dy = 1e9
+                    for j, ycut in enumerate(cut_rows_y):
+                        dy = abs(y - ycut)
+                        if dy < best_dy:
+                            best_dy = dy; j_best = j
+                    if j_best is not None:
+                        filtered_cut.append({k: cut_rows[j_best].get(k,"") for k in CUTS_COLS})
+            else:
+                # if cuts table missing, leave empty
+                filtered_cut = []
 
             consolidated.append({
                 "source_pdf": pdf_path,
-                "header": header_vals,
-                "design_rows": d_rows_f,
-                "cut_rows": c_rows_f,
+                "header": hdr_vals,
+                "design_rows": filtered_design,
+                "cut_rows": filtered_cut,
             })
-        except Exception as e:
-            print(f" - Error extracting tables/headers from {pdf_path}: {e}")
 
-    # Missing-codes report (overall)
+        except Exception as e:
+            print(f" - Error extracting from {pdf_path}: {e}")
+
+    # Not Surveyed
     missing_codes_lower = sorted(list(ecs_lower_set - overall_matched))
     missing_pretty = [original_map.get(c, c) for c in missing_codes_lower]
     report_folder = out_dir if use_custom else os.path.dirname(pdf_files[0])
+
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet
+    def save_missing_codes_pdf(missing_codes_list, week_number, output_folder):
+        report_pdf = os.path.join(output_folder, f"NotSurveyed_WK{week_number}.pdf")
+        styles = getSampleStyleSheet()
+        doc = SimpleDocTemplate(report_pdf, title=f"Not Surveyed - Week {week_number}")
+        elements = [Paragraph(f"Not Surveyed - Week {week_number}", styles['Title']), Spacer(1, 12),
+                    Paragraph(f"Total ECS Codes not found: {len(missing_codes_list)}", styles['Normal']), Spacer(1, 12)]
+        for code in sorted(missing_codes_list, key=str):
+            elements.append(Paragraph(code, styles['Normal']))
+        doc.build(elements)
+        return report_pdf
+
     try:
         ns_pdf = save_missing_codes_pdf(missing_pretty, week_number, report_folder)
         print(f"📄 NotSurveyed report saved: {ns_pdf}")
@@ -510,10 +488,11 @@ def main():
     except Exception as e:
         print(f"⚠ Could not save consolidated report: {e}")
 
+    # Summary
     print("\n===== Summary =====")
     for pdf_path, hits in per_pdf_hits.items():
         print(f"  {os.path.basename(pdf_path)}: {hits} highlights")
-    print(f"Total distinct ECS codes matched across PDFs: {len(overall_matched)}")
+    print(f"Total distinct ECS bases matched across PDFs: {len(overall_matched)}")
     print(f"ECS codes NOT found (overall): {len(missing_pretty)}")
     print("\n✅ Done.")
 
