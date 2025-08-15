@@ -73,34 +73,40 @@ def extract_ecs_codes_from_df(df):
 
 # ============ PDF highlighting ============
 
-_SPLIT_RE = re.compile(r"[.\-_]")  # split suffix on first ., -, or _
-
 def normalize_base(token: str) -> str:
-    """Take the base part of a PDF token before the first '.', '-' or '_' (lowercased)."""
     return _SPLIT_RE.split(token, 1)[0].strip().lower()
 
 def highlight_tokens_anywhere(pdf_file, ecs_lower_set, out_path, per_pdf_hits, matched_codes_set):
     """
-    Highlight words anywhere in the PDF where the token's base (before '.', '-', or '_')
-    matches one of the ECS codes from Excel (case-insensitive).
-
-    Also fill:
-      - per_pdf_hits[pdf_file] = number of highlight rectangles added
-      - matched_codes_set: set of ECS base codes (lower) seen in this PDF
+    Highlight only the FIRST occurrence per ECS base code (before '.', '-', or '_')
+    across the entire PDF. Subsequent occurrences/suffixes of the same base are skipped.
     """
     doc = fitz.open(pdf_file)
     hits = 0
 
+    # Track which bases we've already highlighted in THIS PDF
+    highlighted_bases = set()
+
     for page in doc:
+        # 'sort=True' gives reading order (left-to-right, top-to-bottom),
+        # so the first variant encountered is the one we highlight.
         for (x0, y0, x1, y1, wtext, b, l, n) in page.get_text("words", sort=True):
             tok = (wtext or "").strip()
             if not tok:
                 continue
+
             base = normalize_base(tok)
-            if base and base in ecs_lower_set:
+            if not base:
+                continue
+
+            # Only highlight if:
+            #  - the base is in the ECS set
+            #  - we haven't already highlighted this base in this PDF
+            if base in ecs_lower_set and base not in highlighted_bases:
                 ann = page.add_highlight_annot(fitz.Rect(x0, y0, x1, y1))
                 ann.update()
                 hits += 1
+                highlighted_bases.add(base)
                 matched_codes_set.add(base)
 
     # Overwrite if exists
