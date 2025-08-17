@@ -23,6 +23,20 @@ def normalize_base(token: str) -> str:
     base = _SPLIT_RE.split(cleaned, 1)[0]
     return base.strip().lower()
 
+def sanitize_filename(name: str) -> str:
+    # Remove illegal filename characters on Windows and trim
+    return re.sub(r'[\\/:*?"<>|]', "_", name).strip()
+
+def uniquify_path(path: str) -> str:
+    """If path exists, append (1), (2), ... before extension to avoid overwrite."""
+    base, ext = os.path.splitext(path)
+    i = 1
+    out = path
+    while os.path.exists(out):
+        out = f"{base} ({i}){ext}"
+        i += 1
+    return out
+
 # ---------- Excel parsing ----------
 def load_table_with_dynamic_header(xlsx_path, sheet_name=None):
     """
@@ -51,15 +65,17 @@ def load_table_with_dynamic_header(xlsx_path, sheet_name=None):
 
 def extract_ecs_codes_from_df(df):
     """
-    Return a set of ECS codes (lowercased) from columns 'ECS Codes' or 'ECS Code'.
+    Return:
+      ecs_set         -> set of lowercased ECS codes
+      original_map    -> dict lowercased -> exemplar (original casing from Excel)
     We split cells by common delimiters and keep tokens that contain letters+digits and no spaces.
     """
     if df is None or df.empty:
-        return set()
+        return set(), {}
 
     cols = [c for c in df.columns if str(c).strip().lower() in ("ecs codes", "ecs code")]
     if not cols:
-        return set()
+        return set(), {}
 
     raw_values = []
     for c in cols:
@@ -75,14 +91,22 @@ def extract_ecs_codes_from_df(df):
             if re.search(r"[A-Za-z]", t) and re.search(r"\d", t) and " " not in t:
                 tokens.append(t)
 
-    return set(t.lower() for t in tokens)
+    ecs_set = set()
+    original_map = {}
+    for t in tokens:
+        low = t.lower()
+        if low not in ecs_set:
+            ecs_set.add(low)
+            original_map[low] = t
+    return ecs_set, original_map
 
-# ---------- PDF operations ----------
-def highlight_pdf_return_hits(pdf_path, ecs_lower_set, out_path, cancel_flag):
+# ---------- PDF ops ----------
+def highlight_into_combined(pdf_path, ecs_lower_set, combined_doc, cancel_flag, on_match):
     """
-    Highlight only the FIRST occurrence per ECS base (suffix-insensitive).
-    Save annotated file ONLY if hits > 0.
-    Returns: hits (int), matched_bases (set)
+    Open a PDF, add highlights for the FIRST occurrence per ECS base (suffix-insensitive).
+    If there is at least one hit, append the entire (annotated) document to combined_doc.
+    - on_match(base_code:str, display_code:str, file:str, page:int) is called for each first/base match.
+    Returns: hits (int), matched_bases (set[str])
     """
     doc = fitz.open(pdf_path)
     hits = 0
@@ -108,51 +132,34 @@ def highlight_pdf_return_hits(pdf_path, ecs_lower_set, out_path, cancel_flag):
                     hits += 1
                     highlighted_bases.add(base)
                     matched_bases.add(base)
-    finally:
-        # Save only if hits > 0 and not cancelled mid-write
+                    # notify UI about this match (page numbers are 0-based → show 1-based)
+                    on_match(base, None, os.path.basename(pdf_path), page.number + 1)
+        # append entire (annotated) doc if any hits
         if hits > 0 and not cancel_flag.is_set():
-            if os.path.exists(out_path):
-                os.remove(out_path)
-            doc.save(out_path)
+            combined_doc.insert_pdf(doc)  # all pages, with annotations
+    finally:
         doc.close()
 
     return hits, matched_bases
-
-def combine_pdfs(output_path, input_paths):
-    """
-    Combine all pages from input_paths into a single PDF at output_path.
-    """
-    if not input_paths:
-        return False
-    out = fitz.open()
-    try:
-        for p in input_paths:
-            src = fitz.open(p)
-            out.insert_pdf(src)
-            src.close()
-        if os.path.exists(output_path):
-            os.remove(output_path)
-        out.save(output_path)
-        return True
-    finally:
-        out.close()
 
 # ---------- GUI App ----------
 class HighlighterApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ECS PDF Highlighter")
-        self.geometry("720x520")
-        self.minsize(680, 520)
+        self.geometry("900x640")
+        self.minsize(880, 620)
 
         # State
         self.excel_path = tk.StringVar()
         self.week_number = tk.StringVar()
+        self.building_name = tk.StringVar()
         self.output_dir = tk.StringVar()
         self.pdf_list = []
         self.cancel_flag = threading.Event()
         self.worker_thread = None
         self.msg_queue = queue.Queue()
+        self.ecs_original_map = {}  # filled at runtime for pretty display
 
         self._build_ui()
         self._poll_messages()
@@ -160,12 +167,15 @@ class HighlighterApp(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 8, "pady": 6}
 
-        # Row 0: Week number
-        fr_week = ttk.Frame(self)
-        fr_week.pack(fill="x", **pad)
-        ttk.Label(fr_week, text="Week Number (e.g., 34):").pack(side="left")
-        self.ent_week = ttk.Entry(fr_week, width=10, textvariable=self.week_number)
+        # Row 0: Week number + Building name
+        fr_top = ttk.Frame(self)
+        fr_top.pack(fill="x", **pad)
+        ttk.Label(fr_top, text="Week Number (e.g., 34):").pack(side="left")
+        self.ent_week = ttk.Entry(fr_top, width=10, textvariable=self.week_number)
         self.ent_week.pack(side="left", padx=8)
+        ttk.Label(fr_top, text="Building Name:").pack(side="left", padx=(16, 0))
+        self.ent_bldg = ttk.Entry(fr_top, width=30, textvariable=self.building_name)
+        self.ent_bldg.pack(side="left", padx=8, fill="x", expand=True)
 
         # Row 1: Excel picker
         fr_excel = ttk.Frame(self)
@@ -185,7 +195,7 @@ class HighlighterApp(tk.Tk):
         ttk.Button(btns, text="Remove Selected", command=self._remove_selected).pack(side="left", padx=6)
         ttk.Button(btns, text="Clear List", command=self._clear_list).pack(side="left")
 
-        self.lst_pdfs = tk.Listbox(fr_pdfs, height=10, selectmode=tk.EXTENDED)
+        self.lst_pdfs = tk.Listbox(fr_pdfs, height=8, selectmode=tk.EXTENDED)
         self.lst_pdfs.pack(fill="both", expand=True, padx=6, pady=(0,6))
 
         # Row 3: Output folder
@@ -196,7 +206,18 @@ class HighlighterApp(tk.Tk):
         self.ent_out.pack(side="left", expand=True, fill="x", padx=8)
         ttk.Button(fr_out, text="Select…", command=self._pick_output_dir).pack(side="left")
 
-        # Row 4: Progress + Controls
+        # Row 4: Match log (Treeview)
+        fr_log = ttk.LabelFrame(self, text="Matches (ECS Code | File | Page)")
+        fr_log.pack(fill="both", expand=True, **pad)
+
+        cols = ("code", "file", "page")
+        self.tree = ttk.Treeview(fr_log, columns=cols, show="headings", height=8)
+        for c, w in zip(cols, (220, 420, 60)):
+            self.tree.heading(c, text=c.capitalize())
+            self.tree.column(c, width=w, anchor="w" if c != "page" else "center")
+        self.tree.pack(fill="both", expand=True, padx=6, pady=6)
+
+        # Row 5: Progress + Controls
         fr_prog = ttk.Frame(self)
         fr_prog.pack(fill="x", **pad)
         self.prog = ttk.Progressbar(fr_prog, orient="horizontal", mode="determinate", maximum=100)
@@ -259,6 +280,10 @@ class HighlighterApp(tk.Tk):
         if not week:
             messagebox.showwarning("Week Number", "Please enter a week number (e.g., 34).")
             return
+        bldg = self.building_name.get().strip()
+        if not bldg:
+            messagebox.showwarning("Building Name", "Please enter the building name.")
+            return
         excel = self.excel_path.get().strip()
         if not excel or not os.path.exists(excel):
             messagebox.showwarning("Excel", "Please select a valid Excel file.")
@@ -269,7 +294,6 @@ class HighlighterApp(tk.Tk):
 
         out_dir = self.output_dir.get().strip()
         if not out_dir:
-            # default: next to the first PDF
             out_dir = os.path.dirname(self.pdf_list[0])
             self.output_dir.set(out_dir)
         os.makedirs(out_dir, exist_ok=True)
@@ -280,9 +304,11 @@ class HighlighterApp(tk.Tk):
         self.lbl_status.config(text="Starting…")
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
+        for i in self.tree.get_children():
+            self.tree.delete(i)
 
         # spawn worker
-        args = (week, excel, list(self.pdf_list), out_dir)
+        args = (week, bldg, excel, list(self.pdf_list), out_dir)
         self.worker_thread = threading.Thread(target=self._worker, args=args, daemon=True)
         self.worker_thread.start()
 
@@ -296,14 +322,18 @@ class HighlighterApp(tk.Tk):
             if not messagebox.askyesno("Exit", "Processing is still running. Stop and exit?"):
                 return
             self.cancel_flag.set()
-            # we won't join here to avoid blocking UI; let the thread finish promptly
         self.destroy()
 
     # ----- Background worker -----
-    def _worker(self, week_number, excel_path, pdf_paths, out_dir):
-        # Helper to push messages safely to UI
+    def _worker(self, week_number, building_name, excel_path, pdf_paths, out_dir):
         def post(msg_type, payload=None):
             self.msg_queue.put((msg_type, payload))
+
+        # function called when a match is found (from worker thread)
+        def on_match(base_lower, display_code, file_name, page_num):
+            # choose pretty display using Excel's original exemplar if available
+            pretty = self.ecs_original_map.get(base_lower, base_lower)
+            post("match", (pretty, file_name, page_num))
 
         try:
             post("status", "Reading Excel…")
@@ -311,36 +341,45 @@ class HighlighterApp(tk.Tk):
             if df is None:
                 post("error", "Could not find a header row containing 'ECS Codes' or 'ECS Code' in the Excel.")
                 return
-            ecs = extract_ecs_codes_from_df(df)
+            ecs, original_map = extract_ecs_codes_from_df(df)
             if not ecs:
                 post("error", "No ECS codes found under 'ECS Codes'/'ECS Code'.")
                 return
+            self.ecs_original_map = original_map  # save for pretty display
 
             total = len(pdf_paths)
             done = 0
-            annotated_paths = []
-            overall_matched = set()
+            overall_matched_bases = set()
+
+            bldg_tag = sanitize_filename(building_name)
+            combined_out_base = os.path.join(out_dir, f"{bldg_tag}_Highlighted_WK{week_number}.pdf")
+            combined_out_path = uniquify_path(combined_out_base)
+
+            # combined doc of all annotated reports with at least one hit
+            combined_doc = fitz.open()
 
             for pdf in pdf_paths:
                 if self.cancel_flag.is_set():
                     post("status", "Cancelled.")
                     break
 
-                base = os.path.splitext(os.path.basename(pdf))[0]
-                per_pdf_out = os.path.join(out_dir, f"{base}_WK{week_number}_priorities.pdf")
                 post("status", f"Processing: {os.path.basename(pdf)}")
 
                 try:
-                    hits, matched = highlight_pdf_return_hits(pdf, ecs, per_pdf_out, self.cancel_flag)
+                    hits, matched = highlight_into_combined(
+                        pdf_path=pdf,
+                        ecs_lower_set=ecs,
+                        combined_doc=combined_doc,
+                        cancel_flag=self.cancel_flag,
+                        on_match=on_match
+                    )
                 except Exception as e:
                     post("status", f"Error: {os.path.basename(pdf)} → {e}")
-                    hits = 0
-                    matched = set()
+                    hits, matched = 0, set()
 
                 if hits > 0 and not self.cancel_flag.is_set():
-                    annotated_paths.append(per_pdf_out)
-                    overall_matched |= matched
-                    post("status", f"Saved: {os.path.basename(per_pdf_out)} (hits: {hits})")
+                    overall_matched_bases |= matched
+                    post("status", f"Added to combined: {os.path.basename(pdf)} (hits: {hits})")
                 else:
                     post("status", f"No highlights: {os.path.basename(pdf)}")
 
@@ -348,17 +387,15 @@ class HighlighterApp(tk.Tk):
                 percent = int((done / total) * 100)
                 post("progress", percent)
 
-            # Combine only the annotated PDFs
+            # Save combined annotated output (only if there is at least one page)
             if not self.cancel_flag.is_set():
-                if annotated_paths:
-                    combined_out = os.path.join(out_dir, f"Highlighted_WK{week_number}.pdf")
-                    ok = combine_pdfs(combined_out, annotated_paths)
-                    if ok:
-                        post("status", f"Combined saved: {os.path.basename(combined_out)}")
-                    else:
-                        post("status", "No combined file created.")
+                if combined_doc.page_count > 0:
+                    combined_doc.save(combined_out_path)
+                    post("status", f"Combined saved: {os.path.basename(combined_out_path)}")
                 else:
-                    post("status", "No PDFs had highlights; nothing to combine.")
+                    post("status", "No reports had highlights; no combined file created.")
+
+            combined_doc.close()
 
         except Exception as e:
             post("error", f"Unexpected error: {e}")
@@ -374,6 +411,9 @@ class HighlighterApp(tk.Tk):
                     self.lbl_status.config(text=str(payload))
                 elif msg_type == "progress":
                     self.prog["value"] = int(payload)
+                elif msg_type == "match":
+                    code, file_name, page_num = payload
+                    self.tree.insert("", "end", values=(code, file_name, page_num))
                 elif msg_type == "error":
                     self.lbl_status.config(text="Error")
                     messagebox.showerror("Error", str(payload))
@@ -384,10 +424,8 @@ class HighlighterApp(tk.Tk):
                         self.lbl_status.config(text="Finished.")
                     else:
                         self.lbl_status.config(text="Stopped.")
-                # no else; ignore unknown
         except queue.Empty:
             pass
-        # schedule next poll
         self.after(80, self._poll_messages)
 
 if __name__ == "__main__":
