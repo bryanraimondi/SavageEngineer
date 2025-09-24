@@ -145,7 +145,8 @@ def highlight_to_temp(pdf_path, ecs_compare_set, cancel_flag, on_match, ignore_l
                 # Optionally ignore a single leading digit on the PDF token base
                 cmp_base = base[1:] if (ignore_leading_digit and base and base[0].isdigit()) else base
                 if cmp_base and (cmp_base in ecs_compare_set) and (cmp_base not in highlighted_bases):
-                    rect = fitz.Rect(x0, y0, x1, y1)
+                    line_rects = page.search_for(wtext)
+                rect = line_rects[0] if line_rects else fitz.Rect(x0, y0, x1, y1)
                     ann = page.add_highlight_annot(rect)
                     ann.update()
                     hits += 1
@@ -703,7 +704,8 @@ class HighlighterApp(tk.Tk):
             messagebox.showwarning("CSV", f"Could not save NotSurveyed CSV:\n{e}")
 
 # ---------- main ----------
-if __name__ == "__main__":
+# To avoid command prompt window, run with pythonw or use --noconsole when packaging with PyInstaller
+
     try:
         app = HighlighterApp()
         app.mainloop()
