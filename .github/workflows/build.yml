@@ -1,33 +1,36 @@
-name: Build Windows EXE
+name: Build ECS PDF Highlighter
 
 on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
 
-      - name: Build EXE with PyInstaller
-        run: |
-          pyinstaller --onefile --name ECS_PDF_Highlighter ecs_pdf_highlighter.py
-          echo "Built EXE:"
-          dir dist
+    - name: Build executable with PyInstaller
+      run: |
+        pyinstaller ecs_pdf_highlighter.spec
 
-      - name: Upload EXE artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ECS_PDF_Highlighter
-          path: dist/ECS_PDF_Highlighter.exe
+    - name: Upload executable artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: ecs_pdf_highlighter_exe
+        path: dist/ecs_pdf_highlighter/
