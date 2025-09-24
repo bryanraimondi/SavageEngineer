@@ -5,12 +5,10 @@ on:
   push:
     branches: [ main ]
     paths:
+      - "ecs_pdf_highlighter.py"
       - "ecs_pdf_highlighter.spec"
-      - "**/*.py"
       - "requirements.txt"
       - ".github/workflows/build.yml"
-  pull_request:
-    branches: [ main ]
 
 jobs:
   build-windows:
@@ -40,8 +38,7 @@ jobs:
           Remove-Item -Recurse -Force .\dist -ErrorAction SilentlyContinue
 
       - name: Build with spec
-        run: |
-          pyinstaller --noconfirm ecs_pdf_highlighter.spec
+        run: pyinstaller --noconfirm ecs_pdf_highlighter.spec
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
