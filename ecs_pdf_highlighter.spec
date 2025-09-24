@@ -16,7 +16,7 @@ for m in ("tkinterdnd2", "fitz"):  # fitz = PyMuPDF
         pass
 
 a = Analysis(
-    ['ecs_pdf_highlighter_modified.py'],  # <<< CHANGE if your script name differs
+    ['ecs_pdf_highlighter.py'],  # <<< CHANGE if your script name differs
     pathex=['.'],
     binaries=binaries,
     datas=datas,
