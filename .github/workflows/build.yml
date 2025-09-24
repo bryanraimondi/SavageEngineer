@@ -30,7 +30,7 @@ jobs:
         pyinstaller ecs_pdf_highlighter.spec
 
     - name: Upload executable artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: ecs_pdf_highlighter_exe
         path: dist/ecs_pdf_highlighter/
