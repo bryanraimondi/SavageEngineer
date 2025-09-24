@@ -10,19 +10,27 @@ from tkinter import ttk, filedialog, messagebox
 import fitz  # PyMuPDF
 import pandas as pd
 
-# ---------- Token helpers (suffix-insensitive, punctuation-safe) ----------
-_SPLIT_RE = re.compile(r"[.\-_]")  # split on first '.', '-', or '_'
-_STRIP_PUNCT = re.compile(r'^[\s"\'\(\)\[\]\{\}:;,]+|[\s"\'\(\)\[\]\{\}:;,]+$')
+# ---------- Dash handling + token helpers ----------
+DASH_CHARS = "-\u2010\u2011\u2012\u2013\u2014\u2212"  # -, ‐, -, ‒, –, —, −
+_STRIP_PUNCT = re.compile(r'^[\s"\'\(\)\[\]\{\}:;,\.]+|[\s"\'\(\)\[\]\{\}:;,\.]+$')  # no hyphen here!
+
+def unify_dashes(s: str) -> str:
+    if not s:
+        return s
+    out = s
+    for ch in DASH_CHARS[1:]:
+        out = out.replace(ch, "-")
+    return out.replace("\u00AD", "")  # soft hyphen
 
 def normalize_base(token: str) -> str:
-    """Trim stray punctuation and return base before first . - or _ (lowercased)."""
+    """Lowercase, strip stray punctuation (not hyphens), and unify dash variants."""
     if not token:
         return ""
     cleaned = _STRIP_PUNCT.sub("", token)
     if not cleaned:
         return ""
-    base = _SPLIT_RE.split(cleaned, 1)[0]
-    return base.strip().lower()
+    cleaned = unify_dashes(cleaned)
+    return cleaned.strip().lower()
 
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', "_", name).strip()
@@ -64,9 +72,8 @@ def load_table_with_dynamic_header(xlsx_path, sheet_name=None):
 def extract_ecs_codes_from_df(df):
     """
     Return:
-      ecs_set         -> set of lowercased ECS codes
-      original_map    -> dict lowercased -> exemplar (original casing from Excel)
-    We split cells by common delimiters and keep tokens that contain letters+digits and no spaces.
+      ecs_set         -> set of normalized, lowercased ECS codes
+      original_map    -> dict normalized_lower -> exemplar (original casing from Excel)
     """
     if df is None or df.empty:
         return set(), {}
@@ -90,8 +97,8 @@ def extract_ecs_codes_from_df(df):
     ecs_set = set()
     original_map = {}
     for t in tokens:
-        low = t.lower()
-        if low not in ecs_set:
+        low = normalize_base(t)
+        if low and (low not in ecs_set):
             ecs_set.add(low)
             original_map[low] = t
     return ecs_set, original_map
@@ -111,13 +118,13 @@ def build_ecs_compare_set(ecs_lower_set, ignore_leading_digit):
 
 def highlight_to_temp(pdf_path, ecs_compare_set, cancel_flag, on_match, ignore_leading_digit, out_dir):
     """
-    Open a PDF, add highlights for the FIRST occurrence per ECS base (suffix-insensitive).
+    Open a PDF, add highlights for the FIRST occurrence per ECS code (normalized).
     - Matching uses ecs_compare_set; if ignore_leading_digit=True, a leading digit
       on the PDF token base is ignored.
     - Writes an annotated TEMP PDF (in output dir) *only if there are hits* and returns its path.
     Returns:
       hits (int),
-      matched_bases (set[str])  -> always the *comparison* base used,
+      matched_bases (set[str])  -> normalized ECS codes matched,
       tmp_path (str or None),
       hit_pages_sorted (list[int]) -> 0-based page indices with at least one hit,
       total_pages (int)
@@ -139,21 +146,27 @@ def highlight_to_temp(pdf_path, ecs_compare_set, cancel_flag, on_match, ignore_l
                 tok = (wtext or "").strip()
                 if not tok:
                     continue
-                base = normalize_base(tok)
+
+                base = normalize_base(tok)  # lower + dash-unified
                 if not base:
                     continue
-                # Optionally ignore a single leading digit on the PDF token base
-                cmp_base = base[1:] if (ignore_leading_digit and base and base[0].isdigit()) else base
+
+                cmp_base = base[1:] if (ignore_leading_digit and base[0:1].isdigit()) else base
+
                 if cmp_base and (cmp_base in ecs_compare_set) and (cmp_base not in highlighted_bases):
-                    line_rects = page.search_for(wtext)
-                rect = line_rects[0] if line_rects else fitz.Rect(x0, y0, x1, y1)
+                    # Try exact literal search for prettier highlight; fallback to word box
+                    rects = page.search_for(wtext) or []
+                    rect = rects[0] if rects else fitz.Rect(x0, y0, x1, y1)
+
                     ann = page.add_highlight_annot(rect)
                     ann.update()
+
                     hits += 1
                     page_hits += 1
                     highlighted_bases.add(cmp_base)
                     matched_bases.add(cmp_base)
                     on_match(cmp_base, os.path.basename(pdf_path), page.number + 1)
+
             if page_hits > 0:
                 hit_pages.add(page.number)
 
@@ -191,10 +204,9 @@ def combine_from_selection(out_path, selections, only_highlighted_pages):
                 if only_highlighted_pages:
                     pages = sorted(list(item["keep_pages"])) if item.get("keep_pages") else item["hit_pages"]
                     if pages:
-                        out.insert_pdf(src, page_numbers=pages)
+                        out.insert_pdf(src, pages=pages)  # <-- correct kwarg
                 else:
-                    # full document (all pages), because user wants headers etc.
-                    out.insert_pdf(src)
+                    out.insert_pdf(src)  # full doc
             finally:
                 src.close()
         out_path = uniquify_path(out_path)
@@ -203,13 +215,8 @@ def combine_from_selection(out_path, selections, only_highlighted_pages):
     finally:
         out.close()
 
-# ---------- Review dialog (select pages to keep) ----------
+# ---------- Review dialog ----------
 class ReviewDialog(tk.Toplevel):
-    """
-    Simple modal dialog that lists (File, Page) rows for pages that had highlights.
-    Double-click a row toggles keep/remove. Buttons: Select All / Clear / OK / Cancel.
-    After OK, caller reads self.selection which maps tmp_path -> set(0-based page indexes to keep).
-    """
     def __init__(self, master, items):
         super().__init__(master)
         self.title("Review highlighted pages to keep")
@@ -218,7 +225,6 @@ class ReviewDialog(tk.Toplevel):
         self.transient(master)
         self.grab_set()
 
-        # items is a list of dicts: {"display":file, "tmp_path":..., "hit_pages":[...]}
         self.tree = ttk.Treeview(self, columns=("keep", "file", "page"), show="headings", selectmode="extended")
         self.tree.heading("keep", text="Keep")
         self.tree.heading("file", text="File")
@@ -228,9 +234,8 @@ class ReviewDialog(tk.Toplevel):
         self.tree.column("page", width=80, anchor="center")
         self.tree.pack(fill="both", expand=True, padx=8, pady=8)
 
-        # keep map: tmp_path -> set(pages)
         self.keep_map = {}
-        self._row_mapping = {}  # iid -> (tmp_path, page)
+        self._row_mapping = {}
 
         for it in items:
             tmp = it["tmp_path"]
@@ -249,7 +254,7 @@ class ReviewDialog(tk.Toplevel):
         ttk.Button(btns, text="OK", command=self._ok).pack(side="right")
         ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right", padx=6)
 
-        self.selection = None  # set after OK
+        self.selection = None
 
     def _toggle_keep(self, event):
         iid = self.tree.identify_row(event.y)
@@ -295,16 +300,16 @@ class HighlighterApp(tk.Tk):
         self.building_name = tk.StringVar()
         self.output_dir = tk.StringVar()
 
-        self.only_highlighted_var = tk.BooleanVar(value=True)  # 1) only print highlighted pages
-        self.review_pages_var = tk.BooleanVar(value=True)      # 2) review pages to keep
-        self.ignore_lead_digit_var = tk.BooleanVar(value=False) # 3) ignore leading digit option
+        self.only_highlighted_var = tk.BooleanVar(value=True)
+        self.review_pages_var = tk.BooleanVar(value=True)
+        self.ignore_lead_digit_var = tk.BooleanVar(value=False)
 
         self.pdf_list = []
         self.cancel_flag = threading.Event()
         self.worker_thread = None
         self.msg_queue = queue.Queue()
         self.ecs_original_map = {}
-        self.row_to_fullpath = {}  # for double-click open
+        self.row_to_fullpath = {}
 
         self._build_ui()
         self._poll_messages()
@@ -312,7 +317,6 @@ class HighlighterApp(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 8, "pady": 6}
 
-        # Row 0: Week + Building
         fr_top = ttk.Frame(self)
         fr_top.pack(fill="x", **pad)
         ttk.Label(fr_top, text="Week Number (e.g., 34):").pack(side="left")
@@ -322,14 +326,12 @@ class HighlighterApp(tk.Tk):
         self.ent_bldg = ttk.Entry(fr_top, width=30, textvariable=self.building_name)
         self.ent_bldg.pack(side="left", padx=8, fill="x", expand=True)
 
-        # Row 1: Options
         fr_opts = ttk.Frame(self)
         fr_opts.pack(fill="x", **pad)
         ttk.Checkbutton(fr_opts, text="Only keep highlighted pages", variable=self.only_highlighted_var).pack(side="left")
         ttk.Checkbutton(fr_opts, text="Review pages before saving", variable=self.review_pages_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Ignore leading digit in PDF codes (e.g., 1HLX… → HLX…)", variable=self.ignore_lead_digit_var).pack(side="left", padx=12)
 
-        # Row 2: Excel picker
         fr_excel = ttk.Frame(self)
         fr_excel.pack(fill="x", **pad)
         ttk.Label(fr_excel, text="Excel (ECS Codes):").pack(side="left")
@@ -337,20 +339,15 @@ class HighlighterApp(tk.Tk):
         self.ent_excel.pack(side="left", expand=True, fill="x", padx=8)
         ttk.Button(fr_excel, text="Browse…", command=self._pick_excel).pack(side="left")
 
-        # Row 3: PDFs list + buttons
         fr_pdfs = ttk.LabelFrame(self, text="PDFs to Process")
         fr_pdfs.pack(fill="both", expand=True, **pad)
-
-        btns = ttk.Frame(fr_pdfs)
-        btns.pack(fill="x", padx=6, pady=6)
+        btns = ttk.Frame(fr_pdfs); btns.pack(fill="x", padx=6, pady=6)
         ttk.Button(btns, text="Add PDFs…", command=self._add_pdfs).pack(side="left")
         ttk.Button(btns, text="Remove Selected", command=self._remove_selected).pack(side="left", padx=6)
         ttk.Button(btns, text="Clear List", command=self._clear_list).pack(side="left")
-
         self.lst_pdfs = tk.Listbox(fr_pdfs, height=7, selectmode=tk.EXTENDED)
         self.lst_pdfs.pack(fill="both", expand=True, padx=6, pady=(0,6))
 
-        # Row 4: Output folder
         fr_out = ttk.Frame(self)
         fr_out.pack(fill="x", **pad)
         ttk.Label(fr_out, text="Output Folder:").pack(side="left")
@@ -358,10 +355,8 @@ class HighlighterApp(tk.Tk):
         self.ent_out.pack(side="left", expand=True, fill="x", padx=8)
         ttk.Button(fr_out, text="Select…", command=self._pick_output_dir).pack(side="left")
 
-        # Row 5: Match log (Treeview + dbl-click to open)
         fr_log = ttk.LabelFrame(self, text="Matches (ECS Code | File | Page) — double-click to open file")
         fr_log.pack(fill="both", expand=True, **pad)
-
         cols = ("code", "file", "page")
         self.tree = ttk.Treeview(fr_log, columns=cols, show="headings", height=10)
         for c, w in zip(cols, (260, 540, 70)):
@@ -370,7 +365,6 @@ class HighlighterApp(tk.Tk):
         self.tree.pack(fill="both", expand=True, padx=6, pady=6)
         self.tree.bind("<Double-1>", self._open_row_pdf)
 
-        # Row 6: Progress + Controls
         fr_prog = ttk.Frame(self)
         fr_prog.pack(fill="x", **pad)
         self.prog = ttk.Progressbar(fr_prog, orient="horizontal", mode="determinate", maximum=100)
@@ -388,18 +382,12 @@ class HighlighterApp(tk.Tk):
 
     # ----- UI actions -----
     def _pick_excel(self):
-        path = filedialog.askopenfilename(
-            title="Select Excel with ECS Codes",
-            filetypes=[("Excel files", "*.xlsx *.xls")]
-        )
+        path = filedialog.askopenfilename(title="Select Excel with ECS Codes", filetypes=[("Excel files", "*.xlsx *.xls")])
         if path:
             self.excel_path.set(path)
 
     def _add_pdfs(self):
-        paths = filedialog.askopenfilenames(
-            title="Select PDFs",
-            filetypes=[("PDF files", "*.pdf")]
-        )
+        paths = filedialog.askopenfilenames(title="Select PDFs", filetypes=[("PDF files", "*.pdf")])
         if paths:
             for p in paths:
                 if p not in self.pdf_list:
@@ -445,10 +433,8 @@ class HighlighterApp(tk.Tk):
             messagebox.showwarning("PDFs", "Please add at least one PDF.")
             return
 
-        out_dir = self.output_dir.get().strip()
-        if not out_dir:
-            out_dir = os.path.dirname(self.pdf_list[0])
-            self.output_dir.set(out_dir)
+        out_dir = self.output_dir.get().strip() or os.path.dirname(self.pdf_list[0])
+        self.output_dir.set(out_dir)
         os.makedirs(out_dir, exist_ok=True)
 
         # reset UI
@@ -462,14 +448,7 @@ class HighlighterApp(tk.Tk):
         self.row_to_fullpath.clear()
 
         # spawn worker
-        args = (
-            week,
-            bldg,
-            excel,
-            list(self.pdf_list),
-            out_dir,
-            bool(self.ignore_lead_digit_var.get()),
-        )
+        args = (week, bldg, excel, list(self.pdf_list), out_dir, bool(self.ignore_lead_digit_var.get()))
         self.worker_thread = threading.Thread(target=self._worker, args=args, daemon=True)
         self.worker_thread.start()
 
@@ -499,7 +478,6 @@ class HighlighterApp(tk.Tk):
             os.startfile(fullpath or file_display)  # Windows
         except Exception:
             try:
-                # mac / linux fallback
                 if sys.platform == "darwin":
                     os.system(f'open "{fullpath or file_display}"')
                 else:
@@ -528,7 +506,6 @@ class HighlighterApp(tk.Tk):
                 return
             self.ecs_original_map = original_map
 
-            # Comparison set (with/without leading digit)
             ecs_compare = build_ecs_compare_set(ecs, ignore_leading_digit)
 
             total = len(pdf_paths)
@@ -539,8 +516,7 @@ class HighlighterApp(tk.Tk):
             combined_base = os.path.join(out_dir, f"{bldg_tag}_Highlighted_WK{week_number}.pdf")
             combined_out_path = uniquify_path(combined_base)
 
-            # Collect temp annotated files + hit pages for optional review
-            processed = []  # list of dicts per file
+            processed = []
             for pdf in pdf_paths:
                 if self.cancel_flag.is_set():
                     post("status", "Cancelled.")
@@ -570,14 +546,12 @@ class HighlighterApp(tk.Tk):
                     post("status", f"No highlights: {os.path.basename(pdf)}")
 
                 done += 1
-                post("progress", int((done / total) * 100))
+                post("progress", int((done / total) * 100 if total else 100))
 
-            # Prepare data for review / combination
             if self.cancel_flag.is_set():
                 post("done", None)
                 return
 
-            # Post to UI for review/combination stage
             post("review_data", {
                 "processed": processed,
                 "overall_matched_bases": list(overall_matched_bases),
@@ -608,7 +582,6 @@ class HighlighterApp(tk.Tk):
                 elif msg_type == "match":
                     code, file_name, page_num = payload
                     iid = self.tree.insert("", "end", values=(code, file_name, page_num))
-                    # store a best-effort full path for open; look up by file_name in current list
                     full = next((p for p in self.pdf_list if os.path.basename(p) == file_name), None)
                     if full:
                         self.row_to_fullpath[iid] = full
@@ -618,17 +591,12 @@ class HighlighterApp(tk.Tk):
                     messagebox.showerror("Error", str(payload))
 
                 elif msg_type == "review_data":
-                    # Finalize: optional review and combine + CSV for missing codes
                     self._finalize_and_save(payload)
 
                 elif msg_type == "done":
-                    # background worker is finished
                     self.btn_start.config(state="normal")
                     self.btn_stop.config(state="disabled")
-                    if not self.cancel_flag.is_set():
-                        # keep whatever status is current
-                        pass
-                    else:
+                    if self.cancel_flag.is_set():
                         self.lbl_status.config(text="Stopped.")
 
         except queue.Empty:
@@ -638,7 +606,7 @@ class HighlighterApp(tk.Tk):
 
     # ----- finalize: review pages + combine + CSV of missing -----
     def _finalize_and_save(self, bundle):
-        processed = bundle["processed"]               # list of {display, src_full, tmp_path, hit_pages, total_pages}
+        processed = bundle["processed"]
         overall_matched_bases = set(bundle["overall_matched_bases"])
         ecs_compare = set(bundle["ecs_compare"])
         combined_out_path = bundle["combined_out_path"]
@@ -651,8 +619,7 @@ class HighlighterApp(tk.Tk):
             self.lbl_status.config(text="No highlighted reports.")
             return
 
-        # Optionally review highlighted pages and select which to keep
-        keep_map = {}  # tmp_path -> set(0-based pages to keep)
+        keep_map = {}
         if self.review_pages_var.get():
             items = [{"display": p["display"], "tmp_path": p["tmp_path"], "hit_pages": p["hit_pages"]} for p in processed]
             dlg = ReviewDialog(self, items)
@@ -662,10 +629,8 @@ class HighlighterApp(tk.Tk):
                 return
             keep_map = dlg.selection
         else:
-            # Default: keep all highlighted pages
             keep_map = {p["tmp_path"]: set(p["hit_pages"]) for p in processed}
 
-        # Build selections for combiner
         only_highlighted = bool(self.only_highlighted_var.get())
         selections = []
         for p in processed:
@@ -676,7 +641,6 @@ class HighlighterApp(tk.Tk):
                 "keep_pages": keep_map.get(p["tmp_path"], set(p["hit_pages"]))
             })
 
-        # Combine and save
         try:
             final_path = combine_from_selection(
                 out_path=combined_out_path,
@@ -691,7 +655,6 @@ class HighlighterApp(tk.Tk):
             self.lbl_status.config(text="Combine failed.")
             return
 
-        # 4) CSV of values not found (using comparison set)
         try:
             missing = sorted(list(ecs_compare - overall_matched_bases))
             if missing:
@@ -704,11 +667,13 @@ class HighlighterApp(tk.Tk):
             messagebox.showwarning("CSV", f"Could not save NotSurveyed CSV:\n{e}")
 
 # ---------- main ----------
-# To avoid command prompt window, run with pythonw or use --noconsole when packaging with PyInstaller
-
+if __name__ == "__main__":
     try:
         app = HighlighterApp()
         app.mainloop()
     except Exception as e:
-        messagebox.showerror("Fatal Error", str(e))
+        try:
+            messagebox.showerror("Fatal Error", str(e))
+        except Exception:
+            pass
         sys.exit(1)
