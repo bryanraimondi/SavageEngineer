@@ -1,36 +1,50 @@
 name: Build ECS PDF Highlighter
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main ]
+    paths:
+      - "ecs_pdf_highlighter.spec"
+      - "**/*.py"
+      - "requirements.txt"
+      - ".github/workflows/build.yml"
   pull_request:
     branches: [ main ]
-  workflow_dispatch:
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+          pip install pyinstaller
 
-    - name: Build executable with PyInstaller
-      run: |
-        pyinstaller ecs_pdf_highlighter.spec
+      - name: Clean previous builds
+        run: |
+          Remove-Item -Recurse -Force .\build -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force .\dist -ErrorAction SilentlyContinue
 
-    - name: Upload executable artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ecs_pdf_highlighter_exe
-        path: dist/ecs_pdf_highlighter/
+      - name: Build with spec
+        run: |
+          pyinstaller --noconfirm ecs_pdf_highlighter.spec
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecs_pdf_highlighter_exe
+          path: dist/ecs_pdf_highlighter.exe
