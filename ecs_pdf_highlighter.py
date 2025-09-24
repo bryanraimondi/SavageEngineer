@@ -184,9 +184,9 @@ def combine_from_selection(out_path, selections, only_highlighted_pages):
     selections: list of dicts:
       {
         "tmp_path": str,
-        "hit_pages": list[int],  # 0-based
-        "total_pages": int
-        "keep_pages": set[int] or None  # if review selected; 0-based
+        "hit_pages": list[int],   # 0-based
+        "total_pages": int,
+        "keep_pages": set[int] or None
       }
     If review not used, keep_pages is None.
     If only_highlighted_pages is True:
@@ -197,18 +197,25 @@ def combine_from_selection(out_path, selections, only_highlighted_pages):
     out = fitz.open()
     try:
         for item in selections:
-            if not item["tmp_path"]:
+            tmp = item.get("tmp_path")
+            if not tmp:
                 continue
-            src = fitz.open(item["tmp_path"])
-            try:
+            with fitz.open(tmp) as src:
                 if only_highlighted_pages:
-                    pages = sorted(list(item["keep_pages"])) if item.get("keep_pages") else item["hit_pages"]
-                    if pages:
-                        out.insert_pdf(src, pages=pages)  # <-- correct kwarg
+                    pages = sorted(list(item.get("keep_pages") or item.get("hit_pages") or []))
+                    if not pages:
+                        continue
+                    # Try new API first (pages=...), then fall back to per-page insertion
+                    try:
+                        out.insert_pdf(src, pages=pages)           # newer PyMuPDF
+                    except TypeError:
+                        # Older PyMuPDF: no 'pages' kw — insert each page individually
+                        for p in pages:
+                            out.insert_pdf(src, from_page=p, to_page=p)
                 else:
-                    out.insert_pdf(src)  # full doc
-            finally:
-                src.close()
+                    # Keep entire annotated document
+                    out.insert_pdf(src)
+
         out_path = uniquify_path(out_path)
         out.save(out_path)
         return out_path
