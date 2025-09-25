@@ -162,17 +162,19 @@ def scan_pdf_for_rects(pdf_path, ecs_compare_set, cancel_flag,
     finally:
         doc.close()
 
-# ---------- Combine (from ORIGINAL PDFs) ----------
-def combine_from_selection(out_path, selections, only_highlighted_pages):
+# ---------- Combine (from ORIGINAL PDFs) with optional BURN ----------
+def combine_from_selection(out_path, selections, only_highlighted_pages, burn_highlights=False, highlight_rects_color=(1,1,0), highlight_fill_opacity=0.25):
     """
     selections: list of dicts:
       {
         "pdf_path": str,
-        "hit_pages": list[int],  # 0-based
-        "keep_pages": set[int] or None
+        "hit_pages": list[int],          # 0-based
+        "keep_pages": set[int] or None,  # chosen in review (0-based)
+        "rects_by_page": dict[int -> list[(x0,y0,x1,y1)]]
       }
-    If only_highlighted_pages True -> insert only keep_pages (or hit_pages if None).
-    Else -> insert entire document(s).
+    - If only_highlighted_pages True -> copy only keep_pages (or hit_pages if None).
+    - Else -> copy entire document(s).
+    - If burn_highlights True -> draw translucent yellow rectangles on the copied pages.
     """
     out = fitz.open()
     try:
@@ -180,19 +182,36 @@ def combine_from_selection(out_path, selections, only_highlighted_pages):
             pdf_path = item.get("pdf_path")
             if not pdf_path:
                 continue
+            rects_by_page = item.get("rects_by_page", {})
             with fitz.open(pdf_path) as src:
                 if only_highlighted_pages:
                     pages = sorted(list(item.get("keep_pages") or item.get("hit_pages") or []))
-                    if not pages:
-                        continue
-                    # Newer PyMuPDF supports pages=[...]; older needs per-page
-                    try:
-                        out.insert_pdf(src, pages=pages)
-                    except TypeError:
-                        for p in pages:
-                            out.insert_pdf(src, from_page=p, to_page=p)
                 else:
-                    out.insert_pdf(src)
+                    pages = list(range(src.page_count))
+
+                for p in pages:
+                    # copy one page
+                    try:
+                        out.insert_pdf(src, from_page=p, to_page=p)
+                    except TypeError:
+                        # Very old PyMuPDF still supports from/to; keep same
+                        out.insert_pdf(src, from_page=p, to_page=p)
+
+                    # last page is the one we just inserted
+                    out_pg = out.load_page(out.page_count - 1)
+
+                    if burn_highlights and p in rects_by_page:
+                        for (x0, y0, x1, y1) in rects_by_page[p]:
+                            r = fitz.Rect(x0, y0, x1, y1)
+                            # filled translucent rect (burned highlight)
+                            out_pg.draw_rect(
+                                r,
+                                color=highlight_rects_color,  # outline (yellow)
+                                fill=highlight_rects_color,   # fill (yellow)
+                                fill_opacity=highlight_fill_opacity,
+                                width=0.5
+                            )
+
         out_path = uniquify_path(out_path)
         out.save(out_path)
         return out_path
@@ -271,8 +290,7 @@ class ReviewDialog(tk.Toplevel):
         self.stat = ttk.Label(controls, text="—"); self.stat.pack(side="right")
 
         # Buttons
-        btns = ttk.Frame(self)
-        btns.pack(fill="x", padx=8, pady=(6, 8))
+        btns = ttk.Frame(self); btns.pack(fill="x", padx=8, pady=(6, 8))
         ttk.Button(btns, text="Select All", command=self._select_all).pack(side="left")
         ttk.Button(btns, text="Clear All", command=self._clear_all).pack(side="left", padx=6)
         ttk.Button(btns, text="OK", command=self._ok).pack(side="right")
@@ -341,10 +359,7 @@ class ReviewDialog(tk.Toplevel):
             with fitz.open(pdf_path) as doc:
                 pg = doc.load_page(page_idx)
                 mat = fitz.Matrix(self._zoom, self._zoom)
-                try:
-                    pix = pg.get_pixmap(matrix=mat, alpha=False)
-                except Exception:
-                    pix = pg.get_pixmap()
+                pix = pg.get_pixmap(matrix=mat, alpha=False)
                 png_bytes = pix.tobytes("png")
                 b64 = base64.b64encode(png_bytes).decode("ascii")
                 img = tk.PhotoImage(data=b64)
@@ -382,6 +397,7 @@ class HighlighterApp(tk.Tk):
         self.review_pages_var = tk.BooleanVar(value=True)
         self.ignore_lead_digit_var = tk.BooleanVar(value=False)
         self.highlight_all_var = tk.BooleanVar(value=True)
+        self.burn_highlights_var = tk.BooleanVar(value=True)  # NEW
 
         self.pdf_list = []
         self.cancel_flag = threading.Event()
@@ -406,6 +422,7 @@ class HighlighterApp(tk.Tk):
         ttk.Checkbutton(fr_opts, text="Review pages before saving", variable=self.review_pages_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Ignore leading digit in PDF codes", variable=self.ignore_lead_digit_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Highlight every occurrence", variable=self.highlight_all_var).pack(side="left", padx=12)
+        ttk.Checkbutton(fr_opts, text="Burn highlights into output", variable=self.burn_highlights_var).pack(side="left", padx=12)
 
         fr_excel = ttk.Frame(self); fr_excel.pack(fill="x", **pad)
         ttk.Label(fr_excel, text="Excel (ECS Codes):").pack(side="left")
@@ -499,7 +516,8 @@ class HighlighterApp(tk.Tk):
         args = (
             week, bldg, excel, list(self.pdf_list), out_dir,
             bool(self.ignore_lead_digit_var.get()),
-            bool(self.highlight_all_var.get())
+            bool(self.highlight_all_var.get()),
+            bool(self.burn_highlights_var.get())
         )
         self.worker_thread = threading.Thread(target=self._worker, args=args, daemon=True)
         self.worker_thread.start()
@@ -513,7 +531,7 @@ class HighlighterApp(tk.Tk):
 
     # ----- Worker -----
     def _worker(self, week_number, building_name, excel_path, pdf_paths,
-                out_dir, ignore_leading_digit, highlight_all_occurrences):
+                out_dir, ignore_leading_digit, highlight_all_occurrences, burn_highlights):
         def post(msg_type, payload=None):
             self.msg_queue.put((msg_type, payload))
         def on_match(base_lower, file_name, page_num):
@@ -578,7 +596,8 @@ class HighlighterApp(tk.Tk):
                 "combined_out_path": combined_out_path,
                 "building_name": building_name,
                 "week_number": week_number,
-                "out_dir": out_dir
+                "out_dir": out_dir,
+                "burn_highlights": burn_highlights
             })
         except Exception as e:
             post("error", f"Unexpected error: {e}")
@@ -626,6 +645,7 @@ class HighlighterApp(tk.Tk):
         building_name = bundle["building_name"]
         week_number = bundle["week_number"]
         out_dir = bundle["out_dir"]
+        burn_highlights = bool(bundle.get("burn_highlights", True))
 
         if not processed:
             messagebox.showinfo("No Matches", "No pages matched; nothing to save.")
@@ -654,14 +674,16 @@ class HighlighterApp(tk.Tk):
             selections.append({
                 "pdf_path": p["pdf_path"],
                 "hit_pages": p["hit_pages"],
-                "keep_pages": keep_map.get(p["pdf_path"], set(p["hit_pages"]))
+                "keep_pages": keep_map.get(p["pdf_path"], set(p["hit_pages"])),
+                "rects_by_page": p["rects_by_page"]
             })
 
         try:
             final_path = combine_from_selection(
                 out_path=combined_out_path,
                 selections=selections,
-                only_highlighted_pages=only_highlighted
+                only_highlighted_pages=only_highlighted,
+                burn_highlights=burn_highlights
             )
             if final_path:
                 self.lbl_status.config(text=f"Saved: {os.path.basename(final_path)}")
