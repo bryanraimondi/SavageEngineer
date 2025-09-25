@@ -217,22 +217,35 @@ class ReviewDialog(tk.Toplevel):
     def __init__(self, master, items):
         super().__init__(master)
         self.title("Review highlighted pages to keep")
-        self.geometry("720x420")
+        self.geometry("1100x700")
+        self.minsize(980, 600)
         self.transient(master)
         self.grab_set()
 
-        self.tree = ttk.Treeview(self, columns=("keep", "file", "page"),
-                                 show="headings", selectmode="extended")
+        # ===== LAYOUT =====
+        wrapper = ttk.Frame(self)
+        wrapper.pack(fill="both", expand=True, padx=8, pady=8)
+
+        left = ttk.Frame(wrapper)
+        left.pack(side="left", fill="both", expand=True)
+        right = ttk.Frame(wrapper)
+        right.pack(side="right", fill="both", expand=True, padx=(8, 0))
+
+        ttk.Label(left, text="Pages (double-click to toggle keep):").pack(anchor="w")
+
+        self.tree = ttk.Treeview(left, columns=("keep", "file", "page"),
+                                 show="headings", selectmode="browse", height=22)
         self.tree.heading("keep", text="Keep")
         self.tree.heading("file", text="File")
         self.tree.heading("page", text="Page")
         self.tree.column("keep", width=60, anchor="center")
-        self.tree.column("file", width=480, anchor="w")
-        self.tree.column("page", width=80, anchor="center")
-        self.tree.pack(fill="both", expand=True, padx=8, pady=8)
+        self.tree.column("file", width=520, anchor="w")
+        self.tree.column("page", width=70, anchor="center")
+        self.tree.pack(fill="both", expand=True)
 
-        self.keep_map = {}
-        self._row_mapping = {}
+        # Keep state
+        self.keep_map: dict[str, set[int]] = {}
+        self._row_mapping: dict[str, tuple[str, int]] = {}  # iid -> (tmp_path, page_index)
 
         for it in items:
             tmp = it["tmp_path"]
@@ -242,19 +255,61 @@ class ReviewDialog(tk.Toplevel):
                 iid = self.tree.insert("", "end", values=("[x]", disp, p + 1))
                 self._row_mapping[iid] = (tmp, p)
 
-        self.tree.bind("<Double-1>", self._toggle_keep)
+        # ===== PREVIEW =====
+        ttk.Label(right, text="Preview").pack(anchor="w")
 
+        # Scrollable canvas
+        canvas_frame = ttk.Frame(right)
+        canvas_frame.pack(fill="both", expand=True)
+
+        self.canvas = tk.Canvas(canvas_frame, bg="#202020", highlightthickness=0)
+        xscroll = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self.canvas.xview)
+        yscroll = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
+
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        canvas_frame.rowconfigure(0, weight=1)
+        canvas_frame.columnconfigure(0, weight=1)
+
+        self._preview_img = None      # keep reference to PhotoImage
+        self._tmp_png_path = None     # last temp image path
+        self._zoom = 1.25
+
+        # Controls
+        controls = ttk.Frame(right)
+        controls.pack(fill="x", pady=(6, 0))
+        ttk.Button(controls, text="Zoom -", command=lambda: self._change_zoom(-0.15)).pack(side="left")
+        ttk.Button(controls, text="Zoom +", command=lambda: self._change_zoom(+0.15)).pack(side="left", padx=6)
+        self.stat = ttk.Label(controls, text="—")
+        self.stat.pack(side="right")
+
+        # Buttons
         btns = ttk.Frame(self)
-        btns.pack(fill="x", padx=8, pady=(0,8))
+        btns.pack(fill="x", padx=8, pady=(6, 8))
         ttk.Button(btns, text="Select All", command=self._select_all).pack(side="left")
         ttk.Button(btns, text="Clear All", command=self._clear_all).pack(side="left", padx=6)
         ttk.Button(btns, text="OK", command=self._ok).pack(side="right")
         ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right", padx=6)
 
-        self.selection = None
+        # Bindings
+        self.tree.bind("<Double-1>", self._toggle_keep)
+        self.tree.bind("<<TreeviewSelect>>", self._preview_selected)
 
-    def _toggle_keep(self, event):
-        iid = self.tree.identify_row(event.y)
+        # Auto-select first row to show a preview right away
+        if self.tree.get_children():
+            first = self.tree.get_children()[0]
+            self.tree.selection_set(first)
+            self.tree.focus(first)
+            self._preview_selected()
+
+        # Clean temp images on close
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    # ===== Keep / selection logic =====
+    def _toggle_keep(self, event=None):
+        iid = self.tree.identify_row(event.y) if event else self.tree.focus()
         if not iid:
             return
         tmp, page = self._row_mapping[iid]
@@ -277,11 +332,71 @@ class ReviewDialog(tk.Toplevel):
 
     def _ok(self):
         self.selection = self.keep_map
+        self._cleanup_temp_image()
         self.destroy()
 
     def _cancel(self):
         self.selection = None
+        self._cleanup_temp_image()
         self.destroy()
+
+    # ===== Preview rendering =====
+    def _change_zoom(self, delta):
+        new_zoom = max(0.3, min(3.0, self._zoom + delta))
+        if abs(new_zoom - self._zoom) > 1e-6:
+            self._zoom = new_zoom
+            self._preview_selected()
+
+    def _preview_selected(self, event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        tmp, page_idx = self._row_mapping[iid]
+        self._render_page(tmp, page_idx)
+
+    def _render_page(self, tmp_pdf, page_idx):
+        self.stat.config(text=f"{os.path.basename(tmp_pdf)} — page {page_idx+1}")
+        try:
+            doc = fitz.open(tmp_pdf)
+            page = doc.load_page(page_idx)
+            mat = fitz.Matrix(self._zoom, self._zoom)
+            # Try with annotations; fallback if older PyMuPDF lacks 'annots' parameter
+            try:
+                pix = page.get_pixmap(matrix=mat, alpha=False, annots=True)
+            except TypeError:
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+            # Save to a temp PNG and display
+            self._cleanup_temp_image()
+            fd, path = tempfile.mkstemp(suffix=".png", prefix="ecs_preview_")
+            os.close(fd)
+            pix.save(path)
+            self._tmp_png_path = path
+
+            img = tk.PhotoImage(file=path)
+            self._preview_img = img
+            self.canvas.delete("all")
+            self.canvas.create_image(0, 0, anchor="nw", image=img)
+            self.canvas.config(scrollregion=(0, 0, img.width(), img.height()))
+        except Exception as e:
+            self.canvas.delete("all")
+            self.canvas.create_text(10, 10, anchor="nw", fill="white",
+                                    text=f"Preview error:\n{e}")
+        finally:
+            try:
+                doc.close()
+            except Exception:
+                pass
+
+    def _cleanup_temp_image(self):
+        try:
+            if self._tmp_png_path and os.path.exists(self._tmp_png_path):
+                os.remove(self._tmp_png_path)
+        except Exception:
+            pass
+        finally:
+            self._tmp_png_path = None
+
 
 # ---------- GUI App ----------
 class HighlighterApp(tk.Tk):
