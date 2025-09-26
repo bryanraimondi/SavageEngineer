@@ -9,6 +9,7 @@ from tkinter import ttk, filedialog, messagebox
 
 import fitz  # PyMuPDF
 import pandas as pd
+from collections import defaultdict
 
 # ---------- Dash handling + token helpers ----------
 DASH_CHARS = "-\u2010\u2011\u2012\u2013\u2014\u2212"  # -, ‐, -, ‒, –, —, −
@@ -66,7 +67,7 @@ def load_table_with_dynamic_header(xlsx_path, sheet_name=None):
     return data
 
 def extract_ecs_codes_from_df(df):
-    """Return (ecs_set_lower, original_map_lower_to_original)."""
+    """Return (ecs_primary_set_lower, original_map_lower_to_original_string)."""
     if df is None or df.empty:
         return set(), {}
     cols = [c for c in df.columns if str(c).strip().lower() in ("ecs codes", "ecs code")]
@@ -93,40 +94,61 @@ def extract_ecs_codes_from_df(df):
             original_map[low] = t
     return ecs_set, original_map
 
-# ---------- PDF scan (NO TEMP FILES) ----------
-def build_ecs_compare_set(ecs_lower_set, ignore_leading_digit):
+# ---------- Search set helpers ----------
+def build_ecs_compare_set(ecs_primary, ignore_leading_digit):
     """
-    If ignore_leading_digit is True, also add versions of ECS codes without a single leading digit.
+    Compare set is used for matching. If ignore_leading_digit=True, also include
+    versions of codes with a single leading digit stripped.
     """
     if not ignore_leading_digit:
-        return set(ecs_lower_set)
-    comp = set(ecs_lower_set)
-    for code in ecs_lower_set:
+        return set(ecs_primary)
+    comp = set(ecs_primary)
+    for code in ecs_primary:
         if code and code[0].isdigit():
             comp.add(code[1:])
     return comp
 
+def build_alias_maps(ecs_primary, original_map, ignore_leading_digit):
+    """
+    Returns:
+      alias_to_primary: maps stripped variants -> their primary key
+      pretty_for_primary: maps primary key -> original (pretty) string from Excel
+    """
+    alias_to_primary = {}
+    if ignore_leading_digit:
+        for primary in ecs_primary:
+            if primary and primary[0].isdigit():
+                alias_to_primary[primary[1:]] = primary
+    pretty_for_primary = dict(original_map)
+    return alias_to_primary, pretty_for_primary
+
+# ---------- PDF scan (NO TEMP FILES) ----------
 def scan_pdf_for_rects(pdf_path, ecs_compare_set, cancel_flag,
                        on_match, ignore_leading_digit, highlight_all_occurrences=False):
     """
-    Scan a PDF and return per-page rectangles for matches (no annotations, no temp files).
-    Returns:
-      hits (int),
-      matched_bases (set[str]),
-      rects_by_page (dict[int -> list[(x0,y0,x1,y1)]]),
-      total_pages (int)
+    Scan a PDF and return:
+      hits (int)                         # rectangles counted
+      matched_bases (set[str])           # compare-keys matched anywhere in this file
+      rects_by_page (dict[int -> list[(x0,y0,x1,y1)]])   # for preview/highlighting
+      code_pages   (dict[cmp_base -> set[int]])          # which pages (0-based) had each code
+      total_pages  (int)
+    Notes:
+      - We always record pages per code even if highlight_all_occurrences=False.
+      - When highlight_all_occurrences=False, we still highlight *once per code per page*.
     """
     doc = fitz.open(pdf_path)
     hits = 0
     matched_bases = set()
     rects_by_page = {}
-    seen_bases_global = set()  # for "first occurrence per PDF" mode
+    code_pages = defaultdict(set)
 
     try:
         for page in doc:
             if cancel_flag.is_set():
                 break
             page_rects = []
+            seen_bases_on_page = set()  # avoid duplicating rectangles for same code on the same page when not 'all'
+
             for (x0, y0, x1, y1, wtext, *_rest) in page.get_text("words", sort=True):
                 if cancel_flag.is_set():
                     break
@@ -139,8 +161,15 @@ def scan_pdf_for_rects(pdf_path, ecs_compare_set, cancel_flag,
                     continue
 
                 cmp_base = base[1:] if (ignore_leading_digit and base[0:1].isdigit()) else base
-                if cmp_base and (cmp_base in ecs_compare_set) and (highlight_all_occurrences or (cmp_base not in seen_bases_global)):
-                    # prefer literal rectangles; fallback to the word box
+                if not (cmp_base and (cmp_base in ecs_compare_set)):
+                    continue
+
+                # record page hit for counts
+                code_pages[cmp_base].add(page.number)
+                matched_bases.add(cmp_base)
+
+                # control highlighting rectangles
+                if highlight_all_occurrences or (cmp_base not in seen_bases_on_page):
                     rects = page.search_for(wtext) or []
                     if rects:
                         for r in rects:
@@ -148,18 +177,17 @@ def scan_pdf_for_rects(pdf_path, ecs_compare_set, cancel_flag,
                     else:
                         page_rects.append((x0, y0, x1, y1))
                     hits += 1
-                    matched_bases.add(cmp_base)
-                    seen_bases_global.add(cmp_base)
+                    seen_bases_on_page.add(cmp_base)
                     on_match(cmp_base, os.path.basename(pdf_path), page.number + 1)
 
             if page_rects:
                 rects_by_page[page.number] = page_rects
 
-        return hits, matched_bases, rects_by_page, doc.page_count
+        return hits, matched_bases, rects_by_page, code_pages, doc.page_count
     finally:
         doc.close()
 
-# ---------- Combine (from ORIGINAL PDFs) with TEXT HIGHLIGHT ANNOTS ----------
+# ---------- Text highlight annotations ----------
 def add_text_highlights(page, rects, color=(1, 1, 0), opacity=0.35):
     """Add proper PDF 'Highlight' annotations and make them printable."""
     for (x0, y0, x1, y1) in rects:
@@ -174,6 +202,7 @@ def add_text_highlights(page, rects, color=(1, 1, 0), opacity=0.35):
             pass
         ann.update()
 
+# ---------- Combine (from ORIGINAL PDFs) with TEXT HIGHLIGHT ANNOTS ----------
 def combine_from_selection(out_path, selections, only_highlighted_pages, use_text_annotations=True):
     """
     selections: list of dicts:
@@ -199,7 +228,6 @@ def combine_from_selection(out_path, selections, only_highlighted_pages, use_tex
                     pages = list(range(src.page_count))
 
                 for p in pages:
-                    # copy page into output
                     out.insert_pdf(src, from_page=p, to_page=p)
                     out_pg = out.load_page(out.page_count - 1)
                     if use_text_annotations and p in rects_by_page:
@@ -380,13 +408,47 @@ class ReviewDialog(tk.Toplevel):
             self.canvas.create_text(10, 10, anchor="nw", fill="white",
                                     text=f"Preview error:\n{e}")
 
+# ---------- Summary dialog ----------
+class SummaryDialog(tk.Toplevel):
+    def __init__(self, master, rows, not_found_count, summary_csv_path):
+        """
+        rows: list of dicts with keys:
+          'code' (pretty), 'total_pages' (int), 'breakdown' (str)
+        """
+        super().__init__(master)
+        self.title("Match Summary")
+        self.geometry("900x520")
+        self.minsize(860, 480)
+        self.transient(master)
+        self.grab_set()
+
+        info = ttk.Label(self, text=f"Codes not found: {not_found_count}    |    Summary CSV: {summary_csv_path}")
+        info.pack(fill="x", padx=10, pady=(10, 0))
+
+        cols = ("code", "total_pages", "breakdown")
+        tree = ttk.Treeview(self, columns=cols, show="headings")
+        tree.heading("code", text="ECS Code")
+        tree.heading("total_pages", text="Pages Matched (total)")
+        tree.heading("breakdown", text="Per-file breakdown")
+        tree.column("code", width=220, anchor="w")
+        tree.column("total_pages", width=160, anchor="center")
+        tree.column("breakdown", width=460, anchor="w")
+        tree.pack(fill="both", expand=True, padx=10, pady=10)
+
+        for r in rows:
+            tree.insert("", "end", values=(r["code"], r["total_pages"], r["breakdown"]))
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=10, pady=(0,10))
+        ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
+
 # ---------- GUI App ----------
 class HighlighterApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ECS PDF Highlighter")
-        self.geometry("980x720")
-        self.minsize(960, 700)
+        self.geometry("980x760")
+        self.minsize(960, 720)
 
         # State
         self.excel_path = tk.StringVar()
@@ -405,6 +467,7 @@ class HighlighterApp(tk.Tk):
         self.worker_thread = None
         self.msg_queue = queue.Queue()
         self.ecs_original_map = {}
+        self.ecs_alias_map = {}  # cmp_base (stripped) -> primary
 
         self._build_ui()
         self._poll_messages()
@@ -435,13 +498,12 @@ class HighlighterApp(tk.Tk):
 
         fr_pdfs = ttk.LabelFrame(self, text="PDFs to Process")
         fr_pdfs.pack(fill="both", expand=True, **pad)
-        btns = ttk.Frame(fr_pdfs)
-        btns.pack(fill="x", padx=6, pady=6)
+        btns = ttk.Frame(fr_pdfs); btns.pack(fill="x", padx=6, pady=6)
         ttk.Button(btns, text="Add PDFs…", command=self._add_pdfs).pack(side="left")
         ttk.Button(btns, text="Remove Selected", command=self._remove_selected).pack(side="left", padx=6)
         ttk.Button(btns, text="Clear List", command=self._clear_list).pack(side="left")
         self.lst_pdfs = tk.Listbox(fr_pdfs, height=7, selectmode=tk.EXTENDED)
-        self.lst_pdfs.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.lst_pdfs.pack(fill="both", expand=True, padx=6, pady=(0,6))
 
         fr_out = ttk.Frame(self)
         fr_out.pack(fill="x", **pad)
@@ -452,7 +514,7 @@ class HighlighterApp(tk.Tk):
         fr_log = ttk.LabelFrame(self, text="Matches (ECS Code | File | Page)")
         fr_log.pack(fill="both", expand=True, **pad)
         cols = ("code", "file", "page")
-        self.tree = ttk.Treeview(fr_log, columns=cols, show="headings", height=10)
+        self.tree = ttk.Treeview(fr_log, columns=cols, show="headings", height=12)
         for c, w in zip(cols, (260, 540, 70)):
             self.tree.heading(c, text=c.capitalize())
             self.tree.column(c, width=w, anchor="w" if c != "page" else "center")
@@ -548,9 +610,13 @@ class HighlighterApp(tk.Tk):
         def post(msg_type, payload=None):
             self.msg_queue.put((msg_type, payload))
 
+        def pretty_from_cmp_base(cmp_base):
+            # prefer primary original if available
+            primary = self.ecs_alias_map.get(cmp_base, cmp_base)
+            return self.ecs_original_map.get(primary, self.ecs_original_map.get(cmp_base, cmp_base))
+
         def on_match(base_lower, file_name, page_num):
-            pretty = self.ecs_original_map.get(base_lower, base_lower)
-            post("match", (pretty, file_name, page_num))
+            post("match", (pretty_from_cmp_base(base_lower), file_name, page_num))
 
         try:
             post("status", "Reading Excel…")
@@ -558,22 +624,26 @@ class HighlighterApp(tk.Tk):
             if df is None:
                 post("error", "Could not find a header row containing 'ECS Codes' or 'ECS Code' in the Excel.")
                 return
-            ecs, original_map = extract_ecs_codes_from_df(df)
-            if not ecs:
+            ecs_primary, original_map = extract_ecs_codes_from_df(df)
+            if not ecs_primary:
                 post("error", "No ECS codes found under 'ECS Codes'/'ECS Code'.")
                 return
-            self.ecs_original_map = original_map
-            ecs_compare = build_ecs_compare_set(ecs, ignore_leading_digit)
+            self.ecs_original_map = dict(original_map)
+
+            ecs_compare = build_ecs_compare_set(ecs_primary, ignore_leading_digit)
+            alias_to_primary, pretty_for_primary = build_alias_maps(ecs_primary, original_map, ignore_leading_digit)
+            self.ecs_alias_map = dict(alias_to_primary)
 
             processed = []
-            overall_matched_bases = set()
+            # Aggregator: cmp_base -> { filename -> set(pages) }
+            agg_code_file_pages = defaultdict(lambda: defaultdict(set))
 
             total = len(pdf_paths) if pdf_paths else 1
             for idx, pdf in enumerate(pdf_paths, start=1):
                 if self.cancel_flag.is_set():
                     break
                 post("status", f"Scanning: {os.path.basename(pdf)}")
-                hits, matched, rects_by_page, total_pages = scan_pdf_for_rects(
+                hits, matched, rects_by_page, code_pages, total_pages = scan_pdf_for_rects(
                     pdf_path=pdf,
                     ecs_compare_set=ecs_compare,
                     cancel_flag=self.cancel_flag,
@@ -582,7 +652,6 @@ class HighlighterApp(tk.Tk):
                     highlight_all_occurrences=highlight_all_occurrences
                 )
                 if hits > 0 and not self.cancel_flag.is_set():
-                    overall_matched_bases |= matched
                     hit_pages = sorted(list(rects_by_page.keys()))
                     processed.append({
                         "display": os.path.basename(pdf),
@@ -591,6 +660,10 @@ class HighlighterApp(tk.Tk):
                         "rects_by_page": rects_by_page,
                         "total_pages": total_pages
                     })
+                    # aggregate per-code pages for summary
+                    fname = os.path.basename(pdf)
+                    for cmp_base, pages in code_pages.items():
+                        agg_code_file_pages[cmp_base][fname] |= set(pages)
                     post("status", f"Found {hits} match(es) in {os.path.basename(pdf)}")
                 else:
                     post("status", f"No matches in {os.path.basename(pdf)}")
@@ -605,15 +678,23 @@ class HighlighterApp(tk.Tk):
             combined_base = os.path.join(out_dir, f"{bldg_tag}_Highlighted_WK{week_number}.pdf")
             combined_out_path = uniquify_path(combined_base)
 
+            # Prepare summary payload (convert sets to sorted lists for serialization)
+            agg_serializable = {
+                cmp_base: {fn: sorted(list(pages)) for fn, pages in filepages.items()}
+                for cmp_base, filepages in agg_code_file_pages.items()
+            }
+
             post("review_data", {
                 "processed": processed,
-                "overall_matched_bases": list(overall_matched_bases),
-                "ecs_compare": list(ecs_compare),
                 "combined_out_path": combined_out_path,
                 "building_name": building_name,
                 "week_number": week_number,
                 "out_dir": out_dir,
-                "use_text_annotations": use_text_annotations
+                "use_text_annotations": use_text_annotations,
+                "ecs_primary": sorted(list(ecs_primary)),
+                "original_map": dict(original_map),
+                "alias_to_primary": dict(alias_to_primary),
+                "agg_code_file_pages": agg_serializable
             })
         except Exception as e:
             post("error", f"Unexpected error: {e}")
@@ -652,22 +733,27 @@ class HighlighterApp(tk.Tk):
             pass
         self.after(80, self._poll_messages)
 
-    # ----- finalize: review + combine + CSV -----
+    # ----- finalize: review + combine + CSV + SUMMARY -----
     def _finalize_and_save(self, bundle):
         processed = bundle["processed"]
-        overall_matched_bases = set(bundle["overall_matched_bases"])
-        ecs_compare = set(bundle["ecs_compare"])
         combined_out_path = bundle["combined_out_path"]
         building_name = bundle["building_name"]
         week_number = bundle["week_number"]
         out_dir = bundle["out_dir"]
         use_text_annotations = bool(bundle.get("use_text_annotations", True))
+        ecs_primary = set(bundle.get("ecs_primary", []))             # normalized primary keys
+        original_map = dict(bundle.get("original_map", {}))          # primary -> pretty
+        alias_to_primary = dict(bundle.get("alias_to_primary", {}))  # cmp -> primary
+        agg_code_file_pages = dict(bundle.get("agg_code_file_pages", {}))  # cmp -> {file -> [pages]}
 
         if not processed:
             messagebox.showinfo("No Matches", "No pages matched; nothing to save.")
             self.lbl_status.config(text="No matches.")
+            # Still produce a NotSurveyed CSV with all codes:
+            self._write_not_surveyed_csv(out_dir, building_name, week_number, sorted(list(ecs_primary)))
             return
 
+        # Review selection
         if self.review_pages_var.get():
             items = [{
                 "display": p["display"],
@@ -684,6 +770,7 @@ class HighlighterApp(tk.Tk):
         else:
             keep_map = {p["pdf_path"]: set(p["hit_pages"]) for p in processed}
 
+        # Combine
         only_highlighted = bool(self.only_highlighted_var.get())
         selections = []
         for p in processed:
@@ -709,16 +796,59 @@ class HighlighterApp(tk.Tk):
             self.lbl_status.config(text="Combine failed.")
             return
 
+        # --- Build per-code summary (counts are DISTINCT PAGES) ---
+        # Canonicalize cmp keys to primary
+        primary_file_pages = defaultdict(lambda: defaultdict(set))  # primary -> file -> set(pages)
+        for cmp_base, file_map in agg_code_file_pages.items():
+            primary = alias_to_primary.get(cmp_base, cmp_base)
+            for fn, pages in file_map.items():
+                primary_file_pages[primary][fn] |= set(pages)
+
+        # rows for dialog/CSV
+        rows = []
+        found_primary = set()
+        for primary in sorted(primary_file_pages.keys()):
+            total_pages = sum(len(pages) for pages in primary_file_pages[primary].values())
+            found_primary.add(primary)
+            pretty = original_map.get(primary, primary)
+            breakdown = "; ".join(f"{fn}:{len(sorted(list(pages)))}" for fn, pages in sorted(primary_file_pages[primary].items()))
+            rows.append({"code": pretty, "total_pages": total_pages, "breakdown": breakdown})
+
+        # missing codes (use primaries only, not compare set)
+        missing_primary = sorted(list(ecs_primary - found_primary))
+        not_found_count = len(missing_primary)
+
+        # Write CSVs
+        summary_csv = self._write_summary_csv(out_dir, building_name, week_number, rows)
+        self._write_not_surveyed_csv(out_dir, building_name, week_number,
+                                     [original_map.get(p, p) for p in missing_primary])
+
+        # Show summary dialog
+        SummaryDialog(self, rows, not_found_count, summary_csv)
+
+    def _write_summary_csv(self, out_dir, building_name, week_number, rows):
+        bldg_tag = sanitize_filename(building_name)
+        csv_path = os.path.join(out_dir, f"{bldg_tag}_MatchesSummary_WK{week_number}.csv")
+        csv_path = uniquify_path(csv_path)
         try:
-            missing = sorted(list(ecs_compare - overall_matched_bases))
-            if missing:
-                bldg_tag = sanitize_filename(building_name)
-                csv_path = os.path.join(out_dir, f"{bldg_tag}_NotSurveyed_WK{week_number}.csv")
-                csv_path = uniquify_path(csv_path)
-                pd.DataFrame({"ECS_Code_Not_Found": missing}).to_csv(csv_path, index=False)
-                self.lbl_status.config(text=f"CSV saved: {os.path.basename(csv_path)}")
+            df = pd.DataFrame(rows, columns=["code", "total_pages", "breakdown"])
+            df.to_csv(csv_path, index=False)
+        except Exception as e:
+            messagebox.showwarning("CSV", f"Could not save MatchesSummary CSV:\n{e}")
+        return csv_path
+
+    def _write_not_surveyed_csv(self, out_dir, building_name, week_number, not_found_pretty_list):
+        if not not_found_pretty_list:
+            return None
+        bldg_tag = sanitize_filename(building_name)
+        csv_path = os.path.join(out_dir, f"{bldg_tag}_NotSurveyed_WK{week_number}.csv")
+        csv_path = uniquify_path(csv_path)
+        try:
+            pd.DataFrame({"ECS_Code_Not_Found": sorted(not_found_pretty_list)}).to_csv(csv_path, index=False)
+            self.lbl_status.config(text=f"CSV saved: {os.path.basename(csv_path)}")
         except Exception as e:
             messagebox.showwarning("CSV", f"Could not save NotSurveyed CSV:\n{e}")
+        return csv_path
 
 # ---------- main ----------
 if __name__ == "__main__":
