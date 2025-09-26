@@ -13,8 +13,7 @@ from collections import defaultdict
 
 # ---------- Dash handling + token helpers ----------
 DASH_CHARS = "-\u2010\u2011\u2012\u2013\u2014\u2212"  # -, ‐, -, ‒, –, —, −
-# Strip edge punctuation (incl. various dashes) but keep internal hyphens within codes
-_STRIP_PUNCT = re.compile(r'^[\s"\'()\[\]{}:;,.–—\-]+|[\s"\'()\[\]{}:;,.–—\-]+$')
+_STRIP_EDGE_PUNCT = re.compile(r'^[\s"\'()\[\]{}:;,.–—\-]+|[\s"\'()\[\]{}:;,.–—\-]+$')
 
 def unify_dashes(s: str) -> str:
     if not s:
@@ -24,13 +23,21 @@ def unify_dashes(s: str) -> str:
     return s.replace("\u00AD", "")  # soft hyphen
 
 def normalize_base(token: str) -> str:
+    """Lowercase + normalize dashes; keep inner hyphens."""
     if not token:
         return ""
-    cleaned = _STRIP_PUNCT.sub("", token)
+    cleaned = _STRIP_EDGE_PUNCT.sub("", token)
     if not cleaned:
         return ""
     cleaned = unify_dashes(cleaned)
     return cleaned.strip().lower()
+
+def normalize_nosep(token: str) -> str:
+    """Lowercase + normalize dashes + remove ALL non-alphanumerics."""
+    if not token:
+        return ""
+    token = unify_dashes(token).lower()
+    return re.sub(r'[^0-9a-z]', '', token)
 
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', "_", name).strip()
@@ -46,10 +53,6 @@ def uniquify_path(path: str) -> str:
 
 # ---------- Excel parsing ----------
 def load_table_with_dynamic_header(xlsx_path, sheet_name=None):
-    """
-    Find the row that contains 'ECS Codes' / 'ECS Code' and treat it as the header.
-    Returns a DataFrame with proper headers (or None if not found).
-    """
     df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None, dtype=str)
     target_labels = {"ecs codes", "ecs code"}
     header_row_idx = None
@@ -94,51 +97,53 @@ def extract_ecs_codes_from_df(df):
             original_map[low] = t
     return ecs_set, original_map
 
-# ---------- Search set helpers ----------
-def build_ecs_compare_set(ecs_primary, ignore_leading_digit):
-    """
-    Compare set is used for matching. If ignore_leading_digit=True, also include
-    versions of codes with a single leading digit stripped.
-    """
-    if not ignore_leading_digit:
-        return set(ecs_primary)
-    comp = set(ecs_primary)
-    for code in ecs_primary:
-        if code and code[0].isdigit():
-            comp.add(code[1:])
-    return comp
-
-def build_alias_maps(ecs_primary, original_map, ignore_leading_digit):
+# ---------- Build compare keys & alias map (no separators) ----------
+def build_compare_index(ecs_primary, ignore_leading_digit):
     """
     Returns:
-      alias_to_primary: maps stripped variants -> their primary key
-      pretty_for_primary: maps primary key -> original (pretty) string from Excel
+      cmp_keys_nosep: set of canonical keys (no separators) to match against
+      nosep_to_primary: dict mapping cmp_key_nosep -> primary key from Excel
+      max_code_len: longest cmp_key length (for pruning)
     """
-    alias_to_primary = {}
-    if ignore_leading_digit:
-        for primary in ecs_primary:
-            if primary and primary[0].isdigit():
-                alias_to_primary[primary[1:]] = primary
-    pretty_for_primary = dict(original_map)
-    return alias_to_primary, pretty_for_primary
+    cmp_keys = set()
+    nosep_to_primary = {}
+    for primary in ecs_primary:
+        k = normalize_nosep(primary)
+        if k:
+            cmp_keys.add(k)
+            nosep_to_primary[k] = primary
+        if ignore_leading_digit and primary and primary[0].isdigit():
+            k2 = normalize_nosep(primary[1:])
+            if k2:
+                cmp_keys.add(k2)
+                nosep_to_primary[k2] = primary
+    max_code_len = max((len(k) for k in cmp_keys), default=0)
+    return cmp_keys, nosep_to_primary, max_code_len
 
-# ---------- PDF scan (NO TEMP FILES) ----------
-def scan_pdf_for_rects(pdf_path, ecs_compare_set, cancel_flag,
-                       on_match, ignore_leading_digit, highlight_all_occurrences=False):
+# ---------- Robust PDF scan: sliding window across words ----------
+def scan_pdf_for_rects(pdf_path,
+                       cmp_keys_nosep,
+                       max_code_len,
+                       cancel_flag,
+                       on_match,
+                       pretty_from_cmpkey,
+                       highlight_all_occurrences=False,
+                       max_window_words=10):
     """
-    Scan a PDF and return:
-      hits (int)                         # rectangles counted
-      matched_bases (set[str])           # compare-keys matched anywhere in this file
-      rects_by_page (dict[int -> list[(x0,y0,x1,y1)]])   # for preview/highlighting
-      code_pages   (dict[cmp_base -> set[int]])          # which pages (0-based) had each code
+    Robust search:
+      - tokenizes page into words (with rectangles),
+      - concatenates adjacent words (up to max_window_words) after removing separators,
+      - compares against cmp_keys_nosep.
+    Returns:
+      hits (int)                              # number of rectangles added (approx.)
+      matched_cmp_keys (set[str])             # cmp keys that appeared anywhere
+      rects_by_page (dict[int -> list[(x0,y0,x1,y1)]])  # rectangles for highlighting
+      code_pages   (dict[cmp_key -> set[int]])           # which 0-based pages had each code
       total_pages  (int)
-    Notes:
-      - We always record pages per code even if highlight_all_occurrences=False.
-      - When highlight_all_occurrences=False, we still highlight *once per code per page*.
     """
     doc = fitz.open(pdf_path)
     hits = 0
-    matched_bases = set()
+    matched = set()
     rects_by_page = {}
     code_pages = defaultdict(set)
 
@@ -146,44 +151,70 @@ def scan_pdf_for_rects(pdf_path, ecs_compare_set, cancel_flag,
         for page in doc:
             if cancel_flag.is_set():
                 break
-            page_rects = []
-            seen_bases_on_page = set()  # avoid duplicating rectangles for same code on the same page when not 'all'
 
-            for (x0, y0, x1, y1, wtext, *_rest) in page.get_text("words", sort=True):
+            words = page.get_text("words", sort=True)  # list of tuples
+            # Each: (x0, y0, x1, y1, "text", block, line, word)
+            W = []
+            for w in words:
+                x0, y0, x1, y1, t = float(w[0]), float(w[1]), float(w[2]), float(w[3]), (w[4] or "")
+                norm = normalize_nosep(t)
+                if not norm:
+                    continue
+                W.append(((x0, y0, x1, y1), norm, t))
+
+            if not W:
+                continue
+
+            seen_on_page = set()  # cmp keys already highlighted on this page (if not "all")
+            page_rects = []
+            # For deduping rectangles a bit (avoid drawing same rect many times)
+            rect_key_set = set()
+
+            N = len(W)
+            for i in range(N):
                 if cancel_flag.is_set():
                     break
-                tok = (wtext or "").strip()
-                if not tok:
-                    continue
+                s = ""
+                rects_run = []
+                # grow window
+                for j in range(i, min(i + max_window_words, N)):
+                    rect, norm, raw = W[j]
+                    s += norm
+                    rects_run.append(rect)
 
-                base = normalize_base(tok)
-                if not base:
-                    continue
+                    # prune if absurdly long
+                    if len(s) > max_code_len + 4:
+                        break
 
-                cmp_base = base[1:] if (ignore_leading_digit and base[0:1].isdigit()) else base
-                if not (cmp_base and (cmp_base in ecs_compare_set)):
-                    continue
+                    if s in cmp_keys_nosep:
+                        # Count the page hit
+                        code_pages[s].add(page.number)
+                        matched.add(s)
 
-                # record page hit for counts
-                code_pages[cmp_base].add(page.number)
-                matched_bases.add(cmp_base)
+                        if highlight_all_occurrences or (s not in seen_on_page):
+                            # add rectangles for each word in the run
+                            for (x0, y0, x1, y1) in rects_run:
+                                key = (round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2))
+                                if key not in rect_key_set:
+                                    rect_key_set.add(key)
+                                    page_rects.append((x0, y0, x1, y1))
+                                    hits += 1
 
-                # control highlighting rectangles
-                if highlight_all_occurrences or (cmp_base not in seen_bases_on_page):
-                    rects = page.search_for(wtext) or []
-                    if rects:
-                        for r in rects:
-                            page_rects.append((float(r.x0), float(r.y0), float(r.x1), float(r.y1)))
-                    else:
-                        page_rects.append((x0, y0, x1, y1))
-                    hits += 1
-                    seen_bases_on_page.add(cmp_base)
-                    on_match(cmp_base, os.path.basename(pdf_path), page.number + 1)
+                            # Tell UI (once per code per page)
+                            if s not in seen_on_page:
+                                pretty = pretty_from_cmpkey(s)
+                                on_match(s, os.path.basename(pdf_path), page.number + 1, pretty)
+
+                            seen_on_page.add(s)
+
+                        # If not highlighting "all", we can skip ahead to end of this window
+                        if not highlight_all_occurrences:
+                            break
 
             if page_rects:
                 rects_by_page[page.number] = page_rects
 
-        return hits, matched_bases, rects_by_page, code_pages, doc.page_count
+        return hits, matched, rects_by_page, code_pages, doc.page_count
     finally:
         doc.close()
 
@@ -411,10 +442,6 @@ class ReviewDialog(tk.Toplevel):
 # ---------- Summary dialog ----------
 class SummaryDialog(tk.Toplevel):
     def __init__(self, master, rows, not_found_count, summary_csv_path):
-        """
-        rows: list of dicts with keys:
-          'code' (pretty), 'total_pages' (int), 'breakdown' (str)
-        """
         super().__init__(master)
         self.title("Match Summary")
         self.geometry("900x520")
@@ -466,8 +493,10 @@ class HighlighterApp(tk.Tk):
         self.cancel_flag = threading.Event()
         self.worker_thread = None
         self.msg_queue = queue.Queue()
-        self.ecs_original_map = {}
-        self.ecs_alias_map = {}  # cmp_base (stripped) -> primary
+
+        # Excel originals (pretty) + compare-key mapping
+        self.ecs_original_map = {}          # primary -> pretty
+        self.nosep_to_primary = {}          # cmp_key -> primary
 
         self._build_ui()
         self._poll_messages()
@@ -610,13 +639,12 @@ class HighlighterApp(tk.Tk):
         def post(msg_type, payload=None):
             self.msg_queue.put((msg_type, payload))
 
-        def pretty_from_cmp_base(cmp_base):
-            # prefer primary original if available
-            primary = self.ecs_alias_map.get(cmp_base, cmp_base)
-            return self.ecs_original_map.get(primary, self.ecs_original_map.get(cmp_base, cmp_base))
+        def pretty_from_cmpkey(cmp_key):
+            primary = self.nosep_to_primary.get(cmp_key, cmp_key)
+            return self.ecs_original_map.get(primary, primary)
 
-        def on_match(base_lower, file_name, page_num):
-            post("match", (pretty_from_cmp_base(base_lower), file_name, page_num))
+        def on_match(cmp_key, file_name, page_num, pretty_text):
+            post("match", (pretty_text, file_name, page_num))
 
         try:
             post("status", "Reading Excel…")
@@ -628,15 +656,15 @@ class HighlighterApp(tk.Tk):
             if not ecs_primary:
                 post("error", "No ECS codes found under 'ECS Codes'/'ECS Code'.")
                 return
+
             self.ecs_original_map = dict(original_map)
 
-            ecs_compare = build_ecs_compare_set(ecs_primary, ignore_leading_digit)
-            alias_to_primary, pretty_for_primary = build_alias_maps(ecs_primary, original_map, ignore_leading_digit)
-            self.ecs_alias_map = dict(alias_to_primary)
+            # Build hyphen/space-insensitive compare keys
+            cmp_keys, nosep_to_primary, max_code_len = build_compare_index(ecs_primary, ignore_leading_digit)
+            self.nosep_to_primary = dict(nosep_to_primary)
 
             processed = []
-            # Aggregator: cmp_base -> { filename -> set(pages) }
-            agg_code_file_pages = defaultdict(lambda: defaultdict(set))
+            agg_code_file_pages = defaultdict(lambda: defaultdict(set))  # cmp_key -> file -> set(pages)
 
             total = len(pdf_paths) if pdf_paths else 1
             for idx, pdf in enumerate(pdf_paths, start=1):
@@ -645,10 +673,11 @@ class HighlighterApp(tk.Tk):
                 post("status", f"Scanning: {os.path.basename(pdf)}")
                 hits, matched, rects_by_page, code_pages, total_pages = scan_pdf_for_rects(
                     pdf_path=pdf,
-                    ecs_compare_set=ecs_compare,
+                    cmp_keys_nosep=cmp_keys,
+                    max_code_len=max_code_len,
                     cancel_flag=self.cancel_flag,
                     on_match=on_match,
-                    ignore_leading_digit=ignore_leading_digit,
+                    pretty_from_cmpkey=pretty_from_cmpkey,
                     highlight_all_occurrences=highlight_all_occurrences
                 )
                 if hits > 0 and not self.cancel_flag.is_set():
@@ -660,10 +689,9 @@ class HighlighterApp(tk.Tk):
                         "rects_by_page": rects_by_page,
                         "total_pages": total_pages
                     })
-                    # aggregate per-code pages for summary
                     fname = os.path.basename(pdf)
-                    for cmp_base, pages in code_pages.items():
-                        agg_code_file_pages[cmp_base][fname] |= set(pages)
+                    for cmp_key, pages in code_pages.items():
+                        agg_code_file_pages[cmp_key][fname] |= set(pages)
                     post("status", f"Found {hits} match(es) in {os.path.basename(pdf)}")
                 else:
                     post("status", f"No matches in {os.path.basename(pdf)}")
@@ -678,10 +706,10 @@ class HighlighterApp(tk.Tk):
             combined_base = os.path.join(out_dir, f"{bldg_tag}_Highlighted_WK{week_number}.pdf")
             combined_out_path = uniquify_path(combined_base)
 
-            # Prepare summary payload (convert sets to sorted lists for serialization)
+            # Prepare serializable summary
             agg_serializable = {
-                cmp_base: {fn: sorted(list(pages)) for fn, pages in filepages.items()}
-                for cmp_base, filepages in agg_code_file_pages.items()
+                cmp_key: {fn: sorted(list(pages)) for fn, pages in filepages.items()}
+                for cmp_key, filepages in agg_code_file_pages.items()
             }
 
             post("review_data", {
@@ -693,7 +721,7 @@ class HighlighterApp(tk.Tk):
                 "use_text_annotations": use_text_annotations,
                 "ecs_primary": sorted(list(ecs_primary)),
                 "original_map": dict(original_map),
-                "alias_to_primary": dict(alias_to_primary),
+                "nosep_to_primary": dict(nosep_to_primary),
                 "agg_code_file_pages": agg_serializable
             })
         except Exception as e:
@@ -741,16 +769,17 @@ class HighlighterApp(tk.Tk):
         week_number = bundle["week_number"]
         out_dir = bundle["out_dir"]
         use_text_annotations = bool(bundle.get("use_text_annotations", True))
-        ecs_primary = set(bundle.get("ecs_primary", []))             # normalized primary keys
-        original_map = dict(bundle.get("original_map", {}))          # primary -> pretty
-        alias_to_primary = dict(bundle.get("alias_to_primary", {}))  # cmp -> primary
-        agg_code_file_pages = dict(bundle.get("agg_code_file_pages", {}))  # cmp -> {file -> [pages]}
+        ecs_primary = set(bundle.get("ecs_primary", []))                 # normalized primary keys
+        original_map = dict(bundle.get("original_map", {}))              # primary -> pretty
+        nosep_to_primary = dict(bundle.get("nosep_to_primary", {}))      # cmp -> primary
+        agg_code_file_pages = dict(bundle.get("agg_code_file_pages", {})) # cmp -> {file -> [pages]}
 
         if not processed:
             messagebox.showinfo("No Matches", "No pages matched; nothing to save.")
             self.lbl_status.config(text="No matches.")
-            # Still produce a NotSurveyed CSV with all codes:
-            self._write_not_surveyed_csv(out_dir, building_name, week_number, sorted(list(ecs_primary)))
+            # NotSurveyed = all codes
+            self._write_not_surveyed_csv(out_dir, building_name, week_number,
+                                         [original_map.get(p, p) for p in sorted(ecs_primary)])
             return
 
         # Review selection
@@ -771,8 +800,8 @@ class HighlighterApp(tk.Tk):
             keep_map = {p["pdf_path"]: set(p["hit_pages"]) for p in processed}
 
         # Combine
-        only_highlighted = bool(self.only_highlighted_var.get())
         selections = []
+        only_highlighted = bool(self.only_highlighted_var.get())
         for p in processed:
             selections.append({
                 "pdf_path": p["pdf_path"],
@@ -797,24 +826,23 @@ class HighlighterApp(tk.Tk):
             return
 
         # --- Build per-code summary (counts are DISTINCT PAGES) ---
-        # Canonicalize cmp keys to primary
         primary_file_pages = defaultdict(lambda: defaultdict(set))  # primary -> file -> set(pages)
-        for cmp_base, file_map in agg_code_file_pages.items():
-            primary = alias_to_primary.get(cmp_base, cmp_base)
+        for cmp_key, file_map in agg_code_file_pages.items():
+            primary = nosep_to_primary.get(cmp_key, cmp_key)
             for fn, pages in file_map.items():
                 primary_file_pages[primary][fn] |= set(pages)
 
-        # rows for dialog/CSV
         rows = []
         found_primary = set()
         for primary in sorted(primary_file_pages.keys()):
             total_pages = sum(len(pages) for pages in primary_file_pages[primary].values())
             found_primary.add(primary)
             pretty = original_map.get(primary, primary)
-            breakdown = "; ".join(f"{fn}:{len(sorted(list(pages)))}" for fn, pages in sorted(primary_file_pages[primary].items()))
+            breakdown = "; ".join(f"{fn}:{len(sorted(list(pages)))}"
+                                  for fn, pages in sorted(primary_file_pages[primary].items()))
             rows.append({"code": pretty, "total_pages": total_pages, "breakdown": breakdown})
 
-        # missing codes (use primaries only, not compare set)
+        # missing codes (use primaries only)
         missing_primary = sorted(list(ecs_primary - found_primary))
         not_found_count = len(missing_primary)
 
@@ -831,8 +859,7 @@ class HighlighterApp(tk.Tk):
         csv_path = os.path.join(out_dir, f"{bldg_tag}_MatchesSummary_WK{week_number}.csv")
         csv_path = uniquify_path(csv_path)
         try:
-            df = pd.DataFrame(rows, columns=["code", "total_pages", "breakdown"])
-            df.to_csv(csv_path, index=False)
+            pd.DataFrame(rows, columns=["code", "total_pages", "breakdown"]).to_csv(csv_path, index=False)
         except Exception as e:
             messagebox.showwarning("CSV", f"Could not save MatchesSummary CSV:\n{e}")
         return csv_path
