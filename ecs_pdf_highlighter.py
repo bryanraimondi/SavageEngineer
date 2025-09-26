@@ -1,7 +1,6 @@
 import os
 import re
 import sys
-import uuid
 import base64
 import threading
 import queue
@@ -46,6 +45,10 @@ def uniquify_path(path: str) -> str:
 
 # ---------- Excel parsing ----------
 def load_table_with_dynamic_header(xlsx_path, sheet_name=None):
+    """
+    Find the row that contains 'ECS Codes' / 'ECS Code' and treat it as the header.
+    Returns a DataFrame with proper headers (or None if not found).
+    """
     df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None, dtype=str)
     target_labels = {"ecs codes", "ecs code"}
     header_row_idx = None
@@ -63,6 +66,7 @@ def load_table_with_dynamic_header(xlsx_path, sheet_name=None):
     return data
 
 def extract_ecs_codes_from_df(df):
+    """Return (ecs_set_lower, original_map_lower_to_original)."""
     if df is None or df.empty:
         return set(), {}
     cols = [c for c in df.columns if str(c).strip().lower() in ("ecs codes", "ecs code")]
@@ -91,6 +95,9 @@ def extract_ecs_codes_from_df(df):
 
 # ---------- PDF scan (NO TEMP FILES) ----------
 def build_ecs_compare_set(ecs_lower_set, ignore_leading_digit):
+    """
+    If ignore_leading_digit is True, also add versions of ECS codes without a single leading digit.
+    """
     if not ignore_leading_digit:
         return set(ecs_lower_set)
     comp = set(ecs_lower_set)
@@ -102,8 +109,12 @@ def build_ecs_compare_set(ecs_lower_set, ignore_leading_digit):
 def scan_pdf_for_rects(pdf_path, ecs_compare_set, cancel_flag,
                        on_match, ignore_leading_digit, highlight_all_occurrences=False):
     """
+    Scan a PDF and return per-page rectangles for matches (no annotations, no temp files).
     Returns:
-      hits, matched_bases, rects_by_page {page_index: [(x0,y0,x1,y1), ...]}, total_pages
+      hits (int),
+      matched_bases (set[str]),
+      rects_by_page (dict[int -> list[(x0,y0,x1,y1)]]),
+      total_pages (int)
     """
     doc = fitz.open(pdf_path)
     hits = 0
@@ -116,7 +127,6 @@ def scan_pdf_for_rects(pdf_path, ecs_compare_set, cancel_flag,
             if cancel_flag.is_set():
                 break
             page_rects = []
-            # iterate word boxes
             for (x0, y0, x1, y1, wtext, *_rest) in page.get_text("words", sort=True):
                 if cancel_flag.is_set():
                     break
@@ -130,7 +140,7 @@ def scan_pdf_for_rects(pdf_path, ecs_compare_set, cancel_flag,
 
                 cmp_base = base[1:] if (ignore_leading_digit and base[0:1].isdigit()) else base
                 if cmp_base and (cmp_base in ecs_compare_set) and (highlight_all_occurrences or (cmp_base not in seen_bases_global)):
-                    # Prefer literal search rectangles for exact text extent
+                    # prefer literal rectangles; fallback to the word box
                     rects = page.search_for(wtext) or []
                     if rects:
                         for r in rects:
@@ -150,17 +160,14 @@ def scan_pdf_for_rects(pdf_path, ecs_compare_set, cancel_flag,
         doc.close()
 
 # ---------- Combine (from ORIGINAL PDFs) with TEXT HIGHLIGHT ANNOTS ----------
-def add_text_highlights(page, rects, color=(1,1,0), opacity=0.35):
-    """
-    Add proper PDF 'Highlight' annotations for each rect and make them printable.
-    """
+def add_text_highlights(page, rects, color=(1, 1, 0), opacity=0.35):
+    """Add proper PDF 'Highlight' annotations and make them printable."""
     for (x0, y0, x1, y1) in rects:
         r = fitz.Rect(x0, y0, x1, y1)
         ann = page.add_highlight_annot(r)
         try:
-            ann.set_colors(stroke=color)   # highlight color
+            ann.set_colors(stroke=color)
             ann.set_opacity(opacity)
-            # Ensure they print:
             if hasattr(fitz, "ANNOT_PRINT"):
                 ann.set_flags(fitz.ANNOT_PRINT)
         except Exception:
@@ -193,16 +200,10 @@ def combine_from_selection(out_path, selections, only_highlighted_pages, use_tex
 
                 for p in pages:
                     # copy page into output
-                    try:
-                        out.insert_pdf(src, from_page=p, to_page=p)
-                    except TypeError:
-                        out.insert_pdf(src, from_page=p, to_page=p)
-
+                    out.insert_pdf(src, from_page=p, to_page=p)
                     out_pg = out.load_page(out.page_count - 1)
-
-                    # add text highlight annotations (preferred)
                     if use_text_annotations and p in rects_by_page:
-                        add_text_highlights(out_pg, rects_by_page[p], color=(1,1,0), opacity=0.35)
+                        add_text_highlights(out_pg, rects_by_page[p], color=(1, 1, 0), opacity=0.35)
 
         out_path = uniquify_path(out_path)
         out.save(out_path)
@@ -234,11 +235,16 @@ class ReviewDialog(tk.Toplevel):
 
         ttk.Label(left, text="Pages (double-click to toggle keep):").pack(anchor="w")
 
-        self.tree = ttk.Treeview(left, columns=("keep", "file", "page"),
-                                 show="headings", selectmode="browse", height=22)
+        self.tree = ttk.Treeview(
+            left,
+            columns=("keep", "file", "page"),
+            show="headings",
+            selectmode="browse",
+            height=22
+        )
         self.tree.heading("keep", text="Keep")
         self.tree.heading("file", text="File")
-               self.tree.heading("page", text="Page")
+        self.tree.heading("page", text="Page")
         self.tree.column("keep", width=60, anchor="center")
         self.tree.column("file", width=520, anchor="w")
         self.tree.column("page", width=70, anchor="center")
@@ -262,7 +268,8 @@ class ReviewDialog(tk.Toplevel):
 
         # ===== PREVIEW pane =====
         ttk.Label(right, text="Preview").pack(anchor="w")
-        canvas_frame = ttk.Frame(right); canvas_frame.pack(fill="both", expand=True)
+        canvas_frame = ttk.Frame(right)
+        canvas_frame.pack(fill="both", expand=True)
 
         self.canvas = tk.Canvas(canvas_frame, bg="#202020", highlightthickness=0)
         xscroll = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self.canvas.xview)
@@ -276,13 +283,16 @@ class ReviewDialog(tk.Toplevel):
 
         self._preview_img = None
         self._zoom = 1.25
-        controls = ttk.Frame(right); controls.pack(fill="x", pady=(6, 0))
+        controls = ttk.Frame(right)
+        controls.pack(fill="x", pady=(6, 0))
         ttk.Button(controls, text="Zoom -", command=lambda: self._change_zoom(-0.15)).pack(side="left")
         ttk.Button(controls, text="Zoom +", command=lambda: self._change_zoom(+0.15)).pack(side="left", padx=6)
-        self.stat = ttk.Label(controls, text="—"); self.stat.pack(side="right")
+        self.stat = ttk.Label(controls, text="—")
+        self.stat.pack(side="right")
 
         # Buttons
-        btns = ttk.Frame(self); btns.pack(fill="x", padx=8, pady=(6, 8))
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=8, pady=(6, 8))
         ttk.Button(btns, text="Select All", command=self._select_all).pack(side="left")
         ttk.Button(btns, text="Clear All", command=self._clear_all).pack(side="left", padx=6)
         ttk.Button(btns, text="OK", command=self._ok).pack(side="right")
@@ -388,7 +398,7 @@ class HighlighterApp(tk.Tk):
         self.review_pages_var = tk.BooleanVar(value=True)
         self.ignore_lead_digit_var = tk.BooleanVar(value=False)
         self.highlight_all_var = tk.BooleanVar(value=True)
-        self.use_text_annots_var = tk.BooleanVar(value=True)   # NEW: use real highlight annotations
+        self.use_text_annots_var = tk.BooleanVar(value=True)
 
         self.pdf_list = []
         self.cancel_flag = threading.Event()
@@ -402,38 +412,45 @@ class HighlighterApp(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 8, "pady": 6}
 
-        fr_top = ttk.Frame(self); fr_top.pack(fill="x", **pad)
+        fr_top = ttk.Frame(self)
+        fr_top.pack(fill="x", **pad)
         ttk.Label(fr_top, text="Week Number:").pack(side="left")
         ttk.Entry(fr_top, width=10, textvariable=self.week_number).pack(side="left", padx=8)
         ttk.Label(fr_top, text="Building Name:").pack(side="left", padx=(16, 0))
         ttk.Entry(fr_top, width=30, textvariable=self.building_name).pack(side="left", padx=8, fill="x", expand=True)
 
-        fr_opts = ttk.Frame(self); fr_opts.pack(fill="x", **pad)
+        fr_opts = ttk.Frame(self)
+        fr_opts.pack(fill="x", **pad)
         ttk.Checkbutton(fr_opts, text="Only keep highlighted pages", variable=self.only_highlighted_var).pack(side="left")
         ttk.Checkbutton(fr_opts, text="Review pages before saving", variable=self.review_pages_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Ignore leading digit in PDF codes", variable=self.ignore_lead_digit_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Highlight every occurrence", variable=self.highlight_all_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Use text highlight annotations (prints)", variable=self.use_text_annots_var).pack(side="left", padx=12)
 
-        fr_excel = ttk.Frame(self); fr_excel.pack(fill="x", **pad)
+        fr_excel = ttk.Frame(self)
+        fr_excel.pack(fill="x", **pad)
         ttk.Label(fr_excel, text="Excel (ECS Codes):").pack(side="left")
         ttk.Entry(fr_excel, textvariable=self.excel_path).pack(side="left", expand=True, fill="x", padx=8)
         ttk.Button(fr_excel, text="Browse…", command=self._pick_excel).pack(side="left")
 
-        fr_pdfs = ttk.LabelFrame(self, text="PDFs to Process"); fr_pdfs.pack(fill="both", expand=True, **pad)
-        btns = ttk.Frame(fr_pdfs); btns.pack(fill="x", padx=6, pady=6)
+        fr_pdfs = ttk.LabelFrame(self, text="PDFs to Process")
+        fr_pdfs.pack(fill="both", expand=True, **pad)
+        btns = ttk.Frame(fr_pdfs)
+        btns.pack(fill="x", padx=6, pady=6)
         ttk.Button(btns, text="Add PDFs…", command=self._add_pdfs).pack(side="left")
         ttk.Button(btns, text="Remove Selected", command=self._remove_selected).pack(side="left", padx=6)
         ttk.Button(btns, text="Clear List", command=self._clear_list).pack(side="left")
         self.lst_pdfs = tk.Listbox(fr_pdfs, height=7, selectmode=tk.EXTENDED)
-        self.lst_pdfs.pack(fill="both", expand=True, padx=6, pady=(0,6))
+        self.lst_pdfs.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
-        fr_out = ttk.Frame(self); fr_out.pack(fill="x", **pad)
+        fr_out = ttk.Frame(self)
+        fr_out.pack(fill="x", **pad)
         ttk.Label(fr_out, text="Output Folder:").pack(side="left")
         ttk.Entry(fr_out, textvariable=self.output_dir).pack(side="left", expand=True, fill="x", padx=8)
         ttk.Button(fr_out, text="Select…", command=self._pick_output_dir).pack(side="left")
 
-        fr_log = ttk.LabelFrame(self, text="Matches (ECS Code | File | Page)"); fr_log.pack(fill="both", expand=True, **pad)
+        fr_log = ttk.LabelFrame(self, text="Matches (ECS Code | File | Page)")
+        fr_log.pack(fill="both", expand=True, **pad)
         cols = ("code", "file", "page")
         self.tree = ttk.Treeview(fr_log, columns=cols, show="headings", height=10)
         for c, w in zip(cols, (260, 540, 70)):
@@ -441,20 +458,25 @@ class HighlighterApp(tk.Tk):
             self.tree.column(c, width=w, anchor="w" if c != "page" else "center")
         self.tree.pack(fill="both", expand=True, padx=6, pady=6)
 
-        fr_prog = ttk.Frame(self); fr_prog.pack(fill="x", **pad)
+        fr_prog = ttk.Frame(self)
+        fr_prog.pack(fill="x", **pad)
         self.prog = ttk.Progressbar(fr_prog, orient="horizontal", mode="determinate", maximum=100)
         self.prog.pack(side="left", expand=True, fill="x")
-        self.lbl_status = ttk.Label(fr_prog, text="Idle"); self.lbl_status.pack(side="left", padx=8)
+        self.lbl_status = ttk.Label(fr_prog, text="Idle")
+        self.lbl_status.pack(side="left", padx=8)
 
-        fr_btns = ttk.Frame(self); fr_btns.pack(fill="x", **pad)
+        fr_btns = ttk.Frame(self)
+        fr_btns.pack(fill="x", **pad)
         ttk.Button(fr_btns, text="Start", command=self._start).pack(side="left")
         ttk.Button(fr_btns, text="Stop", command=self._stop).pack(side="left", padx=6)
         ttk.Button(fr_btns, text="Exit", command=self._exit).pack(side="right")
 
     # ----- UI actions -----
     def _pick_excel(self):
-        path = filedialog.askopenfilename(title="Select Excel with ECS Codes",
-                                          filetypes=[("Excel files", "*.xlsx *.xls")])
+        path = filedialog.askopenfilename(
+            title="Select Excel with ECS Codes",
+            filetypes=[("Excel files", "*.xlsx *.xls")]
+        )
         if path:
             self.excel_path.set(path)
 
@@ -525,9 +547,11 @@ class HighlighterApp(tk.Tk):
                 out_dir, ignore_leading_digit, highlight_all_occurrences, use_text_annotations):
         def post(msg_type, payload=None):
             self.msg_queue.put((msg_type, payload))
+
         def on_match(base_lower, file_name, page_num):
             pretty = self.ecs_original_map.get(base_lower, base_lower)
             post("match", (pretty, file_name, page_num))
+
         try:
             post("status", "Reading Excel…")
             df = load_table_with_dynamic_header(excel_path, sheet_name=0)
@@ -574,7 +598,8 @@ class HighlighterApp(tk.Tk):
                 post("progress", int((idx / total) * 100))
 
             if self.cancel_flag.is_set():
-                post("done", None); return
+                post("done", None)
+                return
 
             bldg_tag = sanitize_filename(building_name)
             combined_base = os.path.join(out_dir, f"{bldg_tag}_Highlighted_WK{week_number}.pdf")
