@@ -101,8 +101,8 @@ def extract_ecs_codes_from_df(df):
 def build_compare_index(ecs_primary, ignore_leading_digit):
     """
     Returns:
-      cmp_keys_nosep: set of canonical keys (no separators) to match against
-      nosep_to_primary: dict mapping cmp_key_nosep -> primary key from Excel
+      cmp_keys_nosep: set of canonical keys (no separators)
+      nosep_to_primary: map cmp_key_nosep -> primary key from Excel
       max_code_len: longest cmp_key length (for pruning)
     """
     cmp_keys = set()
@@ -125,20 +125,16 @@ def scan_pdf_for_rects(pdf_path,
                        cmp_keys_nosep,
                        max_code_len,
                        cancel_flag,
-                       on_match,
-                       pretty_from_cmpkey,
+                       on_match,              # on_match(cmp_key, filename, page_num, pretty_text)
+                       pretty_from_cmpkey,    # function(cmp_key)->pretty label
                        highlight_all_occurrences=False,
                        max_window_words=10):
     """
-    Robust search:
-      - tokenizes page into words (with rectangles),
-      - concatenates adjacent words (up to max_window_words) after removing separators,
-      - compares against cmp_keys_nosep.
     Returns:
-      hits (int)                              # number of rectangles added (approx.)
-      matched_cmp_keys (set[str])             # cmp keys that appeared anywhere
-      rects_by_page (dict[int -> list[(x0,y0,x1,y1)]])  # rectangles for highlighting
-      code_pages   (dict[cmp_key -> set[int]])           # which 0-based pages had each code
+      hits (int)
+      matched_cmp_keys (set[str])
+      rects_by_page (dict[int -> list[(x0,y0,x1,y1)]])
+      code_pages   (dict[cmp_key -> set[int]])
       total_pages  (int)
     """
     doc = fitz.open(pdf_path)
@@ -152,8 +148,7 @@ def scan_pdf_for_rects(pdf_path,
             if cancel_flag.is_set():
                 break
 
-            words = page.get_text("words", sort=True)  # list of tuples
-            # Each: (x0, y0, x1, y1, "text", block, line, word)
+            words = page.get_text("words", sort=True)  # (x0,y0,x1,y1,text,block,line,word)
             W = []
             for w in words:
                 x0, y0, x1, y1, t = float(w[0]), float(w[1]), float(w[2]), float(w[3]), (w[4] or "")
@@ -165,9 +160,8 @@ def scan_pdf_for_rects(pdf_path,
             if not W:
                 continue
 
-            seen_on_page = set()  # cmp keys already highlighted on this page (if not "all")
+            seen_on_page = set()
             page_rects = []
-            # For deduping rectangles a bit (avoid drawing same rect many times)
             rect_key_set = set()
 
             N = len(W)
@@ -176,38 +170,26 @@ def scan_pdf_for_rects(pdf_path,
                     break
                 s = ""
                 rects_run = []
-                # grow window
                 for j in range(i, min(i + max_window_words, N)):
                     rect, norm, raw = W[j]
                     s += norm
                     rects_run.append(rect)
-
-                    # prune if absurdly long
                     if len(s) > max_code_len + 4:
                         break
-
                     if s in cmp_keys_nosep:
-                        # Count the page hit
                         code_pages[s].add(page.number)
                         matched.add(s)
-
                         if highlight_all_occurrences or (s not in seen_on_page):
-                            # add rectangles for each word in the run
                             for (x0, y0, x1, y1) in rects_run:
                                 key = (round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2))
                                 if key not in rect_key_set:
                                     rect_key_set.add(key)
                                     page_rects.append((x0, y0, x1, y1))
                                     hits += 1
-
-                            # Tell UI (once per code per page)
                             if s not in seen_on_page:
                                 pretty = pretty_from_cmpkey(s)
                                 on_match(s, os.path.basename(pdf_path), page.number + 1, pretty)
-
                             seen_on_page.add(s)
-
-                        # If not highlighting "all", we can skip ahead to end of this window
                         if not highlight_all_occurrences:
                             break
 
@@ -234,7 +216,7 @@ def add_text_highlights(page, rects, color=(1, 1, 0), opacity=0.35):
         ann.update()
 
 # ---------- Combine (from ORIGINAL PDFs) with TEXT HIGHLIGHT ANNOTS ----------
-def combine_from_selection(out_path, selections, only_highlighted_pages, use_text_annotations=True):
+def combine_from_selection(out_path, selections, only_highlighted_pages, use_text_annotations=True, force_keep_pages=False):
     """
     selections: list of dicts:
       {
@@ -243,7 +225,11 @@ def combine_from_selection(out_path, selections, only_highlighted_pages, use_tex
         "keep_pages": set[int] or None,  # chosen in review (0-based)
         "rects_by_page": dict[int -> list[(x0,y0,x1,y1)]]
       }
-    If use_text_annotations: add real highlight annots on copied pages.
+
+    Behavior:
+      - If force_keep_pages=True  -> copy ONLY keep_pages (manual selection).
+      - Else if only_highlighted_pages=True -> copy hit_pages.
+      - Else -> copy ALL pages.
     """
     out = fitz.open()
     try:
@@ -253,10 +239,16 @@ def combine_from_selection(out_path, selections, only_highlighted_pages, use_tex
                 continue
             rects_by_page = item.get("rects_by_page", {})
             with fitz.open(pdf_path) as src:
-                if only_highlighted_pages:
-                    pages = sorted(list(item.get("keep_pages") or item.get("hit_pages") or []))
+                if force_keep_pages:
+                    pages = sorted(list(item.get("keep_pages") or []))
+                elif only_highlighted_pages:
+                    pages = sorted(list(item.get("hit_pages") or []))
                 else:
                     pages = list(range(src.page_count))
+
+                # Skip PDFs where nothing was selected
+                if not pages:
+                    continue
 
                 for p in pages:
                     out.insert_pdf(src, from_page=p, to_page=p)
@@ -270,7 +262,7 @@ def combine_from_selection(out_path, selections, only_highlighted_pages, use_tex
     finally:
         out.close()
 
-# ---------- Review dialog with LIVE PREVIEW (no files) ----------
+# ---------- Review dialog with LIVE PREVIEW + SORTABLE COLUMNS ----------
 class ReviewDialog(tk.Toplevel):
     def __init__(self, master, items):
         """
@@ -279,8 +271,8 @@ class ReviewDialog(tk.Toplevel):
         """
         super().__init__(master)
         self.title("Review highlighted pages to keep")
-        self.geometry("1100x700")
-        self.minsize(980, 600)
+        self.geometry("1100x720")
+        self.minsize(980, 640)
         self.transient(master)
         self.grab_set()
 
@@ -292,18 +284,18 @@ class ReviewDialog(tk.Toplevel):
         right = ttk.Frame(wrapper)
         right.pack(side="right", fill="both", expand=True, padx=(8, 0))
 
-        ttk.Label(left, text="Pages (double-click to toggle keep):").pack(anchor="w")
+        ttk.Label(left, text="Pages (double-click to toggle keep). Click column headers to sort.").pack(anchor="w")
 
         self.tree = ttk.Treeview(
             left,
             columns=("keep", "file", "page"),
             show="headings",
             selectmode="browse",
-            height=22
+            height=24
         )
-        self.tree.heading("keep", text="Keep")
-        self.tree.heading("file", text="File")
-        self.tree.heading("page", text="Page")
+        self.tree.heading("keep", text="Keep", command=lambda: self._sort_tree("keep"))
+        self.tree.heading("file", text="File", command=lambda: self._sort_tree("file"))
+        self.tree.heading("page", text="Page", command=lambda: self._sort_tree("page"))
         self.tree.column("keep", width=60, anchor="center")
         self.tree.column("file", width=520, anchor="w")
         self.tree.column("page", width=70, anchor="center")
@@ -313,12 +305,14 @@ class ReviewDialog(tk.Toplevel):
         self.keep_map = {}               # pdf_path -> set(page_idx)
         self.page_rects = {}             # (pdf_path, page_idx) -> list[rect]
         self._row_mapping = {}           # iid -> (pdf_path, page_idx)
+        self._pdf_display = {}           # pdf_path -> display name
 
         for it in items:
             pdf_path = it["pdf_path"]
             disp = it["display"]
             hit_pages = it["hit_pages"]
             rects_by_page = it["rects_by_page"]
+            self._pdf_display[pdf_path] = disp
             self.keep_map[pdf_path] = set(hit_pages)
             for p in hit_pages:
                 iid = self.tree.insert("", "end", values=("[x]", disp, p + 1))
@@ -361,6 +355,10 @@ class ReviewDialog(tk.Toplevel):
         self.tree.bind("<Double-1>", self._toggle_keep)
         self.tree.bind("<<TreeviewSelect>>", self._preview_selected)
 
+        # Default: sort by File A→Z to line up duplicates/revisions
+        self._sort_state = {"keep": False, "file": False, "page": False}  # False = ascending
+        self._sort_tree("file", toggle=False)
+
         if self.tree.get_children():
             first = self.tree.get_children()[0]
             self.tree.selection_set(first)
@@ -368,6 +366,47 @@ class ReviewDialog(tk.Toplevel):
             self._preview_selected()
 
         self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    # --- sorting ---
+    def _rows_snapshot(self):
+        rows = []
+        for iid in self.tree.get_children():
+            pdf_path, page = self._row_mapping[iid]
+            disp = self._pdf_display.get(pdf_path, os.path.basename(pdf_path))
+            keep = (page in self.keep_map.get(pdf_path, set()))
+            rows.append({
+                "pdf_path": pdf_path,
+                "page": page,
+                "display": disp,
+                "keep": keep
+            })
+        return rows
+
+    def _rebuild_tree(self, rows):
+        self.tree.delete(*self.tree.get_children())
+        self._row_mapping.clear()
+        for r in rows:
+            keep_txt = "[x]" if r["keep"] else "[ ]"
+            iid = self.tree.insert("", "end", values=(keep_txt, r["display"], r["page"] + 1))
+            self._row_mapping[iid] = (r["pdf_path"], r["page"])
+
+    def _sort_tree(self, column, toggle=True):
+        if toggle:
+            self._sort_state[column] = not self._sort_state.get(column, False)
+        reverse = self._sort_state.get(column, False)
+
+        rows = self._rows_snapshot()
+
+        if column == "file":
+            rows.sort(key=lambda r: (r["display"].lower(), r["page"]), reverse=reverse)
+        elif column == "page":
+            rows.sort(key=lambda r: r["page"], reverse=reverse)
+        elif column == "keep":
+            rows.sort(key=lambda r: ((not r["keep"]), r["display"].lower(), r["page"]), reverse=reverse)
+        else:
+            return
+
+        self._rebuild_tree(rows)
 
     # --- keep / selection ---
     def _toggle_keep(self, event=None):
@@ -474,8 +513,8 @@ class HighlighterApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ECS PDF Highlighter")
-        self.geometry("980x760")
-        self.minsize(960, 720)
+        self.geometry("980x780")
+        self.minsize(960, 740)
 
         # State
         self.excel_path = tk.StringVar()
@@ -504,29 +543,25 @@ class HighlighterApp(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 8, "pady": 6}
 
-        fr_top = ttk.Frame(self)
-        fr_top.pack(fill="x", **pad)
+        fr_top = ttk.Frame(self); fr_top.pack(fill="x", **pad)
         ttk.Label(fr_top, text="Week Number:").pack(side="left")
         ttk.Entry(fr_top, width=10, textvariable=self.week_number).pack(side="left", padx=8)
         ttk.Label(fr_top, text="Building Name:").pack(side="left", padx=(16, 0))
         ttk.Entry(fr_top, width=30, textvariable=self.building_name).pack(side="left", padx=8, fill="x", expand=True)
 
-        fr_opts = ttk.Frame(self)
-        fr_opts.pack(fill="x", **pad)
+        fr_opts = ttk.Frame(self); fr_opts.pack(fill="x", **pad)
         ttk.Checkbutton(fr_opts, text="Only keep highlighted pages", variable=self.only_highlighted_var).pack(side="left")
         ttk.Checkbutton(fr_opts, text="Review pages before saving", variable=self.review_pages_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Ignore leading digit in PDF codes", variable=self.ignore_lead_digit_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Highlight every occurrence", variable=self.highlight_all_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Use text highlight annotations (prints)", variable=self.use_text_annots_var).pack(side="left", padx=12)
 
-        fr_excel = ttk.Frame(self)
-        fr_excel.pack(fill="x", **pad)
+        fr_excel = ttk.Frame(self); fr_excel.pack(fill="x", **pad)
         ttk.Label(fr_excel, text="Excel (ECS Codes):").pack(side="left")
         ttk.Entry(fr_excel, textvariable=self.excel_path).pack(side="left", expand=True, fill="x", padx=8)
         ttk.Button(fr_excel, text="Browse…", command=self._pick_excel).pack(side="left")
 
-        fr_pdfs = ttk.LabelFrame(self, text="PDFs to Process")
-        fr_pdfs.pack(fill="both", expand=True, **pad)
+        fr_pdfs = ttk.LabelFrame(self, text="PDFs to Process"); fr_pdfs.pack(fill="both", expand=True, **pad)
         btns = ttk.Frame(fr_pdfs); btns.pack(fill="x", padx=6, pady=6)
         ttk.Button(btns, text="Add PDFs…", command=self._add_pdfs).pack(side="left")
         ttk.Button(btns, text="Remove Selected", command=self._remove_selected).pack(side="left", padx=6)
@@ -534,14 +569,12 @@ class HighlighterApp(tk.Tk):
         self.lst_pdfs = tk.Listbox(fr_pdfs, height=7, selectmode=tk.EXTENDED)
         self.lst_pdfs.pack(fill="both", expand=True, padx=6, pady=(0,6))
 
-        fr_out = ttk.Frame(self)
-        fr_out.pack(fill="x", **pad)
+        fr_out = ttk.Frame(self); fr_out.pack(fill="x", **pad)
         ttk.Label(fr_out, text="Output Folder:").pack(side="left")
         ttk.Entry(fr_out, textvariable=self.output_dir).pack(side="left", expand=True, fill="x", padx=8)
         ttk.Button(fr_out, text="Select…", command=self._pick_output_dir).pack(side="left")
 
-        fr_log = ttk.LabelFrame(self, text="Matches (ECS Code | File | Page)")
-        fr_log.pack(fill="both", expand=True, **pad)
+        fr_log = ttk.LabelFrame(self, text="Matches (ECS Code | File | Page)"); fr_log.pack(fill="both", expand=True, **pad)
         cols = ("code", "file", "page")
         self.tree = ttk.Treeview(fr_log, columns=cols, show="headings", height=12)
         for c, w in zip(cols, (260, 540, 70)):
@@ -549,15 +582,12 @@ class HighlighterApp(tk.Tk):
             self.tree.column(c, width=w, anchor="w" if c != "page" else "center")
         self.tree.pack(fill="both", expand=True, padx=6, pady=6)
 
-        fr_prog = ttk.Frame(self)
-        fr_prog.pack(fill="x", **pad)
+        fr_prog = ttk.Frame(self); fr_prog.pack(fill="x", **pad)
         self.prog = ttk.Progressbar(fr_prog, orient="horizontal", mode="determinate", maximum=100)
         self.prog.pack(side="left", expand=True, fill="x")
-        self.lbl_status = ttk.Label(fr_prog, text="Idle")
-        self.lbl_status.pack(side="left", padx=8)
+        self.lbl_status = ttk.Label(fr_prog, text="Idle"); self.lbl_status.pack(side="left", padx=8)
 
-        fr_btns = ttk.Frame(self)
-        fr_btns.pack(fill="x", **pad)
+        fr_btns = ttk.Frame(self); fr_btns.pack(fill="x", **pad)
         ttk.Button(fr_btns, text="Start", command=self._start).pack(side="left")
         ttk.Button(fr_btns, text="Stop", command=self._stop).pack(side="left", padx=6)
         ttk.Button(fr_btns, text="Exit", command=self._exit).pack(side="right")
@@ -777,13 +807,13 @@ class HighlighterApp(tk.Tk):
         if not processed:
             messagebox.showinfo("No Matches", "No pages matched; nothing to save.")
             self.lbl_status.config(text="No matches.")
-            # NotSurveyed = all codes
             self._write_not_surveyed_csv(out_dir, building_name, week_number,
                                          [original_map.get(p, p) for p in sorted(ecs_primary)])
             return
 
-        # Review selection
-        if self.review_pages_var.get():
+        # Review selection (sortable)
+        used_review = bool(self.review_pages_var.get())
+        if used_review:
             items = [{
                 "display": p["display"],
                 "pdf_path": p["pdf_path"],
@@ -799,7 +829,7 @@ class HighlighterApp(tk.Tk):
         else:
             keep_map = {p["pdf_path"]: set(p["hit_pages"]) for p in processed}
 
-        # Combine
+        # Build selections for combiner
         selections = []
         only_highlighted = bool(self.only_highlighted_var.get())
         for p in processed:
@@ -815,7 +845,8 @@ class HighlighterApp(tk.Tk):
                 out_path=combined_out_path,
                 selections=selections,
                 only_highlighted_pages=only_highlighted,
-                use_text_annotations=use_text_annotations
+                use_text_annotations=use_text_annotations,
+                force_keep_pages=used_review  # << ALWAYS honor manual selection if review used
             )
             if final_path:
                 self.lbl_status.config(text=f"Saved: {os.path.basename(final_path)}")
@@ -825,8 +856,8 @@ class HighlighterApp(tk.Tk):
             self.lbl_status.config(text="Combine failed.")
             return
 
-        # --- Build per-code summary (counts are DISTINCT PAGES) ---
-        primary_file_pages = defaultdict(lambda: defaultdict(set))  # primary -> file -> set(pages)
+        # Build per-code summary (distinct pages)
+        primary_file_pages = defaultdict(lambda: defaultdict(set))
         for cmp_key, file_map in agg_code_file_pages.items():
             primary = nosep_to_primary.get(cmp_key, cmp_key)
             for fn, pages in file_map.items():
@@ -842,16 +873,13 @@ class HighlighterApp(tk.Tk):
                                   for fn, pages in sorted(primary_file_pages[primary].items()))
             rows.append({"code": pretty, "total_pages": total_pages, "breakdown": breakdown})
 
-        # missing codes (use primaries only)
         missing_primary = sorted(list(ecs_primary - found_primary))
         not_found_count = len(missing_primary)
 
-        # Write CSVs
         summary_csv = self._write_summary_csv(out_dir, building_name, week_number, rows)
         self._write_not_surveyed_csv(out_dir, building_name, week_number,
                                      [original_map.get(p, p) for p in missing_primary])
 
-        # Show summary dialog
         SummaryDialog(self, rows, not_found_count, summary_csv)
 
     def _write_summary_csv(self, out_dir, building_name, week_number, rows):
