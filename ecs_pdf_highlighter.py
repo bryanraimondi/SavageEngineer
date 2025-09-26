@@ -46,10 +46,6 @@ def uniquify_path(path: str) -> str:
 
 # ---------- Excel parsing ----------
 def load_table_with_dynamic_header(xlsx_path, sheet_name=None):
-    """
-    Find the row that contains 'ECS Codes' / 'ECS Code' and treat it as the header.
-    Returns a DataFrame with proper headers (or None if not found).
-    """
     df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None, dtype=str)
     target_labels = {"ecs codes", "ecs code"}
     header_row_idx = None
@@ -67,7 +63,6 @@ def load_table_with_dynamic_header(xlsx_path, sheet_name=None):
     return data
 
 def extract_ecs_codes_from_df(df):
-    """Return (ecs_set_lower, original_map_lower_to_original)."""
     if df is None or df.empty:
         return set(), {}
     cols = [c for c in df.columns if str(c).strip().lower() in ("ecs codes", "ecs code")]
@@ -96,9 +91,6 @@ def extract_ecs_codes_from_df(df):
 
 # ---------- PDF scan (NO TEMP FILES) ----------
 def build_ecs_compare_set(ecs_lower_set, ignore_leading_digit):
-    """
-    If ignore_leading_digit is True, also add versions of ECS codes without a single leading digit.
-    """
     if not ignore_leading_digit:
         return set(ecs_lower_set)
     comp = set(ecs_lower_set)
@@ -110,24 +102,21 @@ def build_ecs_compare_set(ecs_lower_set, ignore_leading_digit):
 def scan_pdf_for_rects(pdf_path, ecs_compare_set, cancel_flag,
                        on_match, ignore_leading_digit, highlight_all_occurrences=False):
     """
-    Scan a PDF and return per-page rectangles for matches (no annotations, no temp files).
     Returns:
-      hits (int),
-      matched_bases (set[str]),
-      rects_by_page (dict[int -> list[(x0,y0,x1,y1)]]),
-      total_pages (int)
+      hits, matched_bases, rects_by_page {page_index: [(x0,y0,x1,y1), ...]}, total_pages
     """
     doc = fitz.open(pdf_path)
     hits = 0
     matched_bases = set()
     rects_by_page = {}
-    seen_bases_global = set()  # for first-occurrence-per-PDF mode
+    seen_bases_global = set()  # for "first occurrence per PDF" mode
 
     try:
         for page in doc:
             if cancel_flag.is_set():
                 break
             page_rects = []
+            # iterate word boxes
             for (x0, y0, x1, y1, wtext, *_rest) in page.get_text("words", sort=True):
                 if cancel_flag.is_set():
                     break
@@ -140,16 +129,14 @@ def scan_pdf_for_rects(pdf_path, ecs_compare_set, cancel_flag,
                     continue
 
                 cmp_base = base[1:] if (ignore_leading_digit and base[0:1].isdigit()) else base
-
                 if cmp_base and (cmp_base in ecs_compare_set) and (highlight_all_occurrences or (cmp_base not in seen_bases_global)):
-                    # try literal rectangles first; fallback to the word box
+                    # Prefer literal search rectangles for exact text extent
                     rects = page.search_for(wtext) or []
                     if rects:
                         for r in rects:
                             page_rects.append((float(r.x0), float(r.y0), float(r.x1), float(r.y1)))
                     else:
                         page_rects.append((x0, y0, x1, y1))
-
                     hits += 1
                     matched_bases.add(cmp_base)
                     seen_bases_global.add(cmp_base)
@@ -162,8 +149,25 @@ def scan_pdf_for_rects(pdf_path, ecs_compare_set, cancel_flag,
     finally:
         doc.close()
 
-# ---------- Combine (from ORIGINAL PDFs) with optional BURN ----------
-def combine_from_selection(out_path, selections, only_highlighted_pages, burn_highlights=False, highlight_rects_color=(1,1,0), highlight_fill_opacity=0.25):
+# ---------- Combine (from ORIGINAL PDFs) with TEXT HIGHLIGHT ANNOTS ----------
+def add_text_highlights(page, rects, color=(1,1,0), opacity=0.35):
+    """
+    Add proper PDF 'Highlight' annotations for each rect and make them printable.
+    """
+    for (x0, y0, x1, y1) in rects:
+        r = fitz.Rect(x0, y0, x1, y1)
+        ann = page.add_highlight_annot(r)
+        try:
+            ann.set_colors(stroke=color)   # highlight color
+            ann.set_opacity(opacity)
+            # Ensure they print:
+            if hasattr(fitz, "ANNOT_PRINT"):
+                ann.set_flags(fitz.ANNOT_PRINT)
+        except Exception:
+            pass
+        ann.update()
+
+def combine_from_selection(out_path, selections, only_highlighted_pages, use_text_annotations=True):
     """
     selections: list of dicts:
       {
@@ -172,9 +176,7 @@ def combine_from_selection(out_path, selections, only_highlighted_pages, burn_hi
         "keep_pages": set[int] or None,  # chosen in review (0-based)
         "rects_by_page": dict[int -> list[(x0,y0,x1,y1)]]
       }
-    - If only_highlighted_pages True -> copy only keep_pages (or hit_pages if None).
-    - Else -> copy entire document(s).
-    - If burn_highlights True -> draw translucent yellow rectangles on the copied pages.
+    If use_text_annotations: add real highlight annots on copied pages.
     """
     out = fitz.open()
     try:
@@ -190,27 +192,17 @@ def combine_from_selection(out_path, selections, only_highlighted_pages, burn_hi
                     pages = list(range(src.page_count))
 
                 for p in pages:
-                    # copy one page
+                    # copy page into output
                     try:
                         out.insert_pdf(src, from_page=p, to_page=p)
                     except TypeError:
-                        # Very old PyMuPDF still supports from/to; keep same
                         out.insert_pdf(src, from_page=p, to_page=p)
 
-                    # last page is the one we just inserted
                     out_pg = out.load_page(out.page_count - 1)
 
-                    if burn_highlights and p in rects_by_page:
-                        for (x0, y0, x1, y1) in rects_by_page[p]:
-                            r = fitz.Rect(x0, y0, x1, y1)
-                            # filled translucent rect (burned highlight)
-                            out_pg.draw_rect(
-                                r,
-                                color=highlight_rects_color,  # outline (yellow)
-                                fill=highlight_rects_color,   # fill (yellow)
-                                fill_opacity=highlight_fill_opacity,
-                                width=0.5
-                            )
+                    # add text highlight annotations (preferred)
+                    if use_text_annotations and p in rects_by_page:
+                        add_text_highlights(out_pg, rects_by_page[p], color=(1,1,0), opacity=0.35)
 
         out_path = uniquify_path(out_path)
         out.save(out_path)
@@ -246,7 +238,7 @@ class ReviewDialog(tk.Toplevel):
                                  show="headings", selectmode="browse", height=22)
         self.tree.heading("keep", text="Keep")
         self.tree.heading("file", text="File")
-        self.tree.heading("page", text="Page")
+               self.tree.heading("page", text="Page")
         self.tree.column("keep", width=60, anchor="center")
         self.tree.column("file", width=520, anchor="w")
         self.tree.column("page", width=70, anchor="center")
@@ -300,7 +292,6 @@ class ReviewDialog(tk.Toplevel):
         self.tree.bind("<Double-1>", self._toggle_keep)
         self.tree.bind("<<TreeviewSelect>>", self._preview_selected)
 
-        # Auto-select first row to show a preview right away
         if self.tree.get_children():
             first = self.tree.get_children()[0]
             self.tree.selection_set(first)
@@ -369,7 +360,7 @@ class ReviewDialog(tk.Toplevel):
             self.canvas.create_image(0, 0, anchor="nw", image=img)
             self.canvas.config(scrollregion=(0, 0, img.width(), img.height()))
 
-            # Overlay highlight boxes (canvas rectangles)
+            # Overlay highlight boxes (for preview only)
             rects = self.page_rects.get((pdf_path, page_idx), [])
             z = self._zoom
             for (x0, y0, x1, y1) in rects:
@@ -397,7 +388,7 @@ class HighlighterApp(tk.Tk):
         self.review_pages_var = tk.BooleanVar(value=True)
         self.ignore_lead_digit_var = tk.BooleanVar(value=False)
         self.highlight_all_var = tk.BooleanVar(value=True)
-        self.burn_highlights_var = tk.BooleanVar(value=True)  # NEW
+        self.use_text_annots_var = tk.BooleanVar(value=True)   # NEW: use real highlight annotations
 
         self.pdf_list = []
         self.cancel_flag = threading.Event()
@@ -422,7 +413,7 @@ class HighlighterApp(tk.Tk):
         ttk.Checkbutton(fr_opts, text="Review pages before saving", variable=self.review_pages_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Ignore leading digit in PDF codes", variable=self.ignore_lead_digit_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Highlight every occurrence", variable=self.highlight_all_var).pack(side="left", padx=12)
-        ttk.Checkbutton(fr_opts, text="Burn highlights into output", variable=self.burn_highlights_var).pack(side="left", padx=12)
+        ttk.Checkbutton(fr_opts, text="Use text highlight annotations (prints)", variable=self.use_text_annots_var).pack(side="left", padx=12)
 
         fr_excel = ttk.Frame(self); fr_excel.pack(fill="x", **pad)
         ttk.Label(fr_excel, text="Excel (ECS Codes):").pack(side="left")
@@ -517,7 +508,7 @@ class HighlighterApp(tk.Tk):
             week, bldg, excel, list(self.pdf_list), out_dir,
             bool(self.ignore_lead_digit_var.get()),
             bool(self.highlight_all_var.get()),
-            bool(self.burn_highlights_var.get())
+            bool(self.use_text_annots_var.get())
         )
         self.worker_thread = threading.Thread(target=self._worker, args=args, daemon=True)
         self.worker_thread.start()
@@ -531,7 +522,7 @@ class HighlighterApp(tk.Tk):
 
     # ----- Worker -----
     def _worker(self, week_number, building_name, excel_path, pdf_paths,
-                out_dir, ignore_leading_digit, highlight_all_occurrences, burn_highlights):
+                out_dir, ignore_leading_digit, highlight_all_occurrences, use_text_annotations):
         def post(msg_type, payload=None):
             self.msg_queue.put((msg_type, payload))
         def on_match(base_lower, file_name, page_num):
@@ -597,7 +588,7 @@ class HighlighterApp(tk.Tk):
                 "building_name": building_name,
                 "week_number": week_number,
                 "out_dir": out_dir,
-                "burn_highlights": burn_highlights
+                "use_text_annotations": use_text_annotations
             })
         except Exception as e:
             post("error", f"Unexpected error: {e}")
@@ -645,7 +636,7 @@ class HighlighterApp(tk.Tk):
         building_name = bundle["building_name"]
         week_number = bundle["week_number"]
         out_dir = bundle["out_dir"]
-        burn_highlights = bool(bundle.get("burn_highlights", True))
+        use_text_annotations = bool(bundle.get("use_text_annotations", True))
 
         if not processed:
             messagebox.showinfo("No Matches", "No pages matched; nothing to save.")
@@ -683,7 +674,7 @@ class HighlighterApp(tk.Tk):
                 out_path=combined_out_path,
                 selections=selections,
                 only_highlighted_pages=only_highlighted,
-                burn_highlights=burn_highlights
+                use_text_annotations=use_text_annotations
             )
             if final_path:
                 self.lbl_status.config(text=f"Saved: {os.path.basename(final_path)}")
