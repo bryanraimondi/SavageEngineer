@@ -262,17 +262,19 @@ def combine_from_selection(out_path, selections, only_highlighted_pages, use_tex
     finally:
         out.close()
 
-# ---------- Review dialog with LIVE PREVIEW + SORTABLE COLUMNS ----------
+# ---------- Review dialog with LIVE PREVIEW + SORTABLE COLUMNS + CODES ----------
 class ReviewDialog(tk.Toplevel):
     def __init__(self, master, items):
         """
         items: list of dicts with:
-          display, pdf_path, hit_pages (list[int]), rects_by_page (dict[int -> list[rect]])
+          display, pdf_path, hit_pages (list[int]),
+          rects_by_page (dict[int -> list[rect]]),
+          page_codes (dict[int -> list[str]])   # pretty codes per page
         """
         super().__init__(master)
         self.title("Review highlighted pages to keep")
-        self.geometry("1100x720")
-        self.minsize(980, 640)
+        self.geometry("1200x740")
+        self.minsize(1080, 660)
         self.transient(master)
         self.grab_set()
 
@@ -288,7 +290,7 @@ class ReviewDialog(tk.Toplevel):
 
         self.tree = ttk.Treeview(
             left,
-            columns=("keep", "file", "page"),
+            columns=("keep", "file", "page", "codes"),
             show="headings",
             selectmode="browse",
             height=24
@@ -296,14 +298,17 @@ class ReviewDialog(tk.Toplevel):
         self.tree.heading("keep", text="Keep", command=lambda: self._sort_tree("keep"))
         self.tree.heading("file", text="File", command=lambda: self._sort_tree("file"))
         self.tree.heading("page", text="Page", command=lambda: self._sort_tree("page"))
+        self.tree.heading("codes", text="Codes", command=lambda: self._sort_tree("codes"))
         self.tree.column("keep", width=60, anchor="center")
         self.tree.column("file", width=520, anchor="w")
         self.tree.column("page", width=70, anchor="center")
+        self.tree.column("codes", width=260, anchor="w")
         self.tree.pack(fill="both", expand=True)
 
         # Keep state + lookup
         self.keep_map = {}               # pdf_path -> set(page_idx)
         self.page_rects = {}             # (pdf_path, page_idx) -> list[rect]
+        self.page_codes = {}             # (pdf_path, page_idx) -> list[str]  (pretty)
         self._row_mapping = {}           # iid -> (pdf_path, page_idx)
         self._pdf_display = {}           # pdf_path -> display name
 
@@ -312,12 +317,15 @@ class ReviewDialog(tk.Toplevel):
             disp = it["display"]
             hit_pages = it["hit_pages"]
             rects_by_page = it["rects_by_page"]
+            page_codes = it.get("page_codes", {})
             self._pdf_display[pdf_path] = disp
             self.keep_map[pdf_path] = set(hit_pages)
             for p in hit_pages:
-                iid = self.tree.insert("", "end", values=("[x]", disp, p + 1))
+                codes_pretty = ", ".join(sorted(page_codes.get(p, [])))
+                iid = self.tree.insert("", "end", values=("[x]", disp, p + 1, codes_pretty))
                 self._row_mapping[iid] = (pdf_path, p)
                 self.page_rects[(pdf_path, p)] = rects_by_page.get(p, [])
+                self.page_codes[(pdf_path, p)] = page_codes.get(p, [])
 
         # ===== PREVIEW pane =====
         ttk.Label(right, text="Preview").pack(anchor="w")
@@ -356,7 +364,7 @@ class ReviewDialog(tk.Toplevel):
         self.tree.bind("<<TreeviewSelect>>", self._preview_selected)
 
         # Default: sort by File A→Z to line up duplicates/revisions
-        self._sort_state = {"keep": False, "file": False, "page": False}  # False = ascending
+        self._sort_state = {"keep": False, "file": False, "page": False, "codes": False}  # False = ascending
         self._sort_tree("file", toggle=False)
 
         if self.tree.get_children():
@@ -374,11 +382,13 @@ class ReviewDialog(tk.Toplevel):
             pdf_path, page = self._row_mapping[iid]
             disp = self._pdf_display.get(pdf_path, os.path.basename(pdf_path))
             keep = (page in self.keep_map.get(pdf_path, set()))
+            codes = ", ".join(sorted(self.page_codes.get((pdf_path, page), [])))
             rows.append({
                 "pdf_path": pdf_path,
                 "page": page,
                 "display": disp,
-                "keep": keep
+                "keep": keep,
+                "codes": codes
             })
         return rows
 
@@ -387,7 +397,7 @@ class ReviewDialog(tk.Toplevel):
         self._row_mapping.clear()
         for r in rows:
             keep_txt = "[x]" if r["keep"] else "[ ]"
-            iid = self.tree.insert("", "end", values=(keep_txt, r["display"], r["page"] + 1))
+            iid = self.tree.insert("", "end", values=(keep_txt, r["display"], r["page"] + 1, r["codes"]))
             self._row_mapping[iid] = (r["pdf_path"], r["page"])
 
     def _sort_tree(self, column, toggle=True):
@@ -403,6 +413,8 @@ class ReviewDialog(tk.Toplevel):
             rows.sort(key=lambda r: r["page"], reverse=reverse)
         elif column == "keep":
             rows.sort(key=lambda r: ((not r["keep"]), r["display"].lower(), r["page"]), reverse=reverse)
+        elif column == "codes":
+            rows.sort(key=lambda r: (r["codes"].lower(), r["display"].lower(), r["page"]), reverse=reverse)
         else:
             return
 
@@ -513,8 +525,8 @@ class HighlighterApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ECS PDF Highlighter")
-        self.geometry("980x780")
-        self.minsize(960, 740)
+        self.geometry("1020x820")
+        self.minsize(1000, 780)
 
         # State
         self.excel_path = tk.StringVar()
@@ -536,6 +548,10 @@ class HighlighterApp(tk.Tk):
         # Excel originals (pretty) + compare-key mapping
         self.ecs_original_map = {}          # primary -> pretty
         self.nosep_to_primary = {}          # cmp_key -> primary
+
+        # Main matches aggregation (for 4th column)
+        self.main_page_codes = defaultdict(set)   # key = (file_name, page_num_1based) -> set(pretty codes)
+        self.main_row_iid = {}                    # key -> tree item id
 
         self._build_ui()
         self._poll_messages()
@@ -574,12 +590,17 @@ class HighlighterApp(tk.Tk):
         ttk.Entry(fr_out, textvariable=self.output_dir).pack(side="left", expand=True, fill="x", padx=8)
         ttk.Button(fr_out, text="Select…", command=self._pick_output_dir).pack(side="left")
 
-        fr_log = ttk.LabelFrame(self, text="Matches (ECS Code | File | Page)"); fr_log.pack(fill="both", expand=True, **pad)
-        cols = ("code", "file", "page")
+        fr_log = ttk.LabelFrame(self, text="Matches (ECS Code | File | Page | Codes on Page)"); fr_log.pack(fill="both", expand=True, **pad)
+        cols = ("code", "file", "page", "codes_on_page")
         self.tree = ttk.Treeview(fr_log, columns=cols, show="headings", height=12)
-        for c, w in zip(cols, (260, 540, 70)):
-            self.tree.heading(c, text=c.capitalize())
-            self.tree.column(c, width=w, anchor="w" if c != "page" else "center")
+        self.tree.heading("code", text="Code")
+        self.tree.heading("file", text="File")
+        self.tree.heading("page", text="Page")
+        self.tree.heading("codes_on_page", text="Codes (on page)")
+        self.tree.column("code", width=180, anchor="w")
+        self.tree.column("file", width=520, anchor="w")
+        self.tree.column("page", width=60, anchor="center")
+        self.tree.column("codes_on_page", width=220, anchor="w")
         self.tree.pack(fill="both", expand=True, padx=6, pady=6)
 
         fr_prog = ttk.Frame(self); fr_prog.pack(fill="x", **pad)
@@ -643,6 +664,12 @@ class HighlighterApp(tk.Tk):
         self.output_dir.set(out_dir)
         os.makedirs(out_dir, exist_ok=True)
 
+        # reset main aggregation per run
+        self.main_page_codes.clear()
+        self.main_row_iid.clear()
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+
         self.cancel_flag.clear()
         self.prog["value"] = 0
         self.lbl_status.config(text="Starting…")
@@ -674,6 +701,7 @@ class HighlighterApp(tk.Tk):
             return self.ecs_original_map.get(primary, primary)
 
         def on_match(cmp_key, file_name, page_num, pretty_text):
+            # page_num is 1-based here for the UI list
             post("match", (pretty_text, file_name, page_num))
 
         try:
@@ -711,12 +739,20 @@ class HighlighterApp(tk.Tk):
                     highlight_all_occurrences=highlight_all_occurrences
                 )
                 if hits > 0 and not self.cancel_flag.is_set():
+                    # Build pretty codes per page for the Review dialog
+                    page_codes = defaultdict(set)  # page -> set(pretty codes)
+                    for cmp_key, pages in code_pages.items():
+                        pretty = pretty_from_cmpkey(cmp_key)
+                        for pidx in pages:
+                            page_codes[pidx].add(pretty)
+
                     hit_pages = sorted(list(rects_by_page.keys()))
                     processed.append({
                         "display": os.path.basename(pdf),
                         "pdf_path": pdf,
                         "hit_pages": hit_pages,
                         "rects_by_page": rects_by_page,
+                        "page_codes": {k: sorted(list(v)) for k, v in page_codes.items()},
                         "total_pages": total_pages
                     })
                     fname = os.path.basename(pdf)
@@ -775,8 +811,21 @@ class HighlighterApp(tk.Tk):
                         pass
 
                 elif msg_type == "match":
-                    code, file_name, page_num = payload
-                    self.tree.insert("", "end", values=(code, file_name, page_num))
+                    # payload: (pretty_code, file_name, page_num_1based)
+                    pretty_code, file_name, page_num = payload
+                    key = (file_name, page_num)
+                    # update aggregation for the main list
+                    self.main_page_codes[key].add(pretty_code)
+                    codes_str = ", ".join(sorted(self.main_page_codes[key]))
+
+                    if key in self.main_row_iid:
+                        iid = self.main_row_iid[key]
+                        # Update existing row's "codes_on_page" column (4th col)
+                        self.tree.set(iid, "codes_on_page", codes_str)
+                    else:
+                        # Insert a new row showing this page (with first code and set)
+                        iid = self.tree.insert("", "end", values=(pretty_code, file_name, page_num, codes_str))
+                        self.main_row_iid[key] = iid
 
                 elif msg_type == "error":
                     self.lbl_status.config(text="Error")
@@ -811,14 +860,15 @@ class HighlighterApp(tk.Tk):
                                          [original_map.get(p, p) for p in sorted(ecs_primary)])
             return
 
-        # Review selection (sortable)
+        # Review selection (sortable; includes Codes column)
         used_review = bool(self.review_pages_var.get())
         if used_review:
             items = [{
                 "display": p["display"],
                 "pdf_path": p["pdf_path"],
                 "hit_pages": p["hit_pages"],
-                "rects_by_page": p["rects_by_page"]
+                "rects_by_page": p["rects_by_page"],
+                "page_codes": p.get("page_codes", {})
             } for p in processed]
             dlg = ReviewDialog(self, items)
             self.wait_window(dlg)
@@ -845,8 +895,8 @@ class HighlighterApp(tk.Tk):
                 out_path=combined_out_path,
                 selections=selections,
                 only_highlighted_pages=only_highlighted,
-                use_text_annotations=use_text_annotations,
-                force_keep_pages=used_review  # << ALWAYS honor manual selection if review used
+                use_text_annotations=use_text_annots_var := use_text_annotations,
+                force_keep_pages=used_review  # ALWAYS honor manual selection if review used
             )
             if final_path:
                 self.lbl_status.config(text=f"Saved: {os.path.basename(final_path)}")
