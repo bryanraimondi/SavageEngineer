@@ -895,7 +895,7 @@ class HighlighterApp(tk.Tk):
                 out_path=combined_out_path,
                 selections=selections,
                 only_highlighted_pages=only_highlighted,
-                use_text_annotations=use_text_annots_var := use_text_annotations,
+                use_text_annotations=use_text_annotations,
                 force_keep_pages=used_review  # ALWAYS honor manual selection if review used
             )
             if final_path:
