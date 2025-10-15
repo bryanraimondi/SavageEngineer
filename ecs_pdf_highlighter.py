@@ -20,6 +20,10 @@ import bisect
 DASH_CHARS = "-\u2010\u2011\u2012\u2013\u2014\u2212"  # -, ‐, -, ‒, –, —, −
 _STRIP_EDGE_PUNCT = re.compile(r'^[\s"\'()\[\]{}:;,.–—\-]+|[\s"\'()\[\]{}:;,.–—\-]+$')
 
+# A3 dimensions in PostScript points (72 pt per inch): 11.69" x 16.54" ≈ 842 x 1191
+A3_PORTRAIT = (842.0, 1191.0)
+A3_LANDSCAPE = (1191.0, 842.0)
+
 def unify_dashes(s: str) -> str:
     if not s:
         return s
@@ -331,7 +335,23 @@ def add_text_highlights(page, rects, color=(1, 1, 0), opacity=0.35):
             pass
         ann.update()
 
-def combine_pages_to_new(out_path, page_items, use_text_annotations=True):
+def _fit_scale_and_offset(src_w, src_h, dst_w, dst_h):
+    """
+    Compute uniform scale and offsets to fit source (src_w x src_h) into destination (dst_w x dst_h)
+    with centered placement. Returns (scale, dx, dy).
+    """
+    if src_w <= 0 or src_h <= 0:
+        return 1.0, 0.0, 0.0
+    sx = dst_w / src_w
+    sy = dst_h / src_h
+    s = min(sx, sy)
+    new_w = src_w * s
+    new_h = src_h * s
+    dx = (dst_w - new_w) * 0.5
+    dy = (dst_h - new_h) * 0.5
+    return s, dx, dy
+
+def combine_pages_to_new(out_path, page_items, use_text_annotations=True, scale_to_a3=False):
     """
     page_items: list of dicts:
       {
@@ -339,6 +359,9 @@ def combine_pages_to_new(out_path, page_items, use_text_annotations=True):
         "page_idx": int,    # 0-based
         "rects": list[(x0,y0,x1,y1)]
       }
+
+    If scale_to_a3 is True, each output page is an A3 sheet (auto portrait/landscape),
+    content is fit (centered), and highlight rects are transformed accordingly.
     """
     out = fitz.open()
     try:
@@ -352,10 +375,40 @@ def combine_pages_to_new(out_path, page_items, use_text_annotations=True):
             with fitz.open(pdf_path) as src:
                 for it in items:
                     p = it["page_idx"]
-                    out.insert_pdf(src, from_page=p, to_page=p)
-                    out_pg = out.load_page(out.page_count - 1)
+                    src_pg = src.load_page(p)
+                    src_rect = src_pg.rect
+                    sw, sh = float(src_rect.width), float(src_rect.height)
+
+                    if not scale_to_a3:
+                        # 1:1 copy, then annotate
+                        out.insert_pdf(src, from_page=p, to_page=p)
+                        out_pg = out.load_page(out.page_count - 1)
+                        if use_text_annotations and it["rects"]:
+                            add_text_highlights(out_pg, it["rects"], color=(1, 1, 0), opacity=0.35)
+                        continue
+
+                    # --- scale to A3 ---
+                    # Choose orientation that matches the source aspect better.
+                    src_landscape = sw >= sh
+                    tw, th = (A3_LANDSCAPE if src_landscape else A3_PORTRAIT)
+                    out_pg = out.new_page(width=tw, height=th)
+
+                    # Place the original page onto this A3 page
+                    dst_rect = fitz.Rect(0, 0, tw, th)
+                    out_pg.show_pdf_page(dst_rect, src, p)  # auto-fit into rect
+
+                    # Compute our own scale/offset to transform highlight rects consistently
+                    s, dx, dy = _fit_scale_and_offset(sw, sh, tw, th)
+
                     if use_text_annotations and it["rects"]:
-                        add_text_highlights(out_pg, it["rects"], color=(1, 1, 0), opacity=0.35)
+                        xfm_rects = []
+                        for (x0, y0, x1, y1) in it["rects"]:
+                            fx0 = x0 * s + dx
+                            fy0 = y0 * s + dy
+                            fx1 = x1 * s + dx
+                            fy1 = y1 * s + dy
+                            xfm_rects.append((fx0, fy0, fx1, fy1))
+                        add_text_highlights(out_pg, xfm_rects, color=(1, 1, 0), opacity=0.35)
 
         out_path = uniquify_path(out_path)
         out.save(out_path)
@@ -370,11 +423,6 @@ def chunk_list(seq, n):
 
 # ======================== Building inference logic =====================
 
-# Rules:
-# - If code looks like DIGIT + 3 LETTERS at start (e.g., 1HLA...), building = that 4-char block (e.g., "1HLA")
-# - Else remove leading digit/hyphen, take first 2 or 3 letters; prefer 2 if followed by '-' (e.g., 1HK-...), else 3.
-# - Fallback to first 2 letters if ambiguous; uppercase always.
-
 _LEADING_D3L = re.compile(r'^[0-9]([a-z]{3})', re.I)
 _FIRST_LETTERS = re.compile(r'[a-z]+', re.I)
 
@@ -383,34 +431,27 @@ def infer_building_from_code(pretty_code: str) -> str:
     if not s:
         return "UNKWN"
     s_no = re.sub(r'[^0-9A-Za-z-]', '', s)
-    # Case 1: digit + 3 letters
     m = _LEADING_D3L.match(s_no)
     if m:
         return (s_no[0] + m.group(1)).upper()
-    # Strip any leading digit and/or hyphens
     t = re.sub(r'^[0-9-]+', '', s_no)
     m2 = _FIRST_LETTERS.match(t)
     if not m2:
         return "UNKWN"
     letters = m2.group(0).upper()
-    if '-' in s_no[:5]:  # pattern like 1HK-0...
+    if '-' in s_no[:5]:
         return letters[:2] if len(letters) >= 2 else letters
-    # otherwise prefer first 3 letters if present
     return letters[:3] if len(letters) >= 3 else letters
 
 # ========================== Worker task (MP) ===========================
 
 def _process_pdf_task(args):
-    """
-    Top-level function so it's picklable on Windows.
-    Returns a serializable dict per PDF.
-    """
     (pdf_path,
      cmp_keys_list,
      use_ac,
      highlight_all_occurrences) = args
 
-    cancel_flag = _DummyCancel()  # worker runs to completion
+    cancel_flag = _DummyCancel()
     cmp_keys = set(cmp_keys_list)
 
     try:
@@ -449,10 +490,10 @@ def _process_pdf_task(args):
             "display": os.path.basename(pdf_path),
             "hits": int(hits),
             "rects_by_page": rects_by_page_ser,
-            "code_pages": code_pages_ser,  # cmp_key -> [0-based pages]
-            "hit_pages": hit_pages,        # 0-based
+            "code_pages": code_pages_ser,
+            "hit_pages": hit_pages,
             "total_pages": int(total_pages),
-            "match_pairs": match_pairs     # list[(cmp_key, 1-based page)]
+            "match_pairs": match_pairs
         }
     except Exception as e:
         return {
@@ -481,18 +522,23 @@ class ReviewDialog(tk.Toplevel):
         self.transient(master)
         self.grab_set()
 
-        wrapper = ttk.Frame(self)
-        wrapper.pack(fill="both", expand=True, padx=8, pady=8)
+        # ====== Resizable split panes ======
+        paned = ttk.Panedwindow(self, orient="horizontal")
+        paned.pack(fill="both", expand=True, padx=8, pady=8)
 
-        left = ttk.Frame(wrapper)
-        left.pack(side="left", fill="both", expand=True)
-        right = ttk.Frame(wrapper)
-        right.pack(side="right", fill="both", expand=True, padx=(8, 0))
+        left = ttk.Frame(paned)
+        right = ttk.Frame(paned)
+        paned.add(left, weight=3)   # give more weight to table by default
+        paned.add(right, weight=2)  # preview pane also resizable
 
-        ttk.Label(left, text="Pages (double-click to toggle keep). Click column headers to sort, or use the Move buttons to set a custom order.").pack(anchor="w")
+        ttk.Label(left, text="Pages (double-click to toggle keep). Click headers to sort, use Move to reorder.").pack(anchor="w")
+
+        # === Treeview with scrollbars ===
+        tree_frame = ttk.Frame(left)
+        tree_frame.pack(fill="both", expand=True)
 
         self.tree = ttk.Treeview(
-            left,
+            tree_frame,
             columns=("order", "keep", "file", "page", "codes"),
             show="headings",
             selectmode="browse",
@@ -508,7 +554,16 @@ class ReviewDialog(tk.Toplevel):
         self.tree.column("file", width=500, anchor="w")
         self.tree.column("page", width=70, anchor="center")
         self.tree.column("codes", width=300, anchor="w")
-        self.tree.pack(fill="both", expand=True)
+
+        ybar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        xbar = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        ybar.grid(row=0, column=1, sticky="ns")
+        xbar.grid(row=1, column=0, sticky="ew")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
 
         self.keep_map = {}               # pdf_path -> set(page_idx)
         self.page_rects = {}             # (pdf_path, page_idx) -> list[rect]
@@ -591,7 +646,7 @@ class ReviewDialog(tk.Toplevel):
         self.bind("<Escape>", lambda e: (self.attributes("-fullscreen", False), self._restore()))
         self.bind("<Control-m>", lambda e: self._maximize())
 
-        # Default: keep insertion order numbered; allow sorting via headers if wanted
+        # Default: keep insertion order numbered
         self._sort_state = {"keep": False, "file": False, "page": False, "codes": False}
 
         if self.tree.get_children():
@@ -822,8 +877,8 @@ class HighlighterApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ECS PDF Highlighter")
-        self.geometry("1120x880")
-        self.minsize(1100, 840)
+        self.geometry("1120x920")
+        self.minsize(1100, 880)
 
         # State
         self.excel_paths = []  # MULTIPLE EXCELS
@@ -837,6 +892,7 @@ class HighlighterApp(tk.Tk):
         self.ignore_lead_digit_var = tk.BooleanVar(value=False)
         self.highlight_all_var = tk.BooleanVar(value=True)
         self.use_text_annots_var = tk.BooleanVar(value=True)
+        self.scale_to_a3_var = tk.BooleanVar(value=False)  # NEW: scale output to A3
 
         self.turbo_var = tk.BooleanVar(value=True)          # Aho–Corasick
         self.parallel_var = tk.BooleanVar(value=True)       # Process PDFs in parallel
@@ -874,6 +930,7 @@ class HighlighterApp(tk.Tk):
         ttk.Checkbutton(fr_opts, text="Ignore leading digit in PDF codes", variable=self.ignore_lead_digit_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Highlight every occurrence", variable=self.highlight_all_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Use text highlight annotations (prints)", variable=self.use_text_annots_var).pack(side="left", padx=12)
+        ttk.Checkbutton(fr_opts, text="Scale output pages to A3", variable=self.scale_to_a3_var).pack(side="left", padx=12)  # NEW
         ttk.Checkbutton(fr_opts, text="Turbo (Aho–Corasick)", variable=self.turbo_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Parallel PDFs", variable=self.parallel_var).pack(side="left", padx=12)
 
@@ -1007,7 +1064,8 @@ class HighlighterApp(tk.Tk):
             bool(self.highlight_all_var.get()),
             bool(self.use_text_annots_var.get()),
             bool(self.turbo_var.get()),
-            bool(self.parallel_var.get())
+            bool(self.parallel_var.get()),
+            bool(self.scale_to_a3_var.get())
         )
         self.worker_thread = threading.Thread(target=self._worker, args=args, daemon=True)
         self.worker_thread.start()
@@ -1022,7 +1080,7 @@ class HighlighterApp(tk.Tk):
     # background worker
     def _worker(self, week_number, root_name, excel_paths, pdf_paths, out_dir, pages_per_file,
                 ignore_leading_digit, highlight_all_occurrences,
-                use_text_annotations, turbo_mode, parallel_mode):
+                use_text_annotations, turbo_mode, parallel_mode, scale_to_a3):
 
         def post(msg_type, payload=None):
             self.msg_queue.put((msg_type, payload))
@@ -1037,7 +1095,6 @@ class HighlighterApp(tk.Tk):
                     df = load_table_with_dynamic_header(xp, sheet_name=0)
                     ecs_primary, original_map = extract_ecs_codes_from_df(df)
                     ecs_primary_all |= ecs_primary
-                    # prefer first-seen pretty; don't overwrite with duplicates
                     for k, v in original_map.items():
                         original_map_all.setdefault(k, v)
                 except Exception as e:
@@ -1106,8 +1163,8 @@ class HighlighterApp(tk.Tk):
                 rects_by_page = res["rects_by_page"]
                 hit_pages = res["hit_pages"]
                 total_pages = res["total_pages"]
-                code_pages = res["code_pages"]          # cmp_key -> [0-based]
-                match_pairs = res["match_pairs"]        # (cmp_key, page_1based)
+                code_pages = res["code_pages"]
+                match_pairs = res["match_pairs"]
 
                 # Send match events (convert cmp_key to pretty)
                 for cmp_key, page_1b in match_pairs:
@@ -1124,7 +1181,6 @@ class HighlighterApp(tk.Tk):
                     "pdf_path": pdf_path,
                     "hit_pages": hit_pages,
                     "rects_by_page": rects_by_page,
-                    # Build pretty page codes for Review
                     "page_codes": {
                         int(p): sorted({
                             self.ecs_original_map.get(self.nosep_to_primary.get(cmp_key, cmp_key), cmp_key)
@@ -1135,7 +1191,6 @@ class HighlighterApp(tk.Tk):
                     "total_pages": total_pages
                 })
 
-            # Prepare serializable summary for finalize
             agg_serializable = {
                 cmp_key: {fn: sorted(list(pages)) for fn, pages in filepages.items()}
                 for cmp_key, filepages in agg_code_file_pages.items()
@@ -1152,6 +1207,7 @@ class HighlighterApp(tk.Tk):
                 "nosep_to_primary": dict(nosep_to_primary),
                 "agg_code_file_pages": agg_serializable,
                 "pages_per_file": int(pages_per_file),
+                "scale_to_a3": bool(scale_to_a3)
             })
 
         except Exception as e:
@@ -1175,7 +1231,6 @@ class HighlighterApp(tk.Tk):
                         pass
 
                 elif msg_type == "match":
-                    # payload: (pretty_code, file_name, page_num_1based)
                     pretty_code, file_name, page_num = payload
                     key = (file_name, page_num)
                     self.main_page_codes[key].add(pretty_code)
@@ -1207,11 +1262,12 @@ class HighlighterApp(tk.Tk):
         week_number = bundle["week_number"]
         out_dir = bundle["out_dir"]
         use_text_annotations = bool(bundle.get("use_text_annotations", True))
-        ecs_primary = set(bundle.get("ecs_primary", []))                 # normalized primary keys
-        original_map = dict(bundle.get("original_map", {}))              # primary -> pretty
-        nosep_to_primary = dict(bundle.get("nosep_to_primary", {}))      # cmp -> primary
-        agg_code_file_pages = dict(bundle.get("agg_code_file_pages", {})) # cmp -> {file -> [pages]}
+        ecs_primary = set(bundle.get("ecs_primary", []))
+        original_map = dict(bundle.get("original_map", {}))
+        nosep_to_primary = dict(bundle.get("nosep_to_primary", {}))
+        agg_code_file_pages = dict(bundle.get("agg_code_file_pages", {}))
         pages_per_file = max(1, int(bundle.get("pages_per_file", 20)))
+        scale_to_a3 = bool(bundle.get("scale_to_a3", False))
 
         if not processed:
             messagebox.showinfo("No Matches", "No pages matched; nothing to save.")
@@ -1245,11 +1301,9 @@ class HighlighterApp(tk.Tk):
             keep_map = {p["pdf_path"]: set(p["hit_pages"]) for p in processed}
             ordered_kept = None
 
-        # Build a list of selected page-items WITH building tag
-        building_buckets = defaultdict(list)  # building -> list[page_item]
+        building_buckets = defaultdict(list)
 
         if ordered_kept:
-            # Use the exact user-defined order (split by inferred building)
             rects_lookup = {}
             codes_lookup = {}
             for p in processed:
@@ -1273,7 +1327,6 @@ class HighlighterApp(tk.Tk):
                     "rects": rects_lookup.get((pdf_path, pg), [])
                 })
         else:
-            # Fallback: keep natural ordering per file/page
             for p in processed:
                 pdf_path = p["pdf_path"]
                 rects_by_page = p["rects_by_page"]
@@ -1284,8 +1337,7 @@ class HighlighterApp(tk.Tk):
                     bld = "UNKWN"
                     if pretty_codes:
                         inferred = [infer_building_from_code(c) for c in pretty_codes]
-                        cnt = Counter(inferred)
-                        most = cnt.most_common()
+                        most = Counter(inferred).most_common()
                         max_freq = most[0][1]
                         tied = sorted([b for b, f in most if f == max_freq])
                         bld = tied[0]
@@ -1294,11 +1346,9 @@ class HighlighterApp(tk.Tk):
                         "page_idx": pg,
                         "rects": rects_by_page.get(pg, [])
                     })
-            # default ordering when no manual order: by (file, page)
             for bld, lst in building_buckets.items():
                 lst.sort(key=lambda it: (os.path.basename(it["pdf_path"]).lower(), it["page_idx"]))
 
-        # Write chunked outputs per building in the current list order
         saved_files = []
         for bld, lst in sorted(building_buckets.items(), key=lambda kv: kv[0]):
             if not lst:
@@ -1309,7 +1359,9 @@ class HighlighterApp(tk.Tk):
                 fname = f"{tag}_{bld}_Highlighted_WK{week_number}_part{part_idx}.pdf"
                 out_path = os.path.join(out_dir, fname)
                 try:
-                    final_path = combine_pages_to_new(out_path, chunk, use_text_annotations=use_text_annotations)
+                    final_path = combine_pages_to_new(out_path, chunk,
+                                                      use_text_annotations=use_text_annotations,
+                                                      scale_to_a3=scale_to_a3)
                     if final_path:
                         saved_files.append(final_path)
                 except Exception as e:
@@ -1344,7 +1396,6 @@ class HighlighterApp(tk.Tk):
         self._write_not_surveyed_csv(out_dir, root_name, week_number,
                                      [original_map.get(p, p) for p in missing_primary])
 
-        # Optional: show quick summary
         SummaryDialog(self, rows, len(missing_primary), summary_csv)
 
     def _write_summary_csv(self, out_dir, root_name, week_number, rows):
@@ -1373,7 +1424,7 @@ class HighlighterApp(tk.Tk):
 # ================================ main =================================
 
 if __name__ == "__main__":
-    multiprocessing.freeze_support()  # important for Windows/PyInstaller
+    multiprocessing.freeze_support()
     try:
         app = HighlighterApp()
         app.mainloop()
