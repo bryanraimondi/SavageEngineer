@@ -20,7 +20,7 @@ import bisect
 DASH_CHARS = "-\u2010\u2011\u2012\u2013\u2014\u2212"  # -, ‐, -, ‒, –, —, −
 _STRIP_EDGE_PUNCT = re.compile(r'^[\s"\'()\[\]{}:;,.–—\-]+|[\s"\'()\[\]{}:;,.–—\-]+$')
 
-# A3 dimensions in PostScript points (72 pt per inch): 11.69" x 16.54" ≈ 842 x 1191
+# A3 dimensions in PostScript points (72 pt/in): 11.69" x 16.54" ≈ 842 x 1191
 A3_PORTRAIT = (842.0, 1191.0)
 A3_LANDSCAPE = (1191.0, 842.0)
 
@@ -168,13 +168,22 @@ def scan_pdf_for_rects_fallback(pdf_path,
                                 prefixes=None,
                                 first_chars=None):
     """
-    Optimized fallback (no Aho–Corasick): sliding window with prefix pruning and first-char filter.
+    Optimized fallback with:
+      - prefix pruning across word windows
+      - FIRST-CHAR filter
+      - per-word substring check so codes inside single tokens like "1hg24sv68011" are found.
     Returns: hits, matched_set, rects_by_page, code_pages, total_pages
     """
     if prefixes is None:
         prefixes, first_chars = build_prefixes_and_firstchars(cmp_keys_nosep)
     if first_chars is None:
         first_chars = {k[0] for k in cmp_keys_nosep if k}
+
+    # Build a small index: first char -> list of candidate keys
+    idx_by_first = {}
+    for k in cmp_keys_nosep:
+        if k:
+            idx_by_first.setdefault(k[0], []).append(k)
 
     doc = fitz.open(pdf_path)
     hits = 0
@@ -203,6 +212,26 @@ def scan_pdf_for_rects_fallback(pdf_path,
             page_rects = []
             rect_key_set = set()
 
+            # --- NEW: per-word substring matches ---
+            for (x0, y0, x1, y1), norm, raw in W:
+                if not norm:
+                    continue
+                cands = idx_by_first.get(norm[0], [])
+                for k in cands:
+                    if len(k) > len(norm):
+                        continue
+                    if k in norm:
+                        code_pages[k].add(page.number)
+                        matched.add(k)
+                        if highlight_all_occurrences or (k not in seen_on_page):
+                            rkey = (round(x0,2), round(y0,2), round(x1,2), round(y1,2))
+                            if rkey not in rect_key_set:
+                                rect_key_set.add(rkey)
+                                page_rects.append((x0, y0, x1, y1))
+                                hits += 1
+                            seen_on_page.add(k)
+
+            # --- Sliding window across multiple words (prefix-pruned) ---
             N = len(W)
             for i in range(N):
                 if cancel_flag.is_set():
@@ -228,15 +257,16 @@ def scan_pdf_for_rects_fallback(pdf_path,
                         code_pages[s].add(page.number)
                         matched.add(s)
                         if highlight_all_occurrences or (s not in seen_on_page):
-                            for (x0, y0, x1, y1) in rects_run:
-                                key = (round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2))
-                                if key not in rect_key_set:
-                                    rect_key_set.add(key)
-                                    page_rects.append((x0, y0, x1, y1))
+                            for (rx0, ry0, rx1, ry1) in rects_run:
+                                rkey = (round(rx0,2), round(ry0,2), round(rx1,2), round(ry1,2))
+                                if rkey not in rect_key_set:
+                                    rect_key_set.add(rkey)
+                                    page_rects.append((rx0, ry0, rx1, ry1))
                                     hits += 1
                             seen_on_page.add(s)
-                        if not highlight_all_occurrences:
-                            break
+                        else:
+                            # already added once; skip duplicates in this page when not highlight_all_occurrences
+                            pass
 
             if page_rects:
                 rects_by_page[page.number] = page_rects
@@ -397,7 +427,7 @@ def combine_pages_to_new(out_path, page_items, use_text_annotations=True, scale_
                     dst_rect = fitz.Rect(0, 0, tw, th)
                     out_pg.show_pdf_page(dst_rect, src, p)  # auto-fit into rect
 
-                    # Compute our own scale/offset to transform highlight rects consistently
+                    # Compute scale/offset to transform highlight rects consistently
                     s, dx, dy = _fit_scale_and_offset(sw, sh, tw, th)
 
                     if use_text_annotations and it["rects"]:
@@ -528,8 +558,8 @@ class ReviewDialog(tk.Toplevel):
 
         left = ttk.Frame(paned)
         right = ttk.Frame(paned)
-        paned.add(left, weight=3)   # give more weight to table by default
-        paned.add(right, weight=2)  # preview pane also resizable
+        paned.add(left, weight=3)
+        paned.add(right, weight=2)
 
         ttk.Label(left, text="Pages (double-click to toggle keep). Click headers to sort, use Move to reorder.").pack(anchor="w")
 
@@ -571,7 +601,7 @@ class ReviewDialog(tk.Toplevel):
         self._row_mapping = {}           # iid -> (pdf_path, page_idx)
         self._pdf_display = {}           # pdf_path -> display name
 
-        # populate rows (initial order = insertion order)
+        # populate rows
         row_idx = 1
         for it in items:
             pdf_path = it["pdf_path"]
@@ -892,7 +922,7 @@ class HighlighterApp(tk.Tk):
         self.ignore_lead_digit_var = tk.BooleanVar(value=False)
         self.highlight_all_var = tk.BooleanVar(value=True)
         self.use_text_annots_var = tk.BooleanVar(value=True)
-        self.scale_to_a3_var = tk.BooleanVar(value=False)  # NEW: scale output to A3
+        self.scale_to_a3_var = tk.BooleanVar(value=False)  # scale output to A3
 
         self.turbo_var = tk.BooleanVar(value=True)          # Aho–Corasick
         self.parallel_var = tk.BooleanVar(value=True)       # Process PDFs in parallel
@@ -930,7 +960,7 @@ class HighlighterApp(tk.Tk):
         ttk.Checkbutton(fr_opts, text="Ignore leading digit in PDF codes", variable=self.ignore_lead_digit_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Highlight every occurrence", variable=self.highlight_all_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Use text highlight annotations (prints)", variable=self.use_text_annots_var).pack(side="left", padx=12)
-        ttk.Checkbutton(fr_opts, text="Scale output pages to A3", variable=self.scale_to_a3_var).pack(side="left", padx=12)  # NEW
+        ttk.Checkbutton(fr_opts, text="Scale output pages to A3", variable=self.scale_to_a3_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Turbo (Aho–Corasick)", variable=self.turbo_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Parallel PDFs", variable=self.parallel_var).pack(side="left", padx=12)
 
@@ -1163,8 +1193,8 @@ class HighlighterApp(tk.Tk):
                 rects_by_page = res["rects_by_page"]
                 hit_pages = res["hit_pages"]
                 total_pages = res["total_pages"]
-                code_pages = res["code_pages"]
-                match_pairs = res["match_pairs"]
+                code_pages = res["code_pages"]          # cmp_key -> [0-based]
+                match_pairs = res["match_pairs"]        # (cmp_key, page_1based)
 
                 # Send match events (convert cmp_key to pretty)
                 for cmp_key, page_1b in match_pairs:
