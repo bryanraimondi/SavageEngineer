@@ -484,11 +484,66 @@ def page_fingerprint(pdf_path, page_idx):
     except Exception:
         return f"X:{pdf_path}:{page_idx}"
 
+# ---------- NEW: neighbor-based summary detection helpers ----------
+
+_NEIGHBOR_DELTAS = (-4, -3, -2, -1, 1, 2, 3, 4)
+_TRAILING_NUM_RE = re.compile(r"^(.*?)(\d+)$", re.IGNORECASE)
+
+def _neighbors_of_code_norm(norm_code: str):
+    """
+    norm_code must be normalize_base(code): lowercase + unified dashes.
+    Returns a list of neighbor codes in the same normalized style.
+    """
+    m = _TRAILING_NUM_RE.match(norm_code)
+    if not m:
+        return []
+    prefix, num = m.groups()
+    width = len(num)
+    base = int(num)
+    out = []
+    for d in _NEIGHBOR_DELTAS:
+        n = base + d
+        if n < 0:
+            continue
+        out.append(f"{prefix}{str(n).zfill(width)}")
+    return out
+
+def looks_like_summary_by_neighbors(codes_on_page_pretty):
+    """
+    codes_on_page_pretty: Iterable[str] (original ECS strings for the page)
+    If any code has ≥4 neighbors (±1..±4) also present on the same page,
+    treat the page as summary-like.
+    """
+    norm_set = {normalize_base(c) for c in codes_on_page_pretty if c}
+    if not norm_set:
+        return False
+
+    for norm_code in norm_set:
+        neighbors = _neighbors_of_code_norm(norm_code)
+        if not neighbors:
+            continue
+        hits = sum(1 for nc in neighbors if nc in norm_set)
+        if hits >= 4:
+            return True
+    return False
+
 def is_summary_like(pdf_path, page_idx, codes_on_page, threshold=15):
-    # Heuristic: many different codes on one page OR summary keywords in text
-    if len(codes_on_page) >= threshold:
-        return True
+    """
+    Heuristic for summary/legend/TOC-like pages.
+
+    - New: neighbor-cluster test on ECS codes present on the page
+      (≥4 of ±1..±4 neighbors present).
+    - Legacy fallbacks:
+      * Many distinct codes on one page (threshold).
+      * Summary keywords in plain text.
+    """
     try:
+        if codes_on_page and looks_like_summary_by_neighbors(codes_on_page):
+            return True
+
+        if len(codes_on_page or ()) >= threshold:
+            return True
+
         with fitz.open(pdf_path) as doc:
             pg = doc.load_page(page_idx)
             txt = (pg.get_text("text") or "").lower()
@@ -496,7 +551,7 @@ def is_summary_like(pdf_path, page_idx, codes_on_page, threshold=15):
                 if kw in txt:
                     return True
     except Exception:
-        pass
+        return False
     return False
 
 # ========================== Worker task (MP) ===========================
@@ -1296,8 +1351,9 @@ class HighlighterApp(tk.Tk):
                         iid = self.main_row_iid[key]
                         self.tree.set(iid, "codes_on_page", codes_str)
                     else:
-                        iid = self.tree.insert("", "end", values=(pretty_code, file_name, page_num, codes_str))
-                        self.main_row_iid[key] = iid
+                        iid = self.main_row_iid[key] = self.tree.insert(
+                            "", "end", values=(pretty_code, file_name, page_num, codes_str)
+                        )
 
                 elif msg_type == "error":
                     self.lbl_status.config(text="Error")
@@ -1312,7 +1368,7 @@ class HighlighterApp(tk.Tk):
             pass
         self.after(80, self._poll_messages)
 
-    # finalize: survey-dup, de-dup drawings, skip summary (with new gating), combine, CSVs
+    # finalize: survey-dup, de-dup drawings, skip summary (gated), combine, CSVs
     def _finalize_and_save(self, bundle):
         processed = bundle["processed"]
         root_name = bundle["root_name"]
@@ -1366,7 +1422,7 @@ class HighlighterApp(tk.Tk):
         building_buckets = defaultdict(list)
         seen_hashes = set()  # for de-dup
 
-        # --- PATCHED: summary rule gating (not for survey PDFs and not for files ≤ 2MB) ---
+        # --- summary rule gating (not for survey PDFs and not for files ≤ 2MB) ---
         def add_item_if_ok(pdf_path, pg, rects, pretty_codes_for_pg, is_survey: bool):
             apply_summary_rule = False
             if skip_summary and not is_survey:
@@ -1377,6 +1433,7 @@ class HighlighterApp(tk.Tk):
                 apply_summary_rule = size_bytes > 2_000_000  # Only apply to larger, non-survey PDFs
 
             if apply_summary_rule:
+                # NEW: neighbor-based test is inside is_summary_like()
                 if is_summary_like(pdf_path, pg, set(pretty_codes_for_pg), threshold=summary_threshold):
                     return
 
@@ -1414,7 +1471,6 @@ class HighlighterApp(tk.Tk):
                         cmp_key = normalize_nosep(pretty)
                         per_code_rects = code_rects_by_page.get(pg, {}).get(cmp_key, [])
                         if not per_code_rects:
-                            # fallback: at least keep rectangles for page if per-code missing
                             per_code_rects = rects_by_page.get(pg, [])
                         add_item_if_ok(pdf_path, pg, per_code_rects, [pretty], is_survey)
                 else:
@@ -1427,8 +1483,9 @@ class HighlighterApp(tk.Tk):
             for (pdf_path, pg) in ordered_kept:
                 for bld, lst in building_buckets.items():
                     for it in lst:
-                        if it["pdf_path"] == pdf_path and it["page_idx"] == pg:
+                        if it["pdf_path"] == pdf_path and it "page_idx" in it and it["page_idx"] == pg:
                             new_buckets[bld].append(it)
+            # append any items not included (safety)
             for bld, lst in building_buckets.items():
                 for it in lst:
                     if it not in new_buckets[bld]:
