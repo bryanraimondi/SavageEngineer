@@ -202,7 +202,6 @@ def scan_pdf_for_rects_fallback(pdf_path,
             if not W:
                 continue
 
-            seen_on_page = set()
             page_rects = []
             rect_key_set = set()
 
@@ -223,7 +222,6 @@ def scan_pdf_for_rects_fallback(pdf_path,
                             page_rects.append((x0, y0, x1, y1))
                             code_rects_by_page[page.number][k].append((x0, y0, x1, y1))
                             hits += 1
-                        seen_on_page.add(k)
 
             # multi-word sliding window
             N = len(W)
@@ -457,7 +455,6 @@ def fingerprint_page_text(pg):
         txt = re.sub(r'\s+', ' ', txt).strip().lower()
         h = hashlib.sha1()
         h.update(txt.encode("utf-8", errors="ignore"))
-        # include mediabox size to reduce collisions
         r = pg.rect
         h.update(f"{int(r.width)}x{int(r.height)}".encode())
         return "T:" + h.hexdigest()
@@ -467,10 +464,10 @@ def fingerprint_page_text(pg):
 def fingerprint_page_image(pg, scale=0.35):
     try:
         mat = fitz.Matrix(scale, scale)
-        pix = pg.get_pixmap(matrix=mat, alpha=False)  # small raster
-        b = pix.samples  # raw bytes
+        pix = pg.get_pixmap(matrix=mat, alpha=False)
+        b = pix.samples
         h = hashlib.sha1()
-        h.update(b[:200000])  # first ~200 KB max to stay fast
+        h.update(b[:200000])
         return "I:" + h.hexdigest()
     except Exception:
         return None
@@ -482,7 +479,6 @@ def page_fingerprint(pdf_path, page_idx):
             fh = fingerprint_page_text(pg)
             if fh:
                 return fh
-            # fallback to tiny image hash if no/low text
             ih = fingerprint_page_image(pg)
             return ih or f"X:{pdf_path}:{page_idx}"
     except Exception:
@@ -933,7 +929,7 @@ class HighlighterApp(tk.Tk):
         self.turbo_var = tk.BooleanVar(value=True)
         self.parallel_var = tk.BooleanVar(value=True)
 
-        # NEW: de-dup / survey / summary controls
+        # De-dup / survey / summary controls
         self.treat_survey_var = tk.BooleanVar(value=True)
         self.survey_size_limit = tk.IntVar(value=1200)  # KB
         self.dedupe_var = tk.BooleanVar(value=True)
@@ -1316,7 +1312,7 @@ class HighlighterApp(tk.Tk):
             pass
         self.after(80, self._poll_messages)
 
-    # finalize: survey-dup, de-dup drawings, skip summary, combine, CSVs
+    # finalize: survey-dup, de-dup drawings, skip summary (with new gating), combine, CSVs
     def _finalize_and_save(self, bundle):
         processed = bundle["processed"]
         root_name = bundle["root_name"]
@@ -1367,21 +1363,29 @@ class HighlighterApp(tk.Tk):
             keep_map = {p["pdf_path"]: set(p["hit_pages"]) for p in processed}
             ordered_kept = None
 
-        # Build items to output, applying survey duplication, summary skip, and de-dup
         building_buckets = defaultdict(list)
         seen_hashes = set()  # for de-dup
 
-        def add_item_if_ok(pdf_path, pg, rects, pretty_codes_for_pg):
-            # skip summary pages?
-            if skip_summary and is_summary_like(pdf_path, pg, set(pretty_codes_for_pg), threshold=summary_threshold):
-                return
-            # de-dup?
+        # --- PATCHED: summary rule gating (not for survey PDFs and not for files ≤ 2MB) ---
+        def add_item_if_ok(pdf_path, pg, rects, pretty_codes_for_pg, is_survey: bool):
+            apply_summary_rule = False
+            if skip_summary and not is_survey:
+                try:
+                    size_bytes = os.path.getsize(pdf_path)
+                except Exception:
+                    size_bytes = 0
+                apply_summary_rule = size_bytes > 2_000_000  # Only apply to larger, non-survey PDFs
+
+            if apply_summary_rule:
+                if is_summary_like(pdf_path, pg, set(pretty_codes_for_pg), threshold=summary_threshold):
+                    return
+
             if dedupe_pages:
                 fp = page_fingerprint(pdf_path, pg)
                 if fp in seen_hashes:
                     return
                 seen_hashes.add(fp)
-            # infer building from the majority code(s)
+
             bld = "UNKWN"
             if pretty_codes_for_pg:
                 inferred = [infer_building_from_code(c) for c in pretty_codes_for_pg]
@@ -1396,16 +1400,11 @@ class HighlighterApp(tk.Tk):
 
         for p in processed:
             pdf_path = p["pdf_path"]
-            display = p["display"]
             rects_by_page = p["rects_by_page"]
             code_rects_by_page = p["code_rects_by_page"]  # page -> cmp_key -> [rect]
             page_codes = p.get("page_codes", {})
             keep_pages = sorted(list(keep_map.get(pdf_path, set())))
             is_survey = treat_survey and is_survey_pdf(pdf_path, size_limit_bytes=survey_size_limit_bytes)
-
-            if ordered_kept:
-                # use manual order
-                pass
 
             for pg in keep_pages:
                 pretty_codes = page_codes.get(pg, [])
@@ -1415,31 +1414,27 @@ class HighlighterApp(tk.Tk):
                         cmp_key = normalize_nosep(pretty)
                         per_code_rects = code_rects_by_page.get(pg, {}).get(cmp_key, [])
                         if not per_code_rects:
-                            # fallback: at least keep one rect if available
+                            # fallback: at least keep rectangles for page if per-code missing
                             per_code_rects = rects_by_page.get(pg, [])
-                        add_item_if_ok(pdf_path, pg, per_code_rects, [pretty])
+                        add_item_if_ok(pdf_path, pg, per_code_rects, [pretty], is_survey)
                 else:
                     rects = rects_by_page.get(pg, [])
-                    add_item_if_ok(pdf_path, pg, rects, pretty_codes)
+                    add_item_if_ok(pdf_path, pg, rects, pretty_codes, is_survey)
 
-        # If user re-ordered pages (ordered_kept), respect that order within each bucket while keeping filtering
+        # Respect manual order per bucket if provided
         if ordered_kept:
-            # rebuild buckets following sequence order (only for non-survey, surveys already expanded above per pg)
             new_buckets = defaultdict(list)
             for (pdf_path, pg) in ordered_kept:
                 for bld, lst in building_buckets.items():
-                    # move in the same order if match found
                     for it in lst:
                         if it["pdf_path"] == pdf_path and it["page_idx"] == pg:
                             new_buckets[bld].append(it)
-            # append any items not included (safety)
             for bld, lst in building_buckets.items():
                 for it in lst:
                     if it not in new_buckets[bld]:
                         new_buckets[bld].append(it)
             building_buckets = new_buckets
         else:
-            # default: stable sort by file name then page
             for bld, lst in building_buckets.items():
                 lst.sort(key=lambda it: (os.path.basename(it["pdf_path"]).lower(), it["page_idx"]))
 
