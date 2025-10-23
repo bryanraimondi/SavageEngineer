@@ -66,7 +66,7 @@ def uniquify_path(path: str) -> str:
 # ========================== Excel & ECS list ===========================
 
 def load_table_with_dynamic_header(xlsx_path, sheet_name=None):
-    df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None, dtype=str)
+    df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None, dtype=str, engine="openpyxl")
     target_labels = {"ecs codes", "ecs code"}
     header_row_idx = None
     for i in range(len(df)):
@@ -484,7 +484,7 @@ def page_fingerprint(pdf_path, page_idx):
     except Exception:
         return f"X:{pdf_path}:{page_idx}"
 
-# ---------- NEW: neighbor-based summary detection helpers ----------
+# ---------- Neighbor-based summary detection helpers ----------
 
 _NEIGHBOR_DELTAS = (-4, -3, -2, -1, 1, 2, 3, 4)
 _TRAILING_NUM_RE = re.compile(r"^(.*?)(\d+)$", re.IGNORECASE)
@@ -531,7 +531,7 @@ def is_summary_like(pdf_path, page_idx, codes_on_page, threshold=15):
     """
     Heuristic for summary/legend/TOC-like pages.
 
-    - New: neighbor-cluster test on ECS codes present on the page
+    - Neighbor-cluster test on ECS codes present on the page
       (≥4 of ±1..±4 neighbors present).
     - Legacy fallbacks:
       * Many distinct codes on one page (threshold).
@@ -553,6 +553,40 @@ def is_summary_like(pdf_path, page_idx, codes_on_page, threshold=15):
     except Exception:
         return False
     return False
+
+# ========================= External DB (local .xlsx) ===================
+
+def load_external_db_from_xlsx(xlsx_path):
+    """
+    Load a locally-downloaded Excel database (no auth).
+    Returns (df, map) where map is normalized_code -> full row dict.
+    """
+    df = None
+    try:
+        # Try dynamic header first (works when 'ECS Code' header is somewhere below the first row)
+        tmp = load_table_with_dynamic_header(xlsx_path, sheet_name=0)
+        if tmp is not None and not tmp.empty:
+            df = tmp
+        else:
+            # Fallback: assume proper headers in row 1
+            df = pd.read_excel(xlsx_path, dtype=str, engine="openpyxl")
+    except Exception as e:
+        raise RuntimeError(f"Cannot read Excel: {e}")
+
+    col_candidates = [c for c in df.columns if str(c).strip().lower() in ("ecs code", "ecs codes")]
+    if not col_candidates:
+        raise RuntimeError("No 'ECS Code' column found in the selected external DB.")
+    col_ecs = col_candidates[0]
+
+    db_map = {}
+    for _, row in df.iterrows():
+        raw = str(row[col_ecs]) if pd.notna(row[col_ecs]) else ""
+        nb = normalize_base(raw)
+        if nb:
+            # first one wins; adjust if you prefer 'last wins'
+            db_map.setdefault(nb, dict(row))
+
+    return df, db_map
 
 # ========================== Worker task (MP) ===========================
 
@@ -589,9 +623,11 @@ def _process_pdf_task(args):
 
         rects_by_page_ser = {int(k): [tuple(r) for r in v] for k, v in rects_by_page.items()}
         code_pages_ser = {k: sorted(list(v)) for k, v in code_pages.items()}
-        code_rects_ser = {int(p): {ck: [tuple(r) for r in rects]
-                                   for ck, rects in mp.items()}
+        code_rects_ser = {int(p): {ck: [tuple(r) for r in mp.items()][0][1] if isinstance(mp, dict) and not isinstance(mp.get(ck, []), list) else [tuple(r) for r in mp.get(ck, [])]
+                                   for ck in mp}
                           for p, mp in code_rects_by_page.items()}
+        # The above keeps structure: page -> code_key -> list[rects]
+
         hit_pages = sorted(list(rects_by_page.keys()))
 
         match_pairs = []
@@ -964,8 +1000,8 @@ class HighlighterApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ECS PDF Highlighter")
-        self.geometry("1140x940")
-        self.minsize(1100, 900)
+        self.geometry("1140x980")
+        self.minsize(1100, 930)
 
         # State
         self.excel_paths = []
@@ -990,6 +1026,11 @@ class HighlighterApp(tk.Tk):
         self.dedupe_var = tk.BooleanVar(value=True)
         self.skip_summary_var = tk.BooleanVar(value=True)
         self.summary_threshold = tk.IntVar(value=15)
+
+        # External DB (optional local file)
+        self.external_db_path = tk.StringVar()
+        self.external_db_df = None
+        self.external_db_map = {}
 
         self.pdf_list = []
         self.cancel_flag = threading.Event()
@@ -1038,6 +1079,15 @@ class HighlighterApp(tk.Tk):
         ttk.Label(fr_rules, text="Summary = ≥ codes/page:").grid(row=2, column=1, sticky="e")
         tk.Spinbox(fr_rules, from_=5, to=100, increment=1, width=6, textvariable=self.summary_threshold).grid(row=2, column=2, sticky="w", padx=6)
 
+        # External DB loader (local .xlsx)
+        fr_db = ttk.LabelFrame(self, text="External DB (optional, local .xlsx)"); fr_db.pack(fill="x", **pad)
+        ttk.Label(fr_db, text="DB Excel:").grid(row=0, column=0, sticky="e")
+        ttk.Entry(fr_db, textvariable=self.external_db_path).grid(row=0, column=1, sticky="ew", padx=6)
+        fr_db.columnconfigure(1, weight=1)
+        ttk.Button(fr_db, text="Browse…", command=self._browse_external_db).grid(row=0, column=2, padx=6)
+        ttk.Button(fr_db, text="Load DB", command=self._load_external_db).grid(row=0, column=3, padx=6)
+        ttk.Button(fr_db, text="Clear", command=self._clear_external_db).grid(row=0, column=4, padx=6)
+
         fr_excel = ttk.LabelFrame(self, text="Excel files (ECS Codes)"); fr_excel.pack(fill="x", **pad)
         btns_ex = ttk.Frame(fr_excel); btns_ex.pack(fill="x", padx=6, pady=6)
         ttk.Button(btns_ex, text="Add Excel…", command=self._add_excels).pack(side="left")
@@ -1081,6 +1131,31 @@ class HighlighterApp(tk.Tk):
         ttk.Button(fr_btns, text="Start", command=self._start).pack(side="left")
         ttk.Button(fr_btns, text="Stop", command=self._stop).pack(side="left", padx=6)
         ttk.Button(fr_btns, text="Exit", command=self._exit).pack(side="right")
+
+    # ===== External DB handlers =====
+    def _browse_external_db(self):
+        p = filedialog.askopenfilename(title="Select External DB Excel", filetypes=[("Excel files", "*.xlsx *.xls")])
+        if p:
+            self.external_db_path.set(p)
+
+    def _load_external_db(self):
+        p = self.external_db_path.get().strip()
+        if not p:
+            messagebox.showwarning("External DB", "Please select a local Excel file first.")
+            return
+        try:
+            df, db_map = load_external_db_from_xlsx(p)
+            self.external_db_df = df
+            self.external_db_map = db_map
+            messagebox.showinfo("External DB", f"Loaded {len(db_map)} codes from:\n{os.path.basename(p)}")
+        except Exception as e:
+            messagebox.showerror("External DB", f"Could not load DB:\n{e}")
+
+    def _clear_external_db(self):
+        self.external_db_path.set("")
+        self.external_db_df = None
+        self.external_db_map = {}
+        messagebox.showinfo("External DB", "Cleared external database.")
 
     # ======= Excel / PDF pickers =======
     def _add_excels(self):
@@ -1200,6 +1275,8 @@ class HighlighterApp(tk.Tk):
             for xp in excel_paths:
                 try:
                     df = load_table_with_dynamic_header(xp, sheet_name=0)
+                    if df is None:
+                        df = pd.read_excel(xp, dtype=str, engine="openpyxl")
                     ecs_primary, original_map = extract_ecs_codes_from_df(df)
                     ecs_primary_all |= ecs_primary
                     for k, v in original_map.items():
@@ -1433,7 +1510,7 @@ class HighlighterApp(tk.Tk):
                 apply_summary_rule = size_bytes > 2_000_000  # Only apply to larger, non-survey PDFs
 
             if apply_summary_rule:
-                # NEW: neighbor-based test is inside is_summary_like()
+                # neighbor-based test is inside is_summary_like()
                 if is_summary_like(pdf_path, pg, set(pretty_codes_for_pg), threshold=summary_threshold):
                     return
 
@@ -1483,7 +1560,7 @@ class HighlighterApp(tk.Tk):
             for (pdf_path, pg) in ordered_kept:
                 for bld, lst in building_buckets.items():
                     for it in lst:
-                        if it["pdf_path"] == pdf_path and it "page_idx" in it and it["page_idx"] == pg:
+                        if it["pdf_path"] == pdf_path and it.get("page_idx") == pg:
                             new_buckets[bld].append(it)
             # append any items not included (safety)
             for bld, lst in building_buckets.items():
@@ -1549,7 +1626,20 @@ class HighlighterApp(tk.Tk):
         csv_path = os.path.join(out_dir, f"{tag}_MatchesSummary_WK{week_number}.csv")
         csv_path = uniquify_path(csv_path)
         try:
-            pd.DataFrame(rows, columns=["code", "total_pages", "breakdown"]).to_csv(csv_path, index=False)
+            base_df = pd.DataFrame(rows, columns=["code", "total_pages", "breakdown"])
+            base_df.to_csv(csv_path, index=False)
+
+            # If external DB loaded, write an enriched CSV beside it
+            if getattr(self, "external_db_map", None):
+                enriched = []
+                for r in rows:
+                    nb = normalize_base(r["code"])
+                    db_row = self.external_db_map.get(nb, {})
+                    enriched.append({**r, **db_row})
+                big = pd.DataFrame(enriched)
+                big_csv = os.path.join(out_dir, f"{tag}_MatchesWithDB_WK{week_number}.csv")
+                big_csv = uniquify_path(big_csv)
+                big.to_csv(big_csv, index=False)
         except Exception as e:
             messagebox.showwarning("CSV", f"Could not save MatchesSummary CSV:\n{e}")
         return csv_path
