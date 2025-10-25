@@ -22,13 +22,13 @@ _STRIP_EDGE_PUNCT = re.compile(r'^[\s"\'\(\)\[\]\{\}:;,.–—\-]+|[\s"\'\(\)\[\
 A3_PORTRAIT = (842.0, 1191.0)
 A3_LANDSCAPE = (1191.0, 842.0)
 
-# CHANGED: Ampliado
+# Palavras-chave para detecção de "summary-like"
 SUMMARY_KEYWORDS = [
     "summary", "contents", "index", "bill of materials", "bom",
     "schedule", "table of contents", "support schedule", "legend"
 ]
 
-EMIT_DIAGNOSTICS = False  # NEW: CSV extra de diagnóstico, se quiser
+EMIT_DIAGNOSTICS = False  # opcional: CSV extra de diagnóstico
 
 def unify_dashes(s: str) -> str:
     if not s:
@@ -92,14 +92,14 @@ def extract_ecs_codes_from_df(df):
     for c in cols:
         raw += df[c].dropna().astype(str).tolist()
 
-    # CHANGED: split correto (vírgula, ;, quebra, /, tab, espaço)
+    # Split robusto: vírgula, ;, quebra, /, tab, espaço
     tokens = []
     for v in raw:
         parts = re.split(r"[,;\n/\t ]+", v)
         for p in parts:
             t = p.strip().strip('"\'')
 
-            # típico: tem letras e dígitos, sem espaço
+            # típico ECS: letras + dígitos, sem espaço
             if t and re.search(r"[A-Za-z]", t) and re.search(r"\d", t) and " " not in t:
                 tokens.append(t)
 
@@ -111,7 +111,6 @@ def extract_ecs_codes_from_df(df):
             ecs_set.add(low)
             original_map[low] = t
     return ecs_set, original_map
-
 def build_compare_index(ecs_primary, ignore_leading_digit):
     cmp_keys = set()
     nosep_to_primary = {}
@@ -127,6 +126,7 @@ def build_compare_index(ecs_primary, ignore_leading_digit):
                 nosep_to_primary[k2] = primary
     max_code_len = max((len(k) for k in cmp_keys), default=0)
     return cmp_keys, nosep_to_primary, max_code_len
+
 def build_prefixes_and_firstchars(cmp_keys_nosep):
     prefixes = set()
     first_chars = set()
@@ -137,9 +137,10 @@ def build_prefixes_and_firstchars(cmp_keys_nosep):
         for i in range(1, len(key) + 1):
             prefixes.add(key[:i])
     return prefixes, first_chars
+
 # ========================= Turbo (Aho–Corasick) ========================
 try:
-    import ahocorasick  # pyahocorasick
+    import ahocorasick  # pyahocorasick (C-accelerated)
     _HAS_AC = True
 except Exception:
     _HAS_AC = False
@@ -163,7 +164,7 @@ def scan_pdf_for_rects_fallback(pdf_path,
     """
     Fallback (words + texto corrido):
     - per-word substring
-    - janela de até 20 palavras  # CHANGED: 10 -> 20
+    - janela de até 20 palavras (para códigos quebrados em várias words)
     - coleta retângulos por página e por código (duplicação de survey)
     - fallback por texto corrido para não perder match
     """
@@ -200,7 +201,7 @@ def scan_pdf_for_rects_fallback(pdf_path,
             rect_key_set = set()
 
             if W:
-                # per-word
+                # per-word substrings
                 for (x0, y0, x1, y1), norm, raw in W:
                     cands = idx_by_first.get(norm[0], [])
                     for k in cands:
@@ -215,7 +216,8 @@ def scan_pdf_for_rects_fallback(pdf_path,
                                 page_rects.append((x0, y0, x1, y1))
                                 code_rects_by_page[page.number][k].append((x0, y0, x1, y1))
                                 hits += 1
-                # janela multi-word
+
+                # janela multi-word (até 20)
                 N = len(W)
                 for i in range(N):
                     if cancel_flag.is_set():
@@ -244,18 +246,15 @@ def scan_pdf_for_rects_fallback(pdf_path,
                                     code_rects_by_page[page.number][s].append((rx0, ry0, rx1, ry1))
                                     hits += 1
 
-            # fallback por texto corrido (para não perder páginas sem words “limpas”)
+            # fallback texto corrido (marca a página mesmo sem rects)
             if not page_rects:
                 txt = (page.get_text("text") or "")
                 S_flat = normalize_nosep(txt)
-                found_any = False
                 for k in cmp_keys_nosep:
                     if k and (k in S_flat):
                         code_pages[k].add(page.number)
                         matched.add(k)
                         hits += 1
-                        found_any = True
-                # se achou por texto, não há rects; a página ainda assim será listada
             else:
                 rects_by_page[page.number] = page_rects
 
@@ -267,6 +266,9 @@ def scan_pdf_for_rects_ac(pdf_path,
                           automaton,
                           cancel_flag,
                           highlight_all_occurrences=False):
+    """
+    Scanner Aho–Corasick (words-based).
+    """
     doc = fitz.open(pdf_path)
     hits = 0
     matched = set()
@@ -344,9 +346,10 @@ def _fit_scale_and_offset(src_w, src_h, dst_w, dst_h):
     dx = (dst_w - new_w) * 0.5
     dy = (dst_h - new_h) * 0.5
     return s, dx, dy
+
 def combine_pages_to_new(out_path, page_items, use_text_annotations=True, scale_to_a3=False):
     """
-    page_items: list of dicts with:
+    page_items: list of dicts com:
       "pdf_path", "page_idx", "rects"
     """
     out = fitz.open()
@@ -399,7 +402,7 @@ def chunk_list(seq, n):
         yield seq[i:i+n]
 
 # ======================== Building inference logic =====================
-_LEADING_D3L = re.compile(r'^[0-9]([a.I)
+_LEADING_D3L = re.compile(r'^0-9', re.I)
 _FIRST_LETTERS = re.compile(r'[a-z]+', re.I)
 
 def infer_building_from_code(pretty_code: str) -> str:
@@ -498,10 +501,15 @@ def looks_like_summary_by_neighbors(codes_on_page_pretty):
 
 def is_summary_like(pdf_path, page_idx, codes_on_page, threshold=15):
     """
-    Mais agressivo para Support Handbook; sem gate por tamanho.
+    Heurística para páginas summary/índice/BOM:
+    - Cluster de vizinhos (±1..±4)
+    - OU muitos códigos distintos (>= threshold)
+    - OU contém keywords típicas
+    - Mais agressivo se o arquivo parece "Support Handbook"
     """
     try:
-        handbook_like = 'support' in os.path.basename(pdf_path).lower() and 'handbook' in os.path.basename(pdf_path).lower()
+        base = os.path.basename(pdf_path).lower()
+        handbook_like = ('support' in base and 'handbook' in base)
         thr = max(5, threshold // 2) if handbook_like else threshold
 
         if codes_on_page and looks_like_summary_by_neighbors(codes_on_page):
@@ -549,7 +557,6 @@ def load_external_db_from_xlsx(xlsx_path):
     return df, db_map
 
 # ================== Seleção da última revisão de surveys =================
-# NEW: parser de REV a partir do nome
 _REV_LET_RE = re.compile(r'(?:^|[^A-Z0-9])REV\s*([A-Z])(?:[^A-Z0-9]|$)', re.IGNORECASE)
 _REV_NUM_RE = re.compile(r'(?:^|[^0-9])REV\s*([0-9]{1,3})(?:[^0-9]|$)', re.IGNORECASE)
 
@@ -563,6 +570,7 @@ def _parse_revision_from_name(name: str) -> int:
     if m:
         return int(m.group(1))
     return 0
+
 def _survey_base_key(name: str) -> str:
     base = _REV_LET_RE.sub(' ', name)
     base = _REV_NUM_RE.sub(' ', base)
@@ -618,7 +626,7 @@ def _process_pdf_task(args):
         rects_by_page_ser = {int(k): [tuple(r) for r in v] for k, v in rects_by_page.items()}
         code_pages_ser = {k: sorted(list(v)) for k, v in code_pages.items()}
 
-        # CHANGED: serialização correta (sem hacks)
+        # Serialização correta: page -> code -> [rects]
         code_rects_ser = {}
         for p, mp in code_rects_by_page.items():
             code_rects_ser[int(p)] = {}
@@ -660,8 +668,6 @@ class _DummyCancel:
     def is_set(self): return False
 
 # ============================ Review Dialog ============================
-# (mantido — só pequenos ajustes de robustez visual, opcional)
-
 class ReviewDialog(tk.Toplevel):
     def __init__(self, master, items):
         super().__init__(master)
@@ -676,6 +682,7 @@ class ReviewDialog(tk.Toplevel):
         right = ttk.Frame(paned)
         paned.add(left, weight=3)
         paned.add(right, weight=2)
+
         ttk.Label(left, text="Pages (double-click to toggle keep). Click headers to sort, use Move to reorder.").pack(anchor="w")
         tree_frame = ttk.Frame(left)
         tree_frame.pack(fill="both", expand=True)
@@ -743,7 +750,6 @@ class ReviewDialog(tk.Toplevel):
 
         self._preview_img = None
         self._zoom = 1.25
-
         controls = ttk.Frame(right)
         controls.pack(fill="x", pady=(6, 0))
         ttk.Button(controls, text="Zoom -", command=lambda: self._change_zoom(-0.15)).pack(side="left")
@@ -768,6 +774,43 @@ class ReviewDialog(tk.Toplevel):
             self._preview_selected()
 
         self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def _rows_snapshot(self):
+        rows = []
+        for iid in self.tree.get_children():
+            pdf_path, page = self._row_mapping[iid]
+            disp = self._pdf_display.get(pdf_path, os.path.basename(pdf_path))
+            keep = (page in self.keep_map.get(pdf_path, set()))
+            codes = ", ".join(sorted(self.page_codes.get((pdf_path, page), [])))
+            order = int(self.tree.set(iid, "order") or "0")
+            rows.append({
+                "iid": iid, "order": order, "pdf_path": pdf_path,
+                "page": page, "display": disp, "keep": keep, "codes": codes
+            })
+        return rows
+
+    def _rebuild_tree(self, rows):
+        self.tree.delete(*self.tree.get_children())
+        self._row_mapping.clear()
+        for idx, r in enumerate(rows, start=1):
+            keep_txt = "[x]" if r["keep"] else "[ ]"
+            iid = self.tree.insert("", "end", values=(idx, keep_txt, r["display"], r["page"] + 1, r["codes"]))
+            self._row_mapping[iid] = (r["pdf_path"], r["page"])
+
+    def _sort_tree(self, column, toggle=True):
+        rows = self._rows_snapshot()
+        reverse = True
+        if column == "file":
+            rows.sort(key=lambda r: (r["display"].lower(), r["page"]), reverse=reverse)
+        elif column == "page":
+            rows.sort(key=lambda r: r["page"], reverse=reverse)
+        elif column == "keep":
+            rows.sort(key=lambda r: ((not r["keep"]), r["display"].lower(), r["page"]), reverse=reverse)
+        elif column == "codes":
+            rows.sort(key=lambda r: (r["codes"].lower(), r["display"].lower(), r["page"]), reverse=reverse)
+        else:
+            return
+        self._rebuild_tree(rows)
 
     def _toggle_keep(self, event=None):
         iid = self.tree.identify_row(event.y) if event else self.tree.focus()
@@ -1024,7 +1067,7 @@ class HighlighterApp(tk.Tk):
     def _clear_external_db(self):
         self.external_db_path.set("")
         self.external_db_df = None
-        self.external_db_map = {}
+               self.external_db_map = {}
         messagebox.showinfo("External DB", "Cleared external database.")
 
     # ======= Excel / PDF pickers =======
@@ -1154,7 +1197,6 @@ class HighlighterApp(tk.Tk):
             if not ecs_primary_all:
                 post("error", "No ECS codes found in the selected Excel files.")
                 return
-
             self.ecs_original_map = dict(original_map_all)
             cmp_keys, nosep_to_primary, _max_len = build_compare_index(ecs_primary_all, ignore_leading_digit)
             self.nosep_to_primary = dict(nosep_to_primary)
@@ -1207,10 +1249,9 @@ class HighlighterApp(tk.Tk):
             if self.cancel_flag.is_set():
                 post("done", None)
                 return
-
             # Aggregate + push UI match rows
             processed = []
-            agg_code_file_pages = defaultdict(lambda: defaultdict(set))  # cmp_key -> file -> set(pages 0-based)
+            agg_code_file_pages = defaultdict(lambda: defaultdict(set))  # cmp_key -> file -> set(pages)
 
             for res in results:
                 if "error" in res:
@@ -1365,10 +1406,10 @@ class HighlighterApp(tk.Tk):
 
         building_buckets = defaultdict(list)
         seen_hashes = set()
-        audit_log = []  # NEW
+        audit_log = []  # auditoria de descartes (summary/de-dup)
 
         def add_item_if_ok(pdf_path, pg, rects, pretty_codes_for_pg, is_survey: bool):
-            # Skip summary-like pages (nunca para survey)
+            # Skip summary-like (nunca para survey)
             if skip_summary and not is_survey:
                 if is_summary_like(pdf_path, pg, set(pretty_codes_for_pg), threshold=summary_threshold):
                     audit_log.append({
@@ -1501,13 +1542,12 @@ class HighlighterApp(tk.Tk):
                 audit_df.to_csv(uniquify_path(audit_csv), index=False)
             except Exception:
                 pass
-
-        # Cover Sheet PDF (com DB externo e linhas que deram match)
+        # Cover Sheet: DB externo + linhas que deram match (found_primary)
         try:
             if getattr(self, "external_db_df", None) is not None:
                 matched_pretty = [original_map.get(p, p) for p in sorted(found_primary)]
                 cover_path = self._generate_cover_sheet_pdf(out_dir, root_name, week_number,
-                                                            self.external_db_df, matched_prety_codes=matched_pretty,
+                                                            self.external_db_df, matched_pretty_codes=matched_pretty,
                                                             scale_to_a3=scale_to_a3)
                 if cover_path:
                     self.lbl_status.config(text=f"Cover Sheet saved: {os.path.basename(cover_path)}")
@@ -1585,12 +1625,12 @@ class HighlighterApp(tk.Tk):
             y += row_h
         return end
 
-    def _generate_cover_sheet_pdf(self, out_dir, root_name, week_number, external_df, matched_prety_codes, scale_to_a3=False):
+    def _generate_cover_sheet_pdf(self, out_dir, root_name, week_number, external_df, matched_pretty_codes, scale_to_a3=False):
         """
         Gera um PDF 'Cover Sheet' com as linhas do external_df cujo 'ECS Code'
-        bater em matched_prety_codes (pretty).
+        bater em matched_pretty_codes (pretty).
         """
-        if external_df is None or external_df.empty or not matched_prety_codes:
+        if external_df is None or external_df.empty or not matched_pretty_codes:
             return None
 
         cols_candidate = [c for c in external_df.columns if str(c).strip().lower() in ("ecs code", "ecs codes")]
@@ -1598,7 +1638,7 @@ class HighlighterApp(tk.Tk):
             return None
         ecs_col = cols_candidate[0]
 
-        matched_norm = { normalize_base(c) for c in matched_prety_codes if c }
+        matched_norm = { normalize_base(c) for c in matched_pretty_codes if c }
         filt_rows = []
         for _, row in external_df.iterrows():
             raw = "" if pd.isna(row[ecs_col]) else str(row[ecs_col])
@@ -1649,3 +1689,4 @@ if __name__ == "__main__":
         except Exception:
             pass
         sys.exit(1)
+``
