@@ -25,7 +25,7 @@ _STRIP_EDGE_PUNCT = re.compile(r'^[\s"\'\(\)\[\]\{\}:;,.–—\-]+|[\s"\'\(\)\[\
 A3_PORTRAIT = (842.0, 1191.0)
 A3_LANDSCAPE = (1191.0, 842.0)
 
-# Palavras-chave para detecção de "summary-like"
+# Palavras-chave para detecção de páginas "summary-like"
 SUMMARY_KEYWORDS = [
     "summary", "contents", "index", "bill of materials", "bom",
     "schedule", "table of contents", "support schedule", "legend"
@@ -95,13 +95,12 @@ def extract_ecs_codes_from_df(df):
     for c in cols:
         raw += df[c].dropna().astype(str).tolist()
 
-    # Split robusto: vírgula, ;, quebra, /, tab, espaço
+    # split robusto: vírgula, ;, quebra, /, tab, espaço
     tokens = []
     for v in raw:
         parts = re.split(r"[,;\n/\t ]+", v)
         for p in parts:
             t = p.strip().strip('"\'')
-            # típico ECS: letras + dígitos, sem espaço
             if t and re.search(r"[A-Za-z]", t) and re.search(r"\d", t) and " " not in t:
                 tokens.append(t)
 
@@ -170,8 +169,8 @@ def scan_pdf_for_rects_fallback(pdf_path,
     """
     Fallback (words + texto corrido):
     - per-word substring
-    - janela de até 10 palavras (para códigos quebrados em várias words)
-    - coleta retângulos por página e por código (duplicação de survey)
+    - janela de até 10 palavras (para códigos quebrados)
+    - coleta retângulos por página e por código
     - fallback por texto corrido para marcar página (usa Aho-Corasick se fornecido)
     """
     if prefixes is None:
@@ -208,7 +207,7 @@ def scan_pdf_for_rects_fallback(pdf_path,
 
             if W:
                 # per-word substrings
-                for (x0, y0, x1, y1), norm, raw in W:
+                for (x0, y0, x1, y1), norm, _raw in W:
                     cands = idx_by_first.get(norm[0], [])
                     for k in cands:
                         if len(k) > len(norm):
@@ -233,7 +232,7 @@ def scan_pdf_for_rects_fallback(pdf_path,
                     parts = []
                     rects_run = []
                     for j in range(i, min(i + 10, N)):
-                        rect, norm, raw = W[j]
+                        rect, norm, _raw = W[j]
                         parts.append(norm)
                         rects_run.append(rect)
                         s = "".join(parts)
@@ -279,7 +278,7 @@ def scan_pdf_for_rects_ac(pdf_path,
                           cancel_flag,
                           highlight_all_occurrences=False):
     """
-    Scanner Aho–Corasick (words-based).
+    Scanner Aho-Corasick (words-based).
     """
     doc = fitz.open(pdf_path)
     hits = 0
@@ -386,7 +385,7 @@ def combine_pages_to_new(out_path, page_items, use_text_annotations=True, scale_
                             add_text_highlights(out_pg, it["rects"], color=(1, 1, 0), opacity=0.35)
                         continue
 
-                    # scale to A3
+                    # scale para A3 (mantém proporção)
                     src_landscape = sw >= sh
                     tw, th = (A3_LANDSCAPE if src_landscape else A3_PORTRAIT)
                     out_pg = out.new_page(width=tw, height=th)
@@ -709,7 +708,7 @@ class ReviewDialog(tk.Toplevel):
         paned.add(left, weight=3)
         paned.add(right, weight=2)
 
-        ttk.Label(left, text="Pages (double-click to toggle keep). Click headers to sort, use Move to reorder.").pack(anchor="w")
+        ttk.Label(left, text="Pages (double-click to toggle keep). Click headers to sort.").pack(anchor="w")
         tree_frame = ttk.Frame(left)
         tree_frame.pack(fill="both", expand=True)
 
@@ -945,9 +944,11 @@ class HighlighterApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ECS PDF Highlighter")
-        # Janela menor para não "sumir" os botões
+        # Janela padrão menor + layout raiz com grid (2 linhas)
         self.geometry("1080x880")
         self.minsize(900, 720)
+        self.grid_rowconfigure(0, weight=1)   # corpo cresce
+        self.grid_columnconfigure(0, weight=1)
 
         # State
         self.excel_paths = []
@@ -989,12 +990,24 @@ class HighlighterApp(tk.Tk):
         self.main_row_iid = {}
 
         self._build_ui()
+        # opcional: maximizar depois de abrir (Windows suporta "zoomed")
+        self.after(200, self._try_maximize)
         self._poll_messages()
+
+    def _try_maximize(self):
+        try:
+            self.state("zoomed")
+        except Exception:
+            pass
 
     def _build_ui(self):
         pad = {"padx": 8, "pady": 6}
 
-        fr_top = ttk.Frame(self); fr_top.pack(fill="x", **pad)
+        # ===== corpo expansível (row 0) =====
+        body = ttk.Frame(self)
+        body.grid(row=0, column=0, sticky="nsew")
+
+        fr_top = ttk.Frame(body); fr_top.pack(fill="x", **pad)
         ttk.Label(fr_top, text="Week:").pack(side="left")
         ttk.Entry(fr_top, width=8, textvariable=self.week_number).pack(side="left", padx=8)
         ttk.Label(fr_top, text="Project/Root Name:").pack(side="left", padx=(16, 0))
@@ -1002,7 +1015,7 @@ class HighlighterApp(tk.Tk):
         ttk.Label(fr_top, text="Max pages per output:").pack(side="left", padx=(16, 0))
         tk.Spinbox(fr_top, from_=5, to=500, increment=1, width=6, textvariable=self.pages_per_file_var).pack(side="left", padx=6)
 
-        fr_opts = ttk.Frame(self); fr_opts.pack(fill="x", **pad)
+        fr_opts = ttk.Frame(body); fr_opts.pack(fill="x", **pad)
         ttk.Checkbutton(fr_opts, text="Only keep highlighted pages", variable=self.only_highlighted_var).pack(side="left")
         ttk.Checkbutton(fr_opts, text="Review pages before saving", variable=self.review_pages_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Ignore leading digit in PDF codes", variable=self.ignore_lead_digit_var).pack(side="left", padx=12)
@@ -1010,11 +1023,11 @@ class HighlighterApp(tk.Tk):
         ttk.Checkbutton(fr_opts, text="Use text highlight annotations", variable=self.use_text_annots_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Scale output pages to A3", variable=self.scale_to_a3_var).pack(side="left", padx=12)
 
-        fr_perf = ttk.Frame(self); fr_perf.pack(fill="x", **pad)
+        fr_perf = ttk.Frame(body); fr_perf.pack(fill="x", **pad)
         ttk.Checkbutton(fr_perf, text="Turbo (Aho–Corasick)", variable=self.turbo_var).pack(side="left")
         ttk.Checkbutton(fr_perf, text="Parallel PDFs", variable=self.parallel_var).pack(side="left", padx=12)
 
-        fr_rules = ttk.LabelFrame(self, text="De-dup & Survey Rules"); fr_rules.pack(fill="x", **pad)
+        fr_rules = ttk.LabelFrame(body, text="De-dup & Survey Rules"); fr_rules.pack(fill="x", **pad)
         ttk.Checkbutton(fr_rules, text="Treat 'Cut Length Report' PDFs as survey tables", variable=self.treat_survey_var).grid(row=0, column=0, sticky="w", padx=6, pady=4)
         ttk.Label(fr_rules, text="Survey size ≤ KB:").grid(row=0, column=1, sticky="e")
         tk.Spinbox(fr_rules, from_=200, to=5000, increment=50, width=6, textvariable=self.survey_size_limit).grid(row=0, column=2, sticky="w", padx=6)
@@ -1025,7 +1038,7 @@ class HighlighterApp(tk.Tk):
         ttk.Checkbutton(fr_rules, text="Keep only latest Survey REV", variable=self.keep_latest_survey_rev_var).grid(row=3, column=0, sticky="w", padx=6, pady=4)
 
         # External DB (local .xlsx)
-        fr_db = ttk.LabelFrame(self, text="External DB (optional, local .xlsx)"); fr_db.pack(fill="x", **pad)
+        fr_db = ttk.LabelFrame(body, text="External DB (optional, local .xlsx)"); fr_db.pack(fill="x", **pad)
         ttk.Label(fr_db, text="DB Excel:").grid(row=0, column=0, sticky="e")
         ttk.Entry(fr_db, textvariable=self.external_db_path).grid(row=0, column=1, sticky="ew", padx=6)
         fr_db.columnconfigure(1, weight=1)
@@ -1034,7 +1047,7 @@ class HighlighterApp(tk.Tk):
         ttk.Button(fr_db, text="Clear", command=self._clear_external_db).grid(row=0, column=4, padx=6)
 
         # Excel files (ECS Codes)
-        fr_excel = ttk.LabelFrame(self, text="Excel files (ECS Codes)"); fr_excel.pack(fill="x", **pad)
+        fr_excel = ttk.LabelFrame(body, text="Excel files (ECS Codes)"); fr_excel.pack(fill="x", **pad)
         btns_ex = ttk.Frame(fr_excel); btns_ex.pack(fill="x", padx=6, pady=6)
         ttk.Button(btns_ex, text="Add Excel…", command=self._add_excels).pack(side="left")
         ttk.Button(btns_ex, text="Remove Selected", command=self._remove_selected_excels).pack(side="left", padx=6)
@@ -1043,7 +1056,7 @@ class HighlighterApp(tk.Tk):
         self.lst_excels.pack(fill="both", expand=True, padx=6, pady=(0,6))
 
         # PDFs to Process
-        fr_pdfs = ttk.LabelFrame(self, text="PDFs to Process"); fr_pdfs.pack(fill="both", expand=True, **pad)
+        fr_pdfs = ttk.LabelFrame(body, text="PDFs to Process"); fr_pdfs.pack(fill="both", expand=True, **pad)
         btns = ttk.Frame(fr_pdfs); btns.pack(fill="x", padx=6, pady=6)
         ttk.Button(btns, text="Add PDFs…", command=self._add_pdfs).pack(side="left")
         ttk.Button(btns, text="Remove Selected", command=self._remove_selected_pdfs).pack(side="left", padx=6)
@@ -1052,13 +1065,13 @@ class HighlighterApp(tk.Tk):
         self.lst_pdfs.pack(fill="both", expand=True, padx=6, pady=(0,6))
 
         # Output
-        fr_out = ttk.Frame(self); fr_out.pack(fill="x", **pad)
+        fr_out = ttk.Frame(body); fr_out.pack(fill="x", **pad)
         ttk.Label(fr_out, text="Output Folder:").pack(side="left")
         ttk.Entry(fr_out, textvariable=self.output_dir).pack(side="left", expand=True, fill="x", padx=8)
         ttk.Button(fr_out, text="Select…", command=self._pick_output_dir).pack(side="left")
 
         # Log
-        fr_log = ttk.LabelFrame(self, text="Matches (ECS Code | File | Page | Codes on Page)"); fr_log.pack(fill="both", expand=True, **pad)
+        fr_log = ttk.LabelFrame(body, text="Matches (ECS Code | File | Page | Codes on Page)"); fr_log.pack(fill="both", expand=True, **pad)
         cols = ("code", "file", "page", "codes_on_page")
         self.tree = ttk.Treeview(fr_log, columns=cols, show="headings", height=12)
         self.tree.heading("code", text="Code")
@@ -1071,14 +1084,14 @@ class HighlighterApp(tk.Tk):
         self.tree.column("codes_on_page", width=220, anchor="w")
         self.tree.pack(fill="both", expand=True, padx=6, pady=6)
 
-        fr_prog = ttk.Frame(self); fr_prog.pack(fill="x", **pad)
+        fr_prog = ttk.Frame(body); fr_prog.pack(fill="x", **pad)
         self.prog = ttk.Progressbar(fr_prog, orient="horizontal", mode="determinate", maximum=100)
         self.prog.pack(side="left", expand=True, fill="x")
         self.lbl_status = ttk.Label(fr_prog, text="Idle"); self.lbl_status.pack(side="left", padx=8)
 
-        # Botões fixados no rodapé para não sumirem
+        # ===== rodapé fixo (row 1) =====
         fr_btns = ttk.Frame(self)
-        fr_btns.pack(side="bottom", fill="x", padx=8, pady=6)
+        fr_btns.grid(row=1, column=0, sticky="ew", padx=8, pady=6)
         ttk.Button(fr_btns, text="Start", command=self._start).pack(side="left")
         ttk.Button(fr_btns, text="Stop", command=self._stop).pack(side="left", padx=6)
         ttk.Button(fr_btns, text="Exit", command=self._exit).pack(side="right")
@@ -1450,7 +1463,7 @@ class HighlighterApp(tk.Tk):
 
         building_buckets = defaultdict(list)
         seen_hashes = set()
-        audit_log = []  # auditoria de descartes (summary/de-dup)
+        audit_log = []
 
         def add_item_if_ok(pdf_path, pg, rects, pretty_codes_for_pg, is_survey: bool):
             # Skip summary-like (nunca para survey)
