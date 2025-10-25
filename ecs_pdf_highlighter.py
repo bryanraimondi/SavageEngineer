@@ -33,12 +33,14 @@ SUMMARY_KEYWORDS_RE = [re.compile(rf"\b{re.escape(k)}\b", re.IGNORECASE) for k i
 
 EMIT_DIAGNOSTICS = False  # opcional: CSV extra de diagnóstico
 
+
 def unify_dashes(s: str) -> str:
     if not s:
         return s
     for ch in DASH_CHARS[1:]:
         s = s.replace(ch, "-")
     return s.replace("\u00AD", "")  # soft hyphen
+
 
 def normalize_base(token: str) -> str:
     if not token:
@@ -49,6 +51,7 @@ def normalize_base(token: str) -> str:
     cleaned = unify_dashes(cleaned)
     return cleaned.strip().lower()
 
+
 def normalize_nosep(token: str) -> str:
     if not token:
         return ""
@@ -56,8 +59,10 @@ def normalize_nosep(token: str) -> str:
     # Mantém apenas [0-9a-z-]
     return re.sub(r'[^0-9a-z\-]', '', token)
 
+
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', "_", name).strip()
+
 
 def uniquify_path(path: str) -> str:
     base, ext = os.path.splitext(path)
@@ -67,6 +72,7 @@ def uniquify_path(path: str) -> str:
         out = f"{base} ({i}){ext}"
         i += 1
     return out
+
 
 # ========================== Excel & lista de ECS ==========================
 def load_table_with_dynamic_header(xlsx_path, sheet_name=None):
@@ -85,6 +91,7 @@ def load_table_with_dynamic_header(xlsx_path, sheet_name=None):
     data.columns = header
     data = data.dropna(axis=1, how='all')
     return data
+
 
 def extract_ecs_codes_from_df(df):
     if df is None or df.empty:
@@ -114,6 +121,7 @@ def extract_ecs_codes_from_df(df):
             original_map[low] = t
     return ecs_set, original_map
 
+
 def build_compare_index(ecs_primary, ignore_leading_digit):
     cmp_keys = set()
     nosep_to_primary = {}
@@ -130,6 +138,7 @@ def build_compare_index(ecs_primary, ignore_leading_digit):
     max_code_len = max((len(k) for k in cmp_keys), default=0)
     return cmp_keys, nosep_to_primary, max_code_len
 
+
 def build_prefixes_and_firstchars(cmp_keys_nosep):
     prefixes = set()
     first_chars = set()
@@ -141,12 +150,14 @@ def build_prefixes_and_firstchars(cmp_keys_nosep):
             prefixes.add(key[:i])
     return prefixes, first_chars
 
+
 # ========================= Turbo (Aho–Corasick) =========================
 try:
     import ahocorasick  # pyahocorasick
     _HAS_AC = True
 except Exception:
     _HAS_AC = False
+
 
 def build_aho_automaton(cmp_keys_nosep):
     A = ahocorasick.Automaton()
@@ -155,6 +166,7 @@ def build_aho_automaton(cmp_keys_nosep):
             A.add_word(k, k)
     A.make_automaton()
     return A
+
 
 # ============================ Scanners de PDF ===========================
 def scan_pdf_for_rects_fallback(pdf_path,
@@ -261,6 +273,7 @@ def scan_pdf_for_rects_fallback(pdf_path,
     finally:
         doc.close()
 
+
 def scan_pdf_for_rects_ac(pdf_path,
                           automaton,
                           cancel_flag,
@@ -320,6 +333,7 @@ def scan_pdf_for_rects_ac(pdf_path,
     finally:
         doc.close()
 
+
 # ========================= Anotar & combinar ============================
 def add_text_highlights(page, rects, color=(1, 1, 0), opacity=0.35):
     for (x0, y0, x1, y1) in rects:
@@ -334,6 +348,7 @@ def add_text_highlights(page, rects, color=(1, 1, 0), opacity=0.35):
             pass
         ann.update()
 
+
 def _fit_scale_and_offset(src_w, src_h, dst_w, dst_h):
     if src_w <= 0 or src_h <= 0:
         return 1.0, 0.0, 0.0
@@ -345,6 +360,7 @@ def _fit_scale_and_offset(src_w, src_h, dst_w, dst_h):
     dx = (dst_w - new_w) * 0.5
     dy = (dst_h - new_h) * 0.5
     return s, dx, dy
+
 
 def combine_pages_to_new(out_path, page_items, use_text_annotations=True, scale_to_a3=False):
     out = fitz.open()
@@ -392,12 +408,15 @@ def combine_pages_to_new(out_path, page_items, use_text_annotations=True, scale_
     finally:
         out.close()
 
+
 def chunk_list(seq, n):
     for i in range(0, len(seq), n):
         yield seq[i:i+n]
 
+
 # ====================== Regras de prédio (agrupamento) ==================
 _FIRST_LETTERS = re.compile(r'[a-z]+', re.I)
+
 
 def infer_building_from_code(pretty_code: str) -> str:
     s = unify_dashes(pretty_code or "").strip()
@@ -414,6 +433,7 @@ def infer_building_from_code(pretty_code: str) -> str:
         return letters[:2] if len(letters) >= 2 else letters
     return letters[:3] if len(letters) >= 3 else letters
 
+
 # ========================= Survey / Duplicatas / Rev ====================
 def is_survey_pdf(path, size_limit_bytes=1_200_000):
     try:
@@ -423,6 +443,7 @@ def is_survey_pdf(path, size_limit_bytes=1_200_000):
     name = os.path.basename(path).lower()
     looks_name = ("cut l" in name) or ("cut length report" in name)
     return looks_name and (sz > 0 and sz <= size_limit_bytes)
+
 
 # Fingerprints de página
 def fingerprint_page_text(pg):
@@ -437,6 +458,7 @@ def fingerprint_page_text(pg):
     except Exception:
         return None
 
+
 def fingerprint_page_image(pg, scale=0.35):
     try:
         mat = fitz.Matrix(scale, scale)
@@ -447,6 +469,7 @@ def fingerprint_page_image(pg, scale=0.35):
         return "I:" + h.hexdigest()
     except Exception:
         return None
+
 
 def page_fingerprint(pdf_path, page_idx):
     try:
@@ -460,9 +483,11 @@ def page_fingerprint(pdf_path, page_idx):
     except Exception:
         return f"X:{pdf_path}:{page_idx}"
 
+
 # -------- Detecção de summary --------
 _NEIGHBOR_DELTAS = (-4, -3, -2, -1, 1, 2, 3, 4)
 _TRAILING_NUM_RE = re.compile(r"^(.*?)(\d+)$", re.IGNORECASE)
+
 
 def _neighbors_of_code_norm(norm_code: str):
     m = _TRAILING_NUM_RE.match(norm_code)
@@ -479,6 +504,7 @@ def _neighbors_of_code_norm(norm_code: str):
         out.append(f"{prefix}{str(n).zfill(width)}")
     return out
 
+
 def looks_like_summary_by_neighbors(codes_on_page_pretty, neighbor_min_hits=3):
     norm_set = {normalize_base(c) for c in codes_on_page_pretty if c}
     if not norm_set:
@@ -491,6 +517,7 @@ def looks_like_summary_by_neighbors(codes_on_page_pretty, neighbor_min_hits=3):
         if hits >= neighbor_min_hits:
             return True
     return False
+
 
 def is_summary_like(pdf_path, page_idx, codes_on_page, threshold=15, neighbor_min_hits=3):
     """
@@ -516,11 +543,13 @@ def is_summary_like(pdf_path, page_idx, codes_on_page, threshold=15, neighbor_mi
         return False
     return False
 
+
 # -------- Escolha da última revisão (survey & handbooks/desenhos) --------
 _REV_LET_RE = re.compile(r'(?:^|[^A-Z0-9])REV\s*([A-Z])(?:[^A-Z0-9]|$)', re.IGNORECASE)
 _REV_NUM_RE = re.compile(r'(?:^|[^0-9])REV\s*([0-9]{1,3})(?:[^0-9]|$)', re.IGNORECASE)
 # sufixo do tipo "__E.pdf" ou "_E.pdf"
 _TAIL_LET_RE = re.compile(r'([_\-])([A-Z])(?:\.pdf)?$', re.IGNORECASE)
+
 
 def _parse_revision_from_name(name: str) -> int:
     if not name:
@@ -536,12 +565,14 @@ def _parse_revision_from_name(name: str) -> int:
         return 1000 + (ord(m.group(2).upper()) - ord('A'))
     return 0
 
+
 def _strip_revision_tokens(name: str) -> str:
     base = _REV_LET_RE.sub(' ', name)
     base = _REV_NUM_RE.sub(' ', base)
     base = _TAIL_LET_RE.sub('', os.path.splitext(base)[0])
     base = re.sub(r'\s+', ' ', base).strip().lower()
     return base
+
 
 def select_latest_survey_revisions(pdf_paths: list) -> list:
     keep = []
@@ -560,6 +591,7 @@ def select_latest_survey_revisions(pdf_paths: list) -> list:
     keep = sorted(set(keep), key=lambda x: os.path.basename(x).lower())
     return keep
 
+
 def select_latest_non_survey_revisions(pdf_paths: list) -> list:
     groups = {}
     for p in pdf_paths:
@@ -577,9 +609,11 @@ def select_latest_non_survey_revisions(pdf_paths: list) -> list:
     out = sorted(set(out), key=lambda x: os.path.basename(x).lower())
     return out
 
+
 # ========================== Tarefa do worker (MP) =======================
 class _DummyCancel:
     def is_set(self): return False
+
 
 def _process_pdf_task(args):
     (pdf_path,
@@ -649,6 +683,7 @@ def _process_pdf_task(args):
             "display": os.path.basename(pdf_path),
             "error": str(e)
         }
+
 
 # ============================ UI: Review Dialog =========================
 class ReviewDialog(tk.Toplevel):
@@ -865,6 +900,7 @@ class ReviewDialog(tk.Toplevel):
             self.canvas.create_text(10, 10, anchor="nw", fill="white",
                                     text=f"Preview error:\n{e}")
 
+
 # ============================ UI: Summary Dialog ========================
 class SummaryDialog(tk.Toplevel):
     def __init__(self, master, rows, not_found_count, summary_csv_path):
@@ -888,8 +924,9 @@ class SummaryDialog(tk.Toplevel):
         for r in rows:
             tree.insert("", "end", values=(r["code"], r["total_pages"], r["breakdown"]))
         btns = ttk.Frame(self)
-        btns.pack(fill="x", padx=10, pady=(0,10))
+        btns.pack(fill="x", padx=10, pady=(0, 10))
         ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
+
 
 # ============================== Main App ================================
 class HighlighterApp(tk.Tk):
@@ -946,6 +983,8 @@ class HighlighterApp(tk.Tk):
 
     def _build_ui(self):
         pad = {"padx": 8, "pady": 6}
+
+        # Top sections (packed in order)
         fr_top = ttk.Frame(self); fr_top.pack(fill="x", **pad)
         ttk.Label(fr_top, text="Week:").pack(side="left")
         ttk.Entry(fr_top, width=8, textvariable=self.week_number).pack(side="left", padx=8)
@@ -996,7 +1035,7 @@ class HighlighterApp(tk.Tk):
         ttk.Button(btns_ex, text="Remove Selected", command=self._remove_selected_excels).pack(side="left", padx=6)
         ttk.Button(btns_ex, text="Clear List", command=self._clear_excels).pack(side="left")
         self.lst_excels = tk.Listbox(fr_excel, height=5, selectmode=tk.EXTENDED)
-        self.lst_excels.pack(fill="both", expand=True, padx=6, pady=(0,6))
+        self.lst_excels.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
         # PDFs
         fr_pdfs = ttk.LabelFrame(self, text="PDFs to Process"); fr_pdfs.pack(fill="both", expand=True, **pad)
@@ -1005,7 +1044,7 @@ class HighlighterApp(tk.Tk):
         ttk.Button(btns, text="Remove Selected", command=self._remove_selected_pdfs).pack(side="left", padx=6)
         ttk.Button(btns, text="Clear List", command=self._clear_pdfs).pack(side="left")
         self.lst_pdfs = tk.Listbox(fr_pdfs, height=7, selectmode=tk.EXTENDED)
-        self.lst_pdfs.pack(fill="both", expand=True, padx=6, pady=(0,6))
+        self.lst_pdfs.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
         # Output
         fr_out = ttk.Frame(self); fr_out.pack(fill="x", **pad)
@@ -1027,15 +1066,26 @@ class HighlighterApp(tk.Tk):
         self.tree.column("codes_on_page", width=220, anchor="w")
         self.tree.pack(fill="both", expand=True, padx=6, pady=6)
 
-        fr_prog = ttk.Frame(self); fr_prog.pack(fill="x", **pad)
+        # ===== Fixed bottom bar (progress + Start/Stop/Exit) =====
+        self.bottom = ttk.Frame(self)
+        self.bottom.pack(side="bottom", fill="x", **pad)
+
+        fr_prog = ttk.Frame(self.bottom)
+        fr_prog.pack(side="left", fill="x", expand=True)
         self.prog = ttk.Progressbar(fr_prog, orient="horizontal", mode="determinate", maximum=100)
         self.prog.pack(side="left", expand=True, fill="x")
-        self.lbl_status = ttk.Label(fr_prog, text="Idle"); self.lbl_status.pack(side="left", padx=8)
+        self.lbl_status = ttk.Label(fr_prog, text="Idle")
+        self.lbl_status.pack(side="left", padx=8)
 
-        fr_btns = ttk.Frame(self); fr_btns.pack(fill="x", **pad)
-        ttk.Button(fr_btns, text="Start", command=self._start).pack(side="left")
-        ttk.Button(fr_btns, text="Stop", command=self._stop).pack(side="left", padx=6)
-        ttk.Button(fr_btns, text="Exit", command=self._exit).pack(side="right")
+        fr_btns = ttk.Frame(self.bottom)
+        fr_btns.pack(side="right")
+        # Keep strong references so they never get GC'd:
+        self.btn_start = ttk.Button(fr_btns, text="Start", command=self._start)
+        self.btn_start.pack(side="left")
+        self.btn_stop = ttk.Button(fr_btns, text="Stop", command=self._stop)
+        self.btn_stop.pack(side="left", padx=6)
+        self.btn_exit = ttk.Button(fr_btns, text="Exit", command=self._exit)
+        self.btn_exit.pack(side="left")
 
     # ===== Handlers DB externa =====
     def _browse_external_db(self):
@@ -1614,7 +1664,7 @@ class HighlighterApp(tk.Tk):
         col_widths = [(w/total_w) * (width - 2*margin) for w in weights]
 
         # header
-        page.draw_rect(fitz.Rect(x, y, width - margin, y + row_h), color=(0,0,0), fill=header_fill)
+        page.draw_rect(fitz.Rect(x, y, width - margin, y + row_h), color=(0, 0, 0), fill=header_fill)
         cx = x
         for i, c in enumerate(cols):
             page.insert_text(fitz.Point(cx+2, y + row_h - 4), str(c), fontsize=9)
@@ -1640,7 +1690,7 @@ class HighlighterApp(tk.Tk):
         if not cols_candidate:
             return None
         ecs_col = cols_candidate[0]
-        matched_norm = { normalize_base(c) for c in matched_pretty_codes if c }
+        matched_norm = {normalize_base(c) for c in matched_pretty_codes if c}
         filt_rows = []
         for _, row in external_df.iterrows():
             raw = "" if pd.isna(row[ecs_col]) else str(row[ecs_col])
@@ -1661,9 +1711,10 @@ class HighlighterApp(tk.Tk):
                 page = doc.new_page(width=tw, height=th)
                 title = f"{tag} — Cover Sheet — WK{week_number}"
                 page.insert_text(fitz.Point(36, 24), title, fontsize=14, fontname="helv")
-                page.draw_line(fitz.Point(36, 28), fitz.Point(tw-36, 28), color=(0,0,0), width=0.7)
-                drawn = self._draw_table_page(page, remaining, margin=36, row_h=18, header_fill=(0.92,0.92,0.92))
-                if drawn <= 0: break
+                page.draw_line(fitz.Point(36, 28), fitz.Point(tw-36, 28), color=(0, 0, 0), width=0.7)
+                drawn = self._draw_table_page(page, remaining, margin=36, row_h=18, header_fill=(0.92, 0.92, 0.92))
+                if drawn <= 0:
+                    break
                 remaining = remaining.iloc[drawn:].reset_index(drop=True)
             if doc.page_count > 0:
                 doc.save(cover_path)
@@ -1671,6 +1722,7 @@ class HighlighterApp(tk.Tk):
         finally:
             doc.close()
         return None
+
 
 # ================================ main ==================================
 if __name__ == "__main__":
