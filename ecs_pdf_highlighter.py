@@ -1223,7 +1223,6 @@ class HighlighterApp(tk.Tk):
             bool(self.pair_by_code_var.get()),
             str(self.dedupe_scope_var.get()),
         )
-        )
         self.worker_thread = threading.Thread(target=self._worker, args=args, daemon=True)
         self.worker_thread.start()
 
