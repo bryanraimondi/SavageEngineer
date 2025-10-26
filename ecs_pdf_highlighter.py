@@ -963,7 +963,15 @@ class HighlighterApp(tk.Tk):
         self.keep_latest_survey_rev_var = tk.BooleanVar(value=True)
         self.keep_latest_non_survey_rev_var = tk.BooleanVar(value=True)  # NOVO: também para handbooks/desenhos
 
-        # DB externa (opcional)
+        
+
+        # ===== NOVO: Parear por código (duplica DESENHOS por código) =====
+        self.pair_by_code_var = tk.BooleanVar(value=True)
+
+        # ===== NOVO: Escopo de de-dup para DESENHOS =====
+        # Opções: "global", "base", "building"
+        self.dedupe_scope_var = tk.StringVar(value="base")
+# DB externa (opcional)
         self.external_db_path = tk.StringVar()
         self.external_db_df = None
         self.external_db_map = {}
@@ -1019,7 +1027,15 @@ class HighlighterApp(tk.Tk):
         ttk.Checkbutton(fr_rules, text="Keep only latest Survey REV", variable=self.keep_latest_survey_rev_var).grid(row=3, column=0, sticky="w", padx=6, pady=4)
         ttk.Checkbutton(fr_rules, text="Keep only latest Handbook/Drawings REV", variable=self.keep_latest_non_survey_rev_var).grid(row=3, column=1, columnspan=2, sticky="w", padx=6, pady=4)
 
-        # DB externa
+        
+        # ---- NOVOS controles (pareamento + escopo da de-dup de DESENHOS) ----
+        ttk.Checkbutton(fr_rules, text="Pair surveys & drawings by code (duplicate drawings per-code)", variable=self.pair_by_code_var).grid(row=4, column=0, columnspan=2, sticky="w", padx=6, pady=4)
+        ttk.Label(fr_rules, text="Drawing dedupe scope:").grid(row=4, column=2, sticky="e", padx=(6,0))
+        self.cbo_dedupe_scope = ttk.Combobox(fr_rules, state="readonly",
+                                             values=["global", "base", "building"],
+                                             textvariable=self.dedupe_scope_var, width=10)
+        self.cbo_dedupe_scope.grid(row=4, column=3, sticky="w", padx=6, pady=4)
+# DB externa
         fr_db = ttk.LabelFrame(self, text="External DB (optional, local .xlsx)"); fr_db.pack(fill="x", **pad)
         ttk.Label(fr_db, text="DB Excel:").grid(row=0, column=0, sticky="e")
         ttk.Entry(fr_db, textvariable=self.external_db_path).grid(row=0, column=1, sticky="ew", padx=6)
@@ -1204,6 +1220,9 @@ class HighlighterApp(tk.Tk):
             int(self.neighbor_min_hits_var.get()),
             bool(self.keep_latest_survey_rev_var.get()),
             bool(self.keep_latest_non_survey_rev_var.get()),
+            bool(self.pair_by_code_var.get()),
+            str(self.dedupe_scope_var.get()),
+        )
         )
         self.worker_thread = threading.Thread(target=self._worker, args=args, daemon=True)
         self.worker_thread.start()
@@ -1220,7 +1239,8 @@ class HighlighterApp(tk.Tk):
                 ignore_leading_digit, highlight_all_occurrences, use_text_annotations,
                 turbo_mode, parallel_mode, scale_to_a3, treat_survey, survey_size_limit_bytes,
                 dedupe_pages, dedupe_surveys, skip_summary, summary_threshold, neighbor_min_hits,
-                keep_latest_survey_rev, keep_latest_non_survey_rev):
+                keep_latest_survey_rev, keep_latest_non_survey_rev,
+                pair_by_code, dedupe_scope):
         def post(msg_type, payload=None):
             self.msg_queue.put((msg_type, payload))
         try:
@@ -1367,6 +1387,9 @@ class HighlighterApp(tk.Tk):
                 "skip_summary": bool(skip_summary),
                 "summary_threshold": int(summary_threshold),
                 "neighbor_min_hits": int(neighbor_min_hits),
+            
+                "pair_by_code": bool(pair_by_code),
+                "dedupe_scope": str(dedupe_scope),
             })
         except Exception as e:
             post("error", f"Unexpected error: {e}")
@@ -1428,6 +1451,8 @@ class HighlighterApp(tk.Tk):
         skip_summary = bool(bundle.get("skip_summary", True))
         summary_threshold = int(bundle.get("summary_threshold", 15))
         neighbor_min_hits = int(bundle.get("neighbor_min_hits", 3))
+        pair_by_code = bool(bundle.get("pair_by_code", True))
+        dedupe_scope = str(bundle.get("dedupe_scope", "base")).strip().lower()
 
         if not processed:
             messagebox.showinfo("No Matches", "No pages matched; nothing to save.")
@@ -1464,7 +1489,16 @@ class HighlighterApp(tk.Tk):
         seen_hashes = set()
         audit_log = []
 
-        def add_item_if_ok(pdf_path, pg, rects, pretty_codes_for_pg, is_survey: bool):
+        def add_item_if_ok(pdf_path, pg, rects, pretty_codes_for_pg, is_survey: bool, code_tag=None, kind="drawing"):
+            # 0) Inferir bucket de prédio (pode ser usado no escopo de de-dup)
+            bld = "UNKWN"
+            if pretty_codes_for_pg:
+                inferred = [infer_building_from_code(c) for c in pretty_codes_for_pg]
+                cnt = Counter(inferred)
+                if len(cnt) > 0:
+                    max_freq = max(cnt.values())
+                    bld = sorted([b for b, f in cnt.items() if f == max_freq])[0]
+
             # 1) Skip summary (apenas não-survey)
             if skip_summary and not is_survey:
                 if is_summary_like(pdf_path, pg, set(pretty_codes_for_pg),
@@ -1477,12 +1511,26 @@ class HighlighterApp(tk.Tk):
                         "codes_on_page": ", ".join(sorted(set(pretty_codes_for_pg))),
                     })
                     return
-            # 2) De-dup
+            # 2) De-dup com escopo e sensível a retângulos
             if dedupe_pages and (not is_survey or dedupe_surveys):
                 fp = page_fingerprint(pdf_path, pg)
-                # Opcional: incluir código no fingerprint de surveys (se dedupe_surveys marcado)
-                if is_survey and dedupe_surveys and pretty_codes_for_pg:
-                    fp = fp + "::" + "|".join(sorted(pretty_codes_for_pg))
+                if not is_survey:
+                    # Escopo para desenhos
+                    base_name_ns = _strip_revision_tokens(os.path.basename(pdf_path))
+                    if dedupe_scope == "base":
+                        fp = fp + f"::base:{base_name_ns}"
+                    elif dedupe_scope == "building":
+                        fp = fp + f"::bld:{bld}"
+                    # "global": sem sufixo extra
+                    if pair_by_code and code_tag:
+                        fp = fp + f"::code:{normalize_nosep(code_tag)}"
+                else:
+                    if dedupe_surveys and pretty_codes_for_pg:
+                        fp = fp + "::" + "|".join(sorted(pretty_codes_for_pg))
+                if rects:
+                    q = lambda v: round(v, 1)
+                    rect_sig = ";".join(f"{q(x0)},{q(y0)},{q(x1)},{q(y1)}" for (x0,y0,x1,y1) in rects[:40])
+                    fp = fp + f"::r:{hashlib.sha1(rect_sig.encode()).hexdigest()[:8]}"
                 if fp in seen_hashes:
                     audit_log.append({
                         "reason": "duplicate_page",
@@ -1494,16 +1542,12 @@ class HighlighterApp(tk.Tk):
                 seen_hashes.add(fp)
 
             # 3) Bucket por prédio
-            bld = "UNKWN"
-            if pretty_codes_for_pg:
-                inferred = [infer_building_from_code(c) for c in pretty_codes_for_pg]
-                cnt = Counter(inferred)
-                max_freq = max(cnt.values())
-                bld = sorted([b for b, f in cnt.items() if f == max_freq])[0]
             building_buckets[bld].append({
                 "pdf_path": pdf_path,
                 "page_idx": pg,
-                "rects": rects
+                "rects": rects,
+                "code_tag": code_tag,
+                "kind": kind
             })
 
         # Preenche buckets (respeita regra “survey duplica por código”)
@@ -1520,13 +1564,17 @@ class HighlighterApp(tk.Tk):
                 if is_survey and pretty_codes:
                     for pretty in sorted(pretty_codes):
                         cmp_key = normalize_nosep(pretty)
-                        per_code_rects = code_rects_by_page.get(pg, {}).get(cmp_key, [])
-                        if not per_code_rects:
-                            per_code_rects = rects_by_page.get(pg, [])
-                        add_item_if_ok(pdf_path, pg, per_code_rects, [pretty], is_survey)
+                        per_code_rects = code_rects_by_page.get(pg, {}).get(cmp_key, []) or rects_by_page.get(pg, [])
+                        add_item_if_ok(pdf_path, pg, per_code_rects, [pretty], is_survey, code_tag=pretty, kind="survey")
                 else:
-                    rects = rects_by_page.get(pg, [])
-                    add_item_if_ok(pdf_path, pg, rects, pretty_codes, is_survey)
+                    if pair_by_code and pretty_codes:
+                        for pretty in sorted(pretty_codes):
+                            cmp_key = normalize_nosep(pretty)
+                            per_code_rects = code_rects_by_page.get(pg, {}).get(cmp_key, []) or rects_by_page.get(pg, [])
+                            add_item_if_ok(pdf_path, pg, per_code_rects, [pretty], is_survey=False, code_tag=pretty, kind="drawing")
+                    else:
+                        rects = rects_by_page.get(pg, [])
+                        add_item_if_ok(pdf_path, pg, rects, pretty_codes, is_survey=False, code_tag=None, kind="drawing")
 
         # Respeita ordem manual, se houver
         if ordered_kept:
@@ -1542,8 +1590,34 @@ class HighlighterApp(tk.Tk):
                         new_buckets[bld].append(it)
             building_buckets = new_buckets
         else:
-            for bld, lst in building_buckets.items():
-                lst.sort(key=lambda it: (os.path.basename(it["pdf_path"]).lower(), it["page_idx"]))
+            # === NOVO: Se pareamento estiver ativo, ordenar por CÓDIGO (SURVEY -> DESENHO). Senão, comportamento anterior.
+            if pair_by_code:
+                excel_order_nosep = []
+                for pcode in ecs_primary:
+                    pretty = original_map.get(pcode, pcode)
+                    excel_order_nosep.append(normalize_nosep(pretty))
+                order_index = {c: i for i, c in enumerate(excel_order_nosep)}
+                for bld, lst in list(building_buckets.items()):
+                    by_code = {}
+                    untagged = []
+                    for it in lst:
+                        ctag = normalize_nosep(it.get("code_tag") or "")
+                        if ctag:
+                            by_code.setdefault(ctag, {"survey": [], "drawing": []})
+                            by_code[ctag][it.get("kind","drawing")].append(it)
+                        else:
+                            untagged.append(it)
+                    codes = list(by_code.keys())
+                    codes.sort(key=lambda c: (order_index.get(c, 10**9), c))
+                    new_seq = []
+                    for c in codes:
+                        new_seq.extend(by_code[c]["survey"])
+                        new_seq.extend(by_code[c]["drawing"])
+                    new_seq.extend(untagged)
+                    building_buckets[bld] = new_seq
+            else:
+                for bld, lst in building_buckets.items():
+                    lst.sort(key=lambda it: (os.path.basename(it["pdf_path"]).lower(), it["page_idx"]))
 
         # Salvar PDFs por prédio/part
         saved_files = []
