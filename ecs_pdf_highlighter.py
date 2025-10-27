@@ -135,7 +135,6 @@ def extract_ecs_codes_from_df(df):
         parts = re.split(r"[,\n/\t ;]+", v)
         for p in parts:
             t = p.strip().strip('"\'')
-
             if t and re.search(r"[A-Za-z]", t) and re.search(r"\d", t) and " " not in t:
                 tokens.append(t)
 
@@ -1443,9 +1442,6 @@ class HighlighterApp(tk.Tk):
         used_review = bool(self.review_pages_var.get())
         if used_review:
             # --- NOVO: filtra páginas Summary/TOC ANTES de abrir a janela de Review ---
-            # Ajuste "first_pages_only" conforme a sua preferência:
-            #   7  -> apenas as 7 primeiras páginas (padrão atual)
-            #   0  -> varre o documento inteiro
             def _is_summary_or_toc(pdf_path: str, page_idx: int) -> bool:
                 return is_summary_keyword_page(pdf_path, page_idx, first_pages_only=7)  # mude para 0 se quiser varrer tudo
             items = []
@@ -1621,7 +1617,7 @@ class HighlighterApp(tk.Tk):
             if getattr(self, "external_db_df", None) is not None:
                 matched_pretty = [original_map.get(p, p) for p in sorted(found_primary)]
                 cover_path = self._generate_cover_sheet_pdf(out_dir, root_name, week_number,
-                                                            self.external_db_df, matched_prety_codes=matched_pretty,
+                                                            self.external_db_df, matched_pretty_codes=matched_pretty,
                                                             scale_to_a3=scale_to_a3)
                 if cover_path:
                     self.lbl_status.config(text=f"Cover Sheet saved: {os.path.basename(cover_path)}")
@@ -1646,18 +1642,18 @@ class HighlighterApp(tk.Tk):
                     db_row = self.external_db_map.get(nb, {})
                     enriched.append({**r, **db_row})
                 big = pd.DataFrame(enriched)
-                big_csv = os.path.join(out_dir, f"{tag}_MatchesWithDB_WK{week\\_number}.csv")
+                big_csv = os.path.join(out_dir, f"{tag}_MatchesWithDB_WK{week_number}.csv")
                 big_csv = uniquify_path(big_csv)
                 big.to_csv(big_csv, index=False)
         except Exception as e:
             messagebox.showwarning("CSV", f"Could not save MatchesSummary CSV:\n{e}")
         return csv_path
 
-    def _write_not_surveyed_csv(self, out_dir, root_name, week\\_number, not_found_pretty_list):
+    def _write_not_surveyed_csv(self, out_dir, root_name, week_number, not_found_pretty_list):
         if not not_found_pretty_list:
             return None
         tag = sanitize_filename(root_name) or "Job"
-        csv_path = os.path.join(out_dir, f"{tag}_NotSurveyed_WK{week\\_number}.csv")
+        csv_path = os.path.join(out_dir, f"{tag}_NotSurveyed_WK{week_number}.csv")
         csv_path = uniquify_path(csv_path)
         try:
             pd.DataFrame({"ECS_Code_Not_Found": sorted(not_found_pretty_list)}).to_csv(csv_path, index=False)
@@ -1772,4 +1768,3 @@ if __name__ == "__main__":
         except Exception:
             pass
         sys.exit(1)
-``
