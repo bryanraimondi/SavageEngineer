@@ -33,6 +33,27 @@ SUMMARY_KEYWORDS_RE = [re.compile(rf"\b{re.escape(k)}\b", re.IGNORECASE) for k i
 
 EMIT_DIAGNOSTICS = False  # opcional: CSV extra de diagnóstico
 
+# === New summary rule (only for PDFs > 1 MB): discard pages containing these keywords ===
+SUMMARY_BIGPDF_RE = [re.compile(r"\bsummary\b", re.IGNORECASE),
+                     re.compile(r"\btable of contents\b", re.IGNORECASE)]
+
+def is_summary_keyword_page_bigpdf(pdf_path, page_idx, min_size_bytes=1_000_000):
+    try:
+        if os.path.getsize(pdf_path) <= min_size_bytes:
+            return False
+    except Exception:
+        return False
+    try:
+        with fitz.open(pdf_path) as doc:
+            pg = doc.load_page(page_idx)
+            txt = (pg.get_text("text") or "")
+            for rx in SUMMARY_BIGPDF_RE:
+                if rx.search(txt):
+                    return True
+    except Exception:
+        return False
+    return False
+
 
 def unify_dashes(s: str) -> str:
     if not s:
@@ -957,21 +978,11 @@ class HighlighterApp(tk.Tk):
         self.survey_size_limit = tk.IntVar(value=1200)  # KB
         self.dedupe_var = tk.BooleanVar(value=True)
         self.dedupe_surveys_var = tk.BooleanVar(value=False)  # NOVO: por padrão NÃO deduplica surveys
-        self.skip_summary_var = tk.BooleanVar(value=True)
-        self.summary_threshold = tk.IntVar(value=15)
-        self.neighbor_min_hits_var = tk.IntVar(value=3)  # NOVO: limiar do cluster ±1..±4
+# NOVO: limiar do cluster ±1..±4
         self.keep_latest_survey_rev_var = tk.BooleanVar(value=True)
         self.keep_latest_non_survey_rev_var = tk.BooleanVar(value=True)  # NOVO: também para handbooks/desenhos
 
-        
-
-        # ===== NOVO: Parear por código (duplica DESENHOS por código) =====
-        self.pair_by_code_var = tk.BooleanVar(value=True)
-
-        # ===== NOVO: Escopo de de-dup para DESENHOS =====
-        # Opções: "global", "base", "building"
-        self.dedupe_scope_var = tk.StringVar(value="base")
-# DB externa (opcional)
+        # DB externa (opcional)
         self.external_db_path = tk.StringVar()
         self.external_db_df = None
         self.external_db_map = {}
@@ -1016,26 +1027,10 @@ class HighlighterApp(tk.Tk):
         fr_rules = ttk.LabelFrame(self, text="De-dup & Survey Rules"); fr_rules.pack(fill="x", **pad)
         ttk.Checkbutton(fr_rules, text="Treat 'Cut Length Report' PDFs as survey tables", variable=self.treat_survey_var).grid(row=0, column=0, sticky="w", padx=6, pady=4)
         ttk.Label(fr_rules, text="Survey size ≤ KB:").grid(row=0, column=1, sticky="e")
-        tk.Spinbox(fr_rules, from_=200, to=5000, increment=50, width=6, textvariable=self.survey_size_limit).grid(row=0, column=2, sticky="w", padx=6)
-        ttk.Checkbutton(fr_rules, text="De-duplicate identical pages (text/image hash)", variable=self.dedupe_var).grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=4)
-        ttk.Checkbutton(fr_rules, text="(Also) dedupe surveys", variable=self.dedupe_surveys_var).grid(row=1, column=2, sticky="w", padx=6)
-        ttk.Checkbutton(fr_rules, text="Skip summary-like pages (non-surveys)", variable=self.skip_summary_var).grid(row=2, column=0, sticky="w", padx=6, pady=4)
-        ttk.Label(fr_rules, text="Summary = ≥ codes/page:").grid(row=2, column=1, sticky="e")
-        tk.Spinbox(fr_rules, from_=5, to=100, increment=1, width=6, textvariable=self.summary_threshold).grid(row=2, column=2, sticky="w", padx=6)
-        ttk.Label(fr_rules, text="Neighbor cluster min (±1..±4):").grid(row=2, column=3, sticky="e")
-        tk.Spinbox(fr_rules, from_=1, to=8, increment=1, width=4, textvariable=self.neighbor_min_hits_var).grid(row=2, column=4, sticky="w", padx=6)
-        ttk.Checkbutton(fr_rules, text="Keep only latest Survey REV", variable=self.keep_latest_survey_rev_var).grid(row=3, column=0, sticky="w", padx=6, pady=4)
+ttk.Checkbutton(fr_rules, text="Keep only latest Survey REV", variable=self.keep_latest_survey_rev_var).grid(row=3, column=0, sticky="w", padx=6, pady=4)
         ttk.Checkbutton(fr_rules, text="Keep only latest Handbook/Drawings REV", variable=self.keep_latest_non_survey_rev_var).grid(row=3, column=1, columnspan=2, sticky="w", padx=6, pady=4)
 
-        
-        # ---- NOVOS controles (pareamento + escopo da de-dup de DESENHOS) ----
-        ttk.Checkbutton(fr_rules, text="Pair surveys & drawings by code (duplicate drawings per-code)", variable=self.pair_by_code_var).grid(row=4, column=0, columnspan=2, sticky="w", padx=6, pady=4)
-        ttk.Label(fr_rules, text="Drawing dedupe scope:").grid(row=4, column=2, sticky="e", padx=(6,0))
-        self.cbo_dedupe_scope = ttk.Combobox(fr_rules, state="readonly",
-                                             values=["global", "base", "building"],
-                                             textvariable=self.dedupe_scope_var, width=10)
-        self.cbo_dedupe_scope.grid(row=4, column=3, sticky="w", padx=6, pady=4)
-# DB externa
+        # DB externa
         fr_db = ttk.LabelFrame(self, text="External DB (optional, local .xlsx)"); fr_db.pack(fill="x", **pad)
         ttk.Label(fr_db, text="DB Excel:").grid(row=0, column=0, sticky="e")
         ttk.Entry(fr_db, textvariable=self.external_db_path).grid(row=0, column=1, sticky="ew", padx=6)
@@ -1215,13 +1210,8 @@ class HighlighterApp(tk.Tk):
             int(self.survey_size_limit.get()) * 1024,
             bool(self.dedupe_var.get()),
             bool(self.dedupe_surveys_var.get()),
-            bool(self.skip_summary_var.get()),
-            int(self.summary_threshold.get()),
-            int(self.neighbor_min_hits_var.get()),
-            bool(self.keep_latest_survey_rev_var.get()),
+                        bool(self.keep_latest_survey_rev_var.get()),
             bool(self.keep_latest_non_survey_rev_var.get()),
-            bool(self.pair_by_code_var.get()),
-            str(self.dedupe_scope_var.get()),
         )
         self.worker_thread = threading.Thread(target=self._worker, args=args, daemon=True)
         self.worker_thread.start()
@@ -1237,9 +1227,8 @@ class HighlighterApp(tk.Tk):
     def _worker(self, week_number, root_name, excel_paths, pdf_paths, out_dir, pages_per_file,
                 ignore_leading_digit, highlight_all_occurrences, use_text_annotations,
                 turbo_mode, parallel_mode, scale_to_a3, treat_survey, survey_size_limit_bytes,
-                dedupe_pages, dedupe_surveys, skip_summary, summary_threshold, neighbor_min_hits,
-                keep_latest_survey_rev, keep_latest_non_survey_rev,
-                pair_by_code, dedupe_scope):
+                dedupe_pages, dedupe_surveys, 
+                keep_latest_survey_rev, keep_latest_non_survey_rev):
         def post(msg_type, payload=None):
             self.msg_queue.put((msg_type, payload))
         try:
@@ -1382,14 +1371,7 @@ class HighlighterApp(tk.Tk):
                 "treat_survey": bool(treat_survey),
                 "survey_size_limit_bytes": int(survey_size_limit_bytes),
                 "dedupe_pages": bool(dedupe_pages),
-                "dedupe_surveys": bool(dedupe_surveys),
-                "skip_summary": bool(skip_summary),
-                "summary_threshold": int(summary_threshold),
-                "neighbor_min_hits": int(neighbor_min_hits),
-            
-                "pair_by_code": bool(pair_by_code),
-                "dedupe_scope": str(dedupe_scope),
-            })
+                "dedupe_surveys": bool(dedupe_surveys),})
         except Exception as e:
             post("error", f"Unexpected error: {e}")
         finally:
@@ -1447,13 +1429,7 @@ class HighlighterApp(tk.Tk):
         survey_size_limit_bytes = int(bundle.get("survey_size_limit_bytes", 1_200_000))
         dedupe_pages = bool(bundle.get("dedupe_pages", True))
         dedupe_surveys = bool(bundle.get("dedupe_surveys", False))
-        skip_summary = bool(bundle.get("skip_summary", True))
-        summary_threshold = int(bundle.get("summary_threshold", 15))
-        neighbor_min_hits = int(bundle.get("neighbor_min_hits", 3))
-        pair_by_code = bool(bundle.get("pair_by_code", True))
-        dedupe_scope = str(bundle.get("dedupe_scope", "base")).strip().lower()
-
-        if not processed:
+if not processed:
             messagebox.showinfo("No Matches", "No pages matched; nothing to save.")
             self.lbl_status.config(text="No matches.")
             self._write_not_surveyed_csv(out_dir, root_name, week_number,
@@ -1488,48 +1464,22 @@ class HighlighterApp(tk.Tk):
         seen_hashes = set()
         audit_log = []
 
-        def add_item_if_ok(pdf_path, pg, rects, pretty_codes_for_pg, is_survey: bool, code_tag=None, kind="drawing"):
-            # 0) Inferir bucket de prédio (pode ser usado no escopo de de-dup)
-            bld = "UNKWN"
-            if pretty_codes_for_pg:
-                inferred = [infer_building_from_code(c) for c in pretty_codes_for_pg]
-                cnt = Counter(inferred)
-                if len(cnt) > 0:
-                    max_freq = max(cnt.values())
-                    bld = sorted([b for b, f in cnt.items() if f == max_freq])[0]
-
-            # 1) Skip summary (apenas não-survey)
-            if skip_summary and not is_survey:
-                if is_summary_like(pdf_path, pg, set(pretty_codes_for_pg),
-                                   threshold=summary_threshold,
-                                   neighbor_min_hits=neighbor_min_hits):
-                    audit_log.append({
-                        "reason": "summary_like",
-                        "file": os.path.basename(pdf_path),
-                        "page": int(pg) + 1,
-                        "codes_on_page": ", ".join(sorted(set(pretty_codes_for_pg))),
-                    })
-                    return
-            # 2) De-dup com escopo e sensível a retângulos
+        def add_item_if_ok(pdf_path, pg, rects, pretty_codes_for_pg, is_survey: bool):
+            # 1) New summary rule: for PDFs > 1 MB, discard pages containing "Summary" or "Table of Contents"
+            if is_summary_keyword_page_bigpdf(pdf_path, pg):
+                audit_log.append({
+                    "reason": "summary_keyword_bigpdf",
+                    "file": os.path.basename(pdf_path),
+                    "page": int(pg) + 1,
+                    "codes_on_page": ", ".join(sorted(set(pretty_codes_for_pg))),
+                })
+                return
+            # 2) De-dup
             if dedupe_pages and (not is_survey or dedupe_surveys):
                 fp = page_fingerprint(pdf_path, pg)
-                if not is_survey:
-                    # Escopo para desenhos
-                    base_name_ns = _strip_revision_tokens(os.path.basename(pdf_path))
-                    if dedupe_scope == "base":
-                        fp = fp + f"::base:{base_name_ns}"
-                    elif dedupe_scope == "building":
-                        fp = fp + f"::bld:{bld}"
-                    # "global": sem sufixo extra
-                    if pair_by_code and code_tag:
-                        fp = fp + f"::code:{normalize_nosep(code_tag)}"
-                else:
-                    if dedupe_surveys and pretty_codes_for_pg:
-                        fp = fp + "::" + "|".join(sorted(pretty_codes_for_pg))
-                if rects:
-                    q = lambda v: round(v, 1)
-                    rect_sig = ";".join(f"{q(x0)},{q(y0)},{q(x1)},{q(y1)}" for (x0,y0,x1,y1) in rects[:40])
-                    fp = fp + f"::r:{hashlib.sha1(rect_sig.encode()).hexdigest()[:8]}"
+                # Opcional: incluir código no fingerprint de surveys (se dedupe_surveys marcado)
+                if is_survey and dedupe_surveys and pretty_codes_for_pg:
+                    fp = fp + "::" + "|".join(sorted(pretty_codes_for_pg))
                 if fp in seen_hashes:
                     audit_log.append({
                         "reason": "duplicate_page",
@@ -1541,12 +1491,16 @@ class HighlighterApp(tk.Tk):
                 seen_hashes.add(fp)
 
             # 3) Bucket por prédio
+            bld = "UNKWN"
+            if pretty_codes_for_pg:
+                inferred = [infer_building_from_code(c) for c in pretty_codes_for_pg]
+                cnt = Counter(inferred)
+                max_freq = max(cnt.values())
+                bld = sorted([b for b, f in cnt.items() if f == max_freq])[0]
             building_buckets[bld].append({
                 "pdf_path": pdf_path,
                 "page_idx": pg,
-                "rects": rects,
-                "code_tag": code_tag,
-                "kind": kind
+                "rects": rects
             })
 
         # Preenche buckets (respeita regra “survey duplica por código”)
@@ -1563,17 +1517,13 @@ class HighlighterApp(tk.Tk):
                 if is_survey and pretty_codes:
                     for pretty in sorted(pretty_codes):
                         cmp_key = normalize_nosep(pretty)
-                        per_code_rects = code_rects_by_page.get(pg, {}).get(cmp_key, []) or rects_by_page.get(pg, [])
-                        add_item_if_ok(pdf_path, pg, per_code_rects, [pretty], is_survey, code_tag=pretty, kind="survey")
+                        per_code_rects = code_rects_by_page.get(pg, {}).get(cmp_key, [])
+                        if not per_code_rects:
+                            per_code_rects = rects_by_page.get(pg, [])
+                        add_item_if_ok(pdf_path, pg, per_code_rects, [pretty], is_survey)
                 else:
-                    if pair_by_code and pretty_codes:
-                        for pretty in sorted(pretty_codes):
-                            cmp_key = normalize_nosep(pretty)
-                            per_code_rects = code_rects_by_page.get(pg, {}).get(cmp_key, []) or rects_by_page.get(pg, [])
-                            add_item_if_ok(pdf_path, pg, per_code_rects, [pretty], is_survey=False, code_tag=pretty, kind="drawing")
-                    else:
-                        rects = rects_by_page.get(pg, [])
-                        add_item_if_ok(pdf_path, pg, rects, pretty_codes, is_survey=False, code_tag=None, kind="drawing")
+                    rects = rects_by_page.get(pg, [])
+                    add_item_if_ok(pdf_path, pg, rects, pretty_codes, is_survey)
 
         # Respeita ordem manual, se houver
         if ordered_kept:
@@ -1589,34 +1539,8 @@ class HighlighterApp(tk.Tk):
                         new_buckets[bld].append(it)
             building_buckets = new_buckets
         else:
-            # === NOVO: Se pareamento estiver ativo, ordenar por CÓDIGO (SURVEY -> DESENHO). Senão, comportamento anterior.
-            if pair_by_code:
-                excel_order_nosep = []
-                for pcode in ecs_primary:
-                    pretty = original_map.get(pcode, pcode)
-                    excel_order_nosep.append(normalize_nosep(pretty))
-                order_index = {c: i for i, c in enumerate(excel_order_nosep)}
-                for bld, lst in list(building_buckets.items()):
-                    by_code = {}
-                    untagged = []
-                    for it in lst:
-                        ctag = normalize_nosep(it.get("code_tag") or "")
-                        if ctag:
-                            by_code.setdefault(ctag, {"survey": [], "drawing": []})
-                            by_code[ctag][it.get("kind","drawing")].append(it)
-                        else:
-                            untagged.append(it)
-                    codes = list(by_code.keys())
-                    codes.sort(key=lambda c: (order_index.get(c, 10**9), c))
-                    new_seq = []
-                    for c in codes:
-                        new_seq.extend(by_code[c]["survey"])
-                        new_seq.extend(by_code[c]["drawing"])
-                    new_seq.extend(untagged)
-                    building_buckets[bld] = new_seq
-            else:
-                for bld, lst in building_buckets.items():
-                    lst.sort(key=lambda it: (os.path.basename(it["pdf_path"]).lower(), it["page_idx"]))
+            for bld, lst in building_buckets.items():
+                lst.sort(key=lambda it: (os.path.basename(it["pdf_path"]).lower(), it["page_idx"]))
 
         # Salvar PDFs por prédio/part
         saved_files = []
