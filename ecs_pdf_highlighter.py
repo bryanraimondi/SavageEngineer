@@ -810,7 +810,7 @@ class ReviewDialog(tk.Toplevel):
         ttk.Button(btns, text="Select All", command=self._select_all).pack(side="left")
         ttk.Button(btns, text="Clear All", command=self._clear_all).pack(side="left", padx=6)
         ttk.Button(btns, text="OK", command=self._ok).pack(side="right")
-        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right", padx=6)
+        ttk.Button(btns, text="Cancel", command=self._cancel").pack(side="right", padx=6)
 
         self.tree.bind("<Double-1>", self._toggle_keep)
         self.tree.bind("<<TreeviewSelect>>", self._preview_selected)
@@ -956,6 +956,41 @@ class SummaryDialog(tk.Toplevel):
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=10, pady=(0, 10))
         ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
+
+
+# ============================== Cover helpers ===========================
+def _excel_letters_to_indices(letters_list, df):
+    """Convert Excel letters (e.g. 'B', 'AA') to 0-based column indices and keep only those that exist."""
+    def letter_to_idx(s):
+        s = s.strip().upper()
+        if not s:
+            return None
+        n = 0
+        for ch in s:
+            if not ('A' <= ch <= 'Z'):
+                return None
+            n = n * 26 + (ord(ch) - ord('A') + 1)
+        return n - 1  # 0-based
+    idxs = []
+    for L in letters_list:
+        i = letter_to_idx(L)
+        if i is not None and 0 <= i < len(df.columns):
+            idxs.append(i)
+    return idxs
+
+
+def _find_calibri_fontfile():
+    """Try to locate Calibri. Returns absolute path or None (fallback to built-in font)."""
+    candidates = [
+        r"C:\Windows\Fonts\calibri.ttf",                         # Windows
+        r"/System/Library/Fonts/Supplemental/Calibri.ttf",       # macOS (uncommon)
+        r"/usr/share/fonts/truetype/msttcorefonts/Calibri.ttf",  # Linux (if installed)
+        os.environ.get("CALIBRI_TTF", "").strip(),               # optional override
+    ]
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return None
 
 
 # ============================== Main App ================================
@@ -1617,7 +1652,7 @@ class HighlighterApp(tk.Tk):
             if getattr(self, "external_db_df", None) is not None:
                 matched_pretty = [original_map.get(p, p) for p in sorted(found_primary)]
                 cover_path = self._generate_cover_sheet_pdf(out_dir, root_name, week_number,
-                                                            self.external_db_df, matched_pretty_codes=matched_pretty,
+                                                            self.external_db_df, matched_prety_codes=matched_pretty,
                                                             scale_to_a3=scale_to_a3)
                 if cover_path:
                     self.lbl_status.config(text=f"Cover Sheet saved: {os.path.basename(cover_path)}")
@@ -1662,36 +1697,70 @@ class HighlighterApp(tk.Tk):
             messagebox.showwarning("CSV", f"Could not save NotSurveyed CSV:\n{e}")
         return csv_path
 
-    def _draw_table_page(self, page, df, margin=36, row_h=16, header_fill=(0.92, 0.92, 0.92)):
+    # ====== Drawing table with Calibri 10, all borders, header each page ======
+    def _draw_table_page(self, page, df, margin=36, row_h=18, header_fill=(0.92, 0.92, 0.92),
+                         fontfile=None, fontsize=10):
         width, height = float(page.rect.width), float(page.rect.height)
-        x = margin
+        x_left = margin
+        x_right = width - margin
         y = margin + 24
-        max_rows = int((height - 2*margin - 30) // row_h) - 1  # -1 header
 
         cols = list(df.columns)
-        weights = [max(6, len(str(c))) for c in cols]
-        total_w = sum(weights)
-        col_widths = [(w/total_w) * (width - 2*margin) for w in weights]
 
-        # header
-        page.draw_rect(fitz.Rect(x, y, width - margin, y + row_h), color=(0, 0, 0), fill=header_fill)
-        cx = x
+        # Compute proportional widths from header + a sample of data
+        sample_rows = min(100, len(df))
+        col_weights = []
+        for c in cols:
+            w = max(len(str(c)), max((len(str(df.iloc[i][c])) for i in range(sample_rows)), default=0))
+            col_weights.append(max(6, w))  # minimum weight to avoid zero-width
+        total_w = sum(col_weights)
+        col_widths = [(w / total_w) * (x_right - x_left) for w in col_weights]
+
+        # Header
+        header_top = y
+        header_bottom = y + row_h
+        page.draw_rect(fitz.Rect(x_left, header_top, x_right, header_bottom), color=(0, 0, 0), fill=header_fill)
+
+        cx = x_left
         for i, c in enumerate(cols):
-            page.insert_text(fitz.Point(cx+2, y + row_h - 4), str(c), fontsize=9)
+            cell_rect = fitz.Rect(cx, header_top, cx + col_widths[i], header_bottom)
+            page.draw_rect(cell_rect, color=(0, 0, 0), width=0.7)  # all borders
+            page.insert_textbox(
+                cell_rect,
+                str(c),
+                fontsize=fontsize,
+                fontfile=fontfile if fontfile else None,
+                fontname=None if fontfile else "helv",
+                align=fitz.TEXT_ALIGN_LEFT,
+            )
             cx += col_widths[i]
-        y += row_h
+        y = header_bottom
 
-        # linhas
+        # Rows per page
+        max_rows = int((height - y - margin) // row_h)
+
+        # Body rows with borders
         end = min(len(df), max_rows)
-        for r in range(0, end):
-            cx = x
+        for r in range(end):
+            row_top = y
+            row_bottom = y + row_h
+            cx = x_left
             for i, c in enumerate(cols):
+                cell_rect = fitz.Rect(cx, row_top, cx + col_widths[i], row_bottom)
+                page.draw_rect(cell_rect, color=(0, 0, 0), width=0.5)  # all borders
                 txt = "" if pd.isna(df.iloc[r][c]) else str(df.iloc[r][c])
-                page.insert_textbox(fitz.Rect(cx+2, y+1, cx+col_widths[i]-2, y+row_h-2),
-                                    txt, fontsize=8, align=fitz.TEXT_ALIGN_LEFT)
+                page.insert_textbox(
+                    fitz.Rect(cx + 2, row_top + 1, cx + col_widths[i] - 2, row_bottom - 1),
+                    txt,
+                    fontsize=fontsize,
+                    fontfile=fontfile if fontfile else None,
+                    fontname=None if fontfile else "helv",
+                    align=fitz.TEXT_ALIGN_LEFT,
+                )
                 cx += col_widths[i]
-            y += row_h
-        return end
+            y = row_bottom
+
+        return end  # number of body rows drawn
 
     def _generate_cover_sheet_pdf(self, out_dir, root_name, week_number, external_df, matched_pretty_codes, scale_to_a3=False):
         if external_df is None or external_df.empty or not matched_pretty_codes:
@@ -1700,6 +1769,7 @@ class HighlighterApp(tk.Tk):
         if not cols_candidate:
             return None
         ecs_col = cols_candidate[0]
+
         matched_norm = {normalize_base(c) for c in matched_pretty_codes if c}
         filt_rows = []
         for _, row in external_df.iterrows():
@@ -1709,20 +1779,48 @@ class HighlighterApp(tk.Tk):
                 filt_rows.append(dict(row))
         if not filt_rows:
             return None
-        df = pd.DataFrame(filt_rows)
+        df_full = pd.DataFrame(filt_rows)
+
+        # Keep only requested columns: B,G,H,I,J,K,L,N,O,P,Q,S,T,U
+        wanted_letters = ["B", "G", "H", "I", "J", "K", "L", "N", "O", "P", "Q", "S", "T", "U"]
+        idxs = _excel_letters_to_indices(wanted_letters, df_full)
+        if not idxs:
+            return None
+        df = df_full.iloc[:, idxs].copy()
+        df.columns = [str(c).strip() for c in df.columns]
+
+        # PDF setup
         tag = sanitize_filename(root_name) or "Job"
         cover_path = os.path.join(out_dir, f"{tag}_Cover Sheet_WK{week_number}.pdf")
         cover_path = uniquify_path(cover_path)
-        tw, th = (A3_PORTRAIT if scale_to_a3 else (595.0, 842.0))  # A4 portrait
+        tw, th = (A3_PORTRAIT if scale_to_a3 else (595.0, 842.0))  # A4 portrait when not scaling
+
+        calibri_ttf = _find_calibri_fontfile()
+
         doc = fitz.open()
         try:
             remaining = df.copy()
             while len(remaining) > 0:
                 page = doc.new_page(width=tw, height=th)
                 title = f"{tag} — Cover Sheet — WK{week_number}"
-                page.insert_text(fitz.Point(36, 24), title, fontsize=14, fontname="helv")
-                page.draw_line(fitz.Point(36, 28), fitz.Point(tw-36, 28), color=(0, 0, 0), width=0.7)
-                drawn = self._draw_table_page(page, remaining, margin=36, row_h=18, header_fill=(0.92, 0.92, 0.92))
+                page.insert_text(
+                    fitz.Point(36, 24),
+                    title,
+                    fontsize=12,
+                    fontfile=calibri_ttf if calibri_ttf else None,
+                    fontname=None if calibri_ttf else "helv",
+                )
+                page.draw_line(fitz.Point(36, 28), fitz.Point(tw - 36, 28), color=(0, 0, 0), width=0.7)
+
+                drawn = self._draw_table_page(
+                    page,
+                    remaining,
+                    margin=36,
+                    row_h=18,
+                    header_fill=(0.92, 0.92, 0.92),
+                    fontfile=calibri_ttf,
+                    fontsize=10,  # Calibri 10 (or Helvetica fallback)
+                )
                 if drawn <= 0:
                     break
                 remaining = remaining.iloc[drawn:].reset_index(drop=True)
