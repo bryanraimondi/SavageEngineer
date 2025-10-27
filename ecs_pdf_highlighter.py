@@ -810,7 +810,7 @@ class ReviewDialog(tk.Toplevel):
         ttk.Button(btns, text="Select All", command=self._select_all).pack(side="left")
         ttk.Button(btns, text="Clear All", command=self._clear_all).pack(side="left", padx=6)
         ttk.Button(btns, text="OK", command=self._ok).pack(side="right")
-        ttk.Button(btns, text="Cancel", command=self._cancel").pack(side="right", padx=6)
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right", padx=6)
 
         self.tree.bind("<Double-1>", self._toggle_keep)
         self.tree.bind("<<TreeviewSelect>>", self._preview_selected)
@@ -1651,9 +1651,12 @@ class HighlighterApp(tk.Tk):
         try:
             if getattr(self, "external_db_df", None) is not None:
                 matched_pretty = [original_map.get(p, p) for p in sorted(found_primary)]
-                cover_path = self._generate_cover_sheet_pdf(out_dir, root_name, week_number,
-                                                            self.external_db_df, matched_prety_codes=matched_pretty,
-                                                            scale_to_a3=scale_to_a3)
+                cover_path = self._generate_cover_sheet_pdf(
+                    out_dir, root_name, week_number,
+                    self.external_db_df,
+                    matched_pretty_codes=matched_pretty,  # fixed kwarg name
+                    scale_to_a3=scale_to_a3
+                )
                 if cover_path:
                     self.lbl_status.config(text=f"Cover Sheet saved: {os.path.basename(cover_path)}")
         except Exception as e:
