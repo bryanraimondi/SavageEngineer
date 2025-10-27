@@ -33,30 +33,6 @@ SUMMARY_KEYWORDS_RE = [re.compile(rf"\b{re.escape(k)}\b", re.IGNORECASE) for k i
 
 EMIT_DIAGNOSTICS = False  # opcional: CSV extra de diagnóstico
 
-# === New summary rule (only for PDFs > 1 MB): discard pages containing these keywords ===
-SUMMARY_BIGPDF_RE = [re.compile(r"\bsummary\b", re.IGNORECASE),
-                     re.compile(r"\btable of contents\b", re.IGNORECASE)]
-
-def is_summary_keyword_page_bigpdf(pdf_path, page_idx, min_size_bytes=1_000_000):
-    try:
-        # Only check the first 7 pages (0..6)
-        if page_idx >= 7:
-            return False
-        if os.path.getsize(pdf_path) <= min_size_bytes:
-            return False
-    except Exception:
-        return False
-    try:
-        with fitz.open(pdf_path) as doc:
-            pg = doc.load_page(page_idx)
-            txt = (pg.get_text("text") or "")
-            for rx in SUMMARY_BIGPDF_RE:
-                if rx.search(txt):
-                    return True
-    except Exception:
-        return False
-    return False
-
 
 def unify_dashes(s: str) -> str:
     if not s:
@@ -981,7 +957,9 @@ class HighlighterApp(tk.Tk):
         self.survey_size_limit = tk.IntVar(value=1200)  # KB
         self.dedupe_var = tk.BooleanVar(value=True)
         self.dedupe_surveys_var = tk.BooleanVar(value=False)  # NOVO: por padrão NÃO deduplica surveys
-# NOVO: limiar do cluster ±1..±4
+        self.skip_summary_var = tk.BooleanVar(value=True)
+        self.summary_threshold = tk.IntVar(value=15)
+        self.neighbor_min_hits_var = tk.IntVar(value=3)  # NOVO: limiar do cluster ±1..±4
         self.keep_latest_survey_rev_var = tk.BooleanVar(value=True)
         self.keep_latest_non_survey_rev_var = tk.BooleanVar(value=True)  # NOVO: também para handbooks/desenhos
 
@@ -1030,6 +1008,14 @@ class HighlighterApp(tk.Tk):
         fr_rules = ttk.LabelFrame(self, text="De-dup & Survey Rules"); fr_rules.pack(fill="x", **pad)
         ttk.Checkbutton(fr_rules, text="Treat 'Cut Length Report' PDFs as survey tables", variable=self.treat_survey_var).grid(row=0, column=0, sticky="w", padx=6, pady=4)
         ttk.Label(fr_rules, text="Survey size ≤ KB:").grid(row=0, column=1, sticky="e")
+        tk.Spinbox(fr_rules, from_=200, to=5000, increment=50, width=6, textvariable=self.survey_size_limit).grid(row=0, column=2, sticky="w", padx=6)
+        ttk.Checkbutton(fr_rules, text="De-duplicate identical pages (text/image hash)", variable=self.dedupe_var).grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=4)
+        ttk.Checkbutton(fr_rules, text="(Also) dedupe surveys", variable=self.dedupe_surveys_var).grid(row=1, column=2, sticky="w", padx=6)
+        ttk.Checkbutton(fr_rules, text="Skip summary-like pages (non-surveys)", variable=self.skip_summary_var).grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        ttk.Label(fr_rules, text="Summary = ≥ codes/page:").grid(row=2, column=1, sticky="e")
+        tk.Spinbox(fr_rules, from_=5, to=100, increment=1, width=6, textvariable=self.summary_threshold).grid(row=2, column=2, sticky="w", padx=6)
+        ttk.Label(fr_rules, text="Neighbor cluster min (±1..±4):").grid(row=2, column=3, sticky="e")
+        tk.Spinbox(fr_rules, from_=1, to=8, increment=1, width=4, textvariable=self.neighbor_min_hits_var).grid(row=2, column=4, sticky="w", padx=6)
         ttk.Checkbutton(fr_rules, text="Keep only latest Survey REV", variable=self.keep_latest_survey_rev_var).grid(row=3, column=0, sticky="w", padx=6, pady=4)
         ttk.Checkbutton(fr_rules, text="Keep only latest Handbook/Drawings REV", variable=self.keep_latest_non_survey_rev_var).grid(row=3, column=1, columnspan=2, sticky="w", padx=6, pady=4)
 
@@ -1213,7 +1199,10 @@ class HighlighterApp(tk.Tk):
             int(self.survey_size_limit.get()) * 1024,
             bool(self.dedupe_var.get()),
             bool(self.dedupe_surveys_var.get()),
-                        bool(self.keep_latest_survey_rev_var.get()),
+            bool(self.skip_summary_var.get()),
+            int(self.summary_threshold.get()),
+            int(self.neighbor_min_hits_var.get()),
+            bool(self.keep_latest_survey_rev_var.get()),
             bool(self.keep_latest_non_survey_rev_var.get()),
         )
         self.worker_thread = threading.Thread(target=self._worker, args=args, daemon=True)
@@ -1230,7 +1219,7 @@ class HighlighterApp(tk.Tk):
     def _worker(self, week_number, root_name, excel_paths, pdf_paths, out_dir, pages_per_file,
                 ignore_leading_digit, highlight_all_occurrences, use_text_annotations,
                 turbo_mode, parallel_mode, scale_to_a3, treat_survey, survey_size_limit_bytes,
-                dedupe_pages, dedupe_surveys, 
+                dedupe_pages, dedupe_surveys, skip_summary, summary_threshold, neighbor_min_hits,
                 keep_latest_survey_rev, keep_latest_non_survey_rev):
         def post(msg_type, payload=None):
             self.msg_queue.put((msg_type, payload))
@@ -1374,7 +1363,11 @@ class HighlighterApp(tk.Tk):
                 "treat_survey": bool(treat_survey),
                 "survey_size_limit_bytes": int(survey_size_limit_bytes),
                 "dedupe_pages": bool(dedupe_pages),
-                "dedupe_surveys": bool(dedupe_surveys),})
+                "dedupe_surveys": bool(dedupe_surveys),
+                "skip_summary": bool(skip_summary),
+                "summary_threshold": int(summary_threshold),
+                "neighbor_min_hits": int(neighbor_min_hits),
+            })
         except Exception as e:
             post("error", f"Unexpected error: {e}")
         finally:
@@ -1432,6 +1425,10 @@ class HighlighterApp(tk.Tk):
         survey_size_limit_bytes = int(bundle.get("survey_size_limit_bytes", 1_200_000))
         dedupe_pages = bool(bundle.get("dedupe_pages", True))
         dedupe_surveys = bool(bundle.get("dedupe_surveys", False))
+        skip_summary = bool(bundle.get("skip_summary", True))
+        summary_threshold = int(bundle.get("summary_threshold", 15))
+        neighbor_min_hits = int(bundle.get("neighbor_min_hits", 3))
+
         if not processed:
             messagebox.showinfo("No Matches", "No pages matched; nothing to save.")
             self.lbl_status.config(text="No matches.")
@@ -1466,17 +1463,45 @@ class HighlighterApp(tk.Tk):
         building_buckets = defaultdict(list)
         seen_hashes = set()
         audit_log = []
+        # Precompute original PDF sizes once (bytes) and flag big documents (>1 MB)
+        pdf_size_bytes = {}
+        pdf_is_big = {}
+        try:
+            for item in processed:
+                pth = item.get("pdf_path")
+                if pth and pth not in pdf_size_bytes:
+                    try:
+                        sz = os.path.getsize(pth)
+                    except Exception:
+                        sz = 0
+                    pdf_size_bytes[pth] = sz
+                    pdf_is_big[pth] = (sz > 1_000_000)
+        except Exception:
+            pass
+
 
         def add_item_if_ok(pdf_path, pg, rects, pretty_codes_for_pg, is_survey: bool):
-            # 1) New summary rule: for PDFs > 1 MB, discard pages containing "Summary" or "Table of Contents"
-            if is_summary_keyword_page_bigpdf(pdf_path, pg):
-                audit_log.append({
-                    "reason": "summary_keyword_bigpdf",
-                    "file": os.path.basename(pdf_path),
-                    "page": int(pg) + 1,
-                    "codes_on_page": ", ".join(sorted(set(pretty_codes_for_pg))),
-                })
-                return
+            # 1) Summary (apenas NÃO-SURVEY): checar só nas 7 primeiras páginas e somente se o PDF original > 1 MB
+            try:
+                if (not is_survey) and (pg < 7):
+                    try:
+                        if os.path.getsize(pdf_path) > 1_000_000:
+                            with fitz.open(pdf_path) as _doc_chk:
+                                _pg = _doc_chk.load_page(pg)
+                                _txt = (_pg.get_text("text") or "")
+                                if re.search(r"summary", _txt, flags=re.IGNORECASE) or \
+                                   re.search(r"table of contents", _txt, flags=re.IGNORECASE):
+                                    audit_log.append({
+                                        "reason": "summary_keyword_bigpdf",
+                                        "file": os.path.basename(pdf_path),
+                                        "page": int(pg) + 1,
+                                        "codes_on_page": ", ".join(sorted(set(pretty_codes_for_pg))),
+                                    })
+                                    return
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             # 2) De-dup
             if dedupe_pages and (not is_survey or dedupe_surveys):
                 fp = page_fingerprint(pdf_path, pg)
