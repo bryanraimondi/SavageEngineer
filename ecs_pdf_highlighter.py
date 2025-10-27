@@ -39,6 +39,9 @@ SUMMARY_BIGPDF_RE = [re.compile(r"\bsummary\b", re.IGNORECASE),
 
 def is_summary_keyword_page_bigpdf(pdf_path, page_idx, min_size_bytes=1_000_000):
     try:
+        # Only check the first 7 pages (0..6)
+        if page_idx >= 7:
+            return False
         if os.path.getsize(pdf_path) <= min_size_bytes:
             return False
     except Exception:
@@ -1027,7 +1030,7 @@ class HighlighterApp(tk.Tk):
         fr_rules = ttk.LabelFrame(self, text="De-dup & Survey Rules"); fr_rules.pack(fill="x", **pad)
         ttk.Checkbutton(fr_rules, text="Treat 'Cut Length Report' PDFs as survey tables", variable=self.treat_survey_var).grid(row=0, column=0, sticky="w", padx=6, pady=4)
         ttk.Label(fr_rules, text="Survey size ≤ KB:").grid(row=0, column=1, sticky="e")
-ttk.Checkbutton(fr_rules, text="Keep only latest Survey REV", variable=self.keep_latest_survey_rev_var).grid(row=3, column=0, sticky="w", padx=6, pady=4)
+        ttk.Checkbutton(fr_rules, text="Keep only latest Survey REV", variable=self.keep_latest_survey_rev_var).grid(row=3, column=0, sticky="w", padx=6, pady=4)
         ttk.Checkbutton(fr_rules, text="Keep only latest Handbook/Drawings REV", variable=self.keep_latest_non_survey_rev_var).grid(row=3, column=1, columnspan=2, sticky="w", padx=6, pady=4)
 
         # DB externa
@@ -1429,7 +1432,7 @@ ttk.Checkbutton(fr_rules, text="Keep only latest Survey REV", variable=self.keep
         survey_size_limit_bytes = int(bundle.get("survey_size_limit_bytes", 1_200_000))
         dedupe_pages = bool(bundle.get("dedupe_pages", True))
         dedupe_surveys = bool(bundle.get("dedupe_surveys", False))
-if not processed:
+        if not processed:
             messagebox.showinfo("No Matches", "No pages matched; nothing to save.")
             self.lbl_status.config(text="No matches.")
             self._write_not_surveyed_csv(out_dir, root_name, week_number,
