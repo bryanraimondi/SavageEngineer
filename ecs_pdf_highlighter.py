@@ -129,10 +129,10 @@ def extract_ecs_codes_from_df(df):
     raw = []
     for c in cols:
         raw += df[c].dropna().astype(str).tolist()
-    # Split robusto
+    # Split robusto (vírgula, ponto-e-vírgula, quebra de linha, barra, tab, espaço)
     tokens = []
     for v in raw:
-        parts = re.split(r"[,\n/\t ;]+", v)
+        parts = re.split(r"[,;\n/\t ]+", v)
         for p in parts:
             t = p.strip().strip('"\'')
             if t and re.search(r"[A-Za-z]", t) and re.search(r"\d", t) and " " not in t:
@@ -632,7 +632,7 @@ def select_latest_non_survey_revisions(pdf_paths: list) -> list:
             groups[base] = (p, rev)
     # mantém todos os surveys + somente o mais novo dos não-surveys
     out = [p for p in pdf_paths if is_survey_pdf(p)]
-    out.extend(v[0] for v in groups.values())  # FIX: sem ']' sobrando
+    out.extend(v[0] for v in groups.values())  # FIX
     out = sorted(set(out), key=lambda x: os.path.basename(x).lower())
     return out
 
@@ -960,7 +960,7 @@ class SummaryDialog(tk.Toplevel):
 
 # ============================== Cover helpers ===========================
 def _excel_letters_to_indices(letters_list, df):
-    """Convert Excel letters (e.g. 'B', 'AA') to 0-based column indices and keep only those that exist."""
+    """Converte letras Excel (B, AA) para índices 0-based e mantém só as existentes."""
     def letter_to_idx(s):
         s = s.strip().upper()
         if not s:
@@ -980,17 +980,25 @@ def _excel_letters_to_indices(letters_list, df):
 
 
 def _find_calibri_fontfile():
-    """Try to locate Calibri. Returns absolute path or None (fallback to built-in font)."""
+    """Tenta localizar Calibri. Retorna caminho ou None (usa Helvetica)."""
     candidates = [
-        r"C:\Windows\Fonts\calibri.ttf",                         # Windows
-        r"/System/Library/Fonts/Supplemental/Calibri.ttf",       # macOS (uncommon)
-        r"/usr/share/fonts/truetype/msttcorefonts/Calibri.ttf",  # Linux (if installed)
-        os.environ.get("CALIBRI_TTF", "").strip(),               # optional override
+        r"C:\Windows\Fonts\calibri.ttf",
+        r"/System/Library/Fonts/Supplemental/Calibri.ttf",
+        r"/usr/share/fonts/truetype/msttcorefonts/Calibri.ttf",
+        os.environ.get("CALIBRI_TTF", "").strip(),
     ]
     for p in candidates:
         if p and os.path.exists(p):
             return p
     return None
+
+
+def _text_font_kwargs(fontfile_path):
+    """Retorna kwargs corretos de fonte para insert_text/insert_textbox."""
+    if fontfile_path and isinstance(fontfile_path, str) and os.path.exists(fontfile_path):
+        return {"fontfile": fontfile_path}
+    # fallback para fonte padrão embutida
+    return {"fontname": "helv"}
 
 
 # ============================== Main App ================================
@@ -1020,9 +1028,9 @@ class HighlighterApp(tk.Tk):
         self.treat_survey_var = tk.BooleanVar(value=True)
         self.survey_size_limit = tk.IntVar(value=1200)  # KB
         self.dedupe_var = tk.BooleanVar(value=True)
-        self.dedupe_surveys_var = tk.BooleanVar(value=False)  # por padrão NÃO deduplica surveys
+        self.dedupe_surveys_var = tk.BooleanVar(value=False)
         self.keep_latest_survey_rev_var = tk.BooleanVar(value=True)
-        self.keep_latest_non_survey_rev_var = tk.BooleanVar(value=True)  # também p/ handbooks/desenhos
+        self.keep_latest_non_survey_rev_var = tk.BooleanVar(value=True)
 
         # DB externa (opcional)
         self.external_db_path = tk.StringVar()
@@ -1045,7 +1053,6 @@ class HighlighterApp(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 8, "pady": 6}
 
-        # Top sections (packed in order)
         fr_top = ttk.Frame(self); fr_top.pack(fill="x", **pad)
         ttk.Label(fr_top, text="Week:").pack(side="left")
         ttk.Entry(fr_top, width=8, textvariable=self.week_number).pack(side="left", padx=8)
@@ -1072,7 +1079,6 @@ class HighlighterApp(tk.Tk):
         ttk.Checkbutton(fr_rules, text="Keep only latest Survey REV", variable=self.keep_latest_survey_rev_var).grid(row=3, column=0, sticky="w", padx=6, pady=4)
         ttk.Checkbutton(fr_rules, text="Keep only latest Handbook/Drawings REV", variable=self.keep_latest_non_survey_rev_var).grid(row=3, column=1, columnspan=2, sticky="w", padx=6, pady=4)
 
-        # DB externa
         fr_db = ttk.LabelFrame(self, text="External DB (optional, local .xlsx)"); fr_db.pack(fill="x", **pad)
         ttk.Label(fr_db, text="DB Excel:").grid(row=0, column=0, sticky="e")
         ttk.Entry(fr_db, textvariable=self.external_db_path).grid(row=0, column=1, sticky="ew", padx=6)
@@ -1081,7 +1087,6 @@ class HighlighterApp(tk.Tk):
         ttk.Button(fr_db, text="Load DB", command=self._load_external_db).grid(row=0, column=3, padx=6)
         ttk.Button(fr_db, text="Clear", command=self._clear_external_db).grid(row=0, column=4, padx=6)
 
-        # Excels
         fr_excel = ttk.LabelFrame(self, text="Excel files (ECS Codes)"); fr_excel.pack(fill="x", **pad)
         btns_ex = ttk.Frame(fr_excel); btns_ex.pack(fill="x", padx=6, pady=6)
         ttk.Button(btns_ex, text="Add Excel…", command=self._add_excels).pack(side="left")
@@ -1090,7 +1095,6 @@ class HighlighterApp(tk.Tk):
         self.lst_excels = tk.Listbox(fr_excel, height=5, selectmode=tk.EXTENDED)
         self.lst_excels.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
-        # PDFs
         fr_pdfs = ttk.LabelFrame(self, text="PDFs to Process"); fr_pdfs.pack(fill="both", expand=True, **pad)
         btns = ttk.Frame(fr_pdfs); btns.pack(fill="x", padx=6, pady=6)
         ttk.Button(btns, text="Add PDFs…", command=self._add_pdfs).pack(side="left")
@@ -1099,13 +1103,11 @@ class HighlighterApp(tk.Tk):
         self.lst_pdfs = tk.Listbox(fr_pdfs, height=7, selectmode=tk.EXTENDED)
         self.lst_pdfs.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
-        # Output
         fr_out = ttk.Frame(self); fr_out.pack(fill="x", **pad)
         ttk.Label(fr_out, text="Output Folder:").pack(side="left")
         ttk.Entry(fr_out, textvariable=self.output_dir).pack(side="left", expand=True, fill="x", padx=8)
         ttk.Button(fr_out, text="Select…", command=self._pick_output_dir).pack(side="left")
 
-        # Log
         fr_log = ttk.LabelFrame(self, text="Matches (ECS Code | File | Page | Codes on Page)"); fr_log.pack(fill="both", expand=True, **pad)
         cols = ("code", "file", "page", "codes_on_page")
         self.tree = ttk.Treeview(fr_log, columns=cols, show="headings", height=12)
@@ -1119,7 +1121,6 @@ class HighlighterApp(tk.Tk):
         self.tree.column("codes_on_page", width=220, anchor="w")
         self.tree.pack(fill="both", expand=True, padx=6, pady=6)
 
-        # ===== Fixed bottom bar (progress + Start/Stop/Exit) =====
         self.bottom = ttk.Frame(self)
         self.bottom.pack(side="bottom", fill="x", **pad)
         fr_prog = ttk.Frame(self.bottom)
@@ -1130,7 +1131,6 @@ class HighlighterApp(tk.Tk):
         self.lbl_status.pack(side="left", padx=8)
         fr_btns = ttk.Frame(self.bottom)
         fr_btns.pack(side="right")
-        # Keep strong references so they never get GC'd:
         self.btn_start = ttk.Button(fr_btns, text="Start", command=self._start)
         self.btn_start.pack(side="left")
         self.btn_stop = ttk.Button(fr_btns, text="Stop", command=self._stop)
@@ -1181,6 +1181,7 @@ class HighlighterApp(tk.Tk):
                 self.excel_paths.remove(path)
             except ValueError:
                 pass
+
     def _clear_excels(self):
         self.lst_excels.delete(0, "end")
         self.excel_paths.clear()
@@ -1202,6 +1203,7 @@ class HighlighterApp(tk.Tk):
                 self.pdf_list.remove(path)
             except ValueError:
                 pass
+
     def _clear_pdfs(self):
         self.lst_pdfs.delete(0, "end")
         self.pdf_list.clear()
@@ -1225,7 +1227,6 @@ class HighlighterApp(tk.Tk):
         self.output_dir.set(out_dir)
         os.makedirs(out_dir, exist_ok=True)
 
-        # reset UI aggregation
         self.main_page_codes.clear()
         self.main_row_iid.clear()
         for iid in self.tree.get_children():
@@ -1271,7 +1272,6 @@ class HighlighterApp(tk.Tk):
         def post(msg_type, payload=None):
             self.msg_queue.put((msg_type, payload))
         try:
-            # 1) Carregar todas as planilhas e unir códigos
             post("status", "Reading Excel files…")
             ecs_primary_all = set()
             original_map_all = {}
@@ -1293,7 +1293,6 @@ class HighlighterApp(tk.Tk):
             cmp_keys, nosep_to_primary, _max_len = build_compare_index(ecs_primary_all, ignore_leading_digit)
             self.nosep_to_primary = dict(nosep_to_primary)
 
-            # 2) Filtrar revisões
             if keep_latest_survey_rev:
                 try:
                     pdf_paths = select_latest_survey_revisions(list(pdf_paths))
@@ -1305,7 +1304,6 @@ class HighlighterApp(tk.Tk):
                 except Exception:
                     pass
 
-            # 3) Tarefas
             tasks = []
             for pdf in pdf_paths:
                 tasks.append((
@@ -1346,9 +1344,8 @@ class HighlighterApp(tk.Tk):
                 post("done", None)
                 return
 
-            # 4) Agregar + mandar linhas para UI
             processed = []
-            agg_code_file_pages = defaultdict(lambda: defaultdict(set))  # cmp_key -> file -> set(pages)
+            agg_code_file_pages = defaultdict(lambda: defaultdict(set))
 
             for res in results:
                 if "error" in res:
@@ -1414,7 +1411,6 @@ class HighlighterApp(tk.Tk):
         finally:
             post("done", None)
 
-    # ===== message pump (UI) =====
     def _poll_messages(self):
         try:
             while True:
@@ -1449,7 +1445,7 @@ class HighlighterApp(tk.Tk):
             pass
         self.after(80, self._poll_messages)
 
-    # ===== finalize: filtros, review (com filtro Summary/TOC), combine, CSVs =====
+    # ===== finalize: filtros, review, combine, CSVs =====
     def _finalize_and_save(self, bundle):
         processed = bundle["processed"]
         root_name = bundle["root_name"]
@@ -1476,15 +1472,14 @@ class HighlighterApp(tk.Tk):
 
         used_review = bool(self.review_pages_var.get())
         if used_review:
-            # --- NOVO: filtra páginas Summary/TOC ANTES de abrir a janela de Review ---
             def _is_summary_or_toc(pdf_path: str, page_idx: int) -> bool:
-                return is_summary_keyword_page(pdf_path, page_idx, first_pages_only=7)  # mude para 0 se quiser varrer tudo
+                return is_summary_keyword_page(pdf_path, page_idx, first_pages_only=7)
             items = []
             for p in processed:
                 pdf_path = p["pdf_path"]
                 filtered_hit_pages = [pg for pg in p["hit_pages"] if not _is_summary_or_toc(pdf_path, pg)]
                 if not filtered_hit_pages:
-                    continue  # sem páginas após filtro -> não entra no Review
+                    continue
                 items.append({
                     "display": p["display"],
                     "pdf_path": pdf_path,
@@ -1513,8 +1508,6 @@ class HighlighterApp(tk.Tk):
         audit_log = []
 
         def add_item_if_ok(pdf_path, pg, rects, pretty_codes_for_pg, is_survey: bool):
-            # 1) Summary/TOC: descarta sem depender de tamanho; por padrão, checa as 7 primeiras páginas
-            #    (Se quiser varrer o documento inteiro, troque para first_pages_only=0)
             if is_summary_keyword_page(pdf_path, pg, first_pages_only=7):
                 audit_log.append({
                     "reason": "summary_keyword",
@@ -1523,10 +1516,8 @@ class HighlighterApp(tk.Tk):
                     "codes_on_page": ", ".join(sorted(set(pretty_codes_for_pg))),
                 })
                 return
-            # 2) De-dup
             if dedupe_pages and (not is_survey or dedupe_surveys):
                 fp = page_fingerprint(pdf_path, pg)
-                # Opcional: incluir código no fingerprint de surveys (se dedupe_surveys marcado)
                 if is_survey and dedupe_surveys and pretty_codes_for_pg:
                     fp = fp + "::" + "\n".join(sorted(pretty_codes_for_pg))
                 if fp in seen_hashes:
@@ -1539,7 +1530,6 @@ class HighlighterApp(tk.Tk):
                     return
                 seen_hashes.add(fp)
 
-            # 3) Bucket por prédio
             bld = "UNKWN"
             if pretty_codes_for_pg:
                 inferred = [infer_building_from_code(c) for c in pretty_codes_for_pg]
@@ -1552,7 +1542,6 @@ class HighlighterApp(tk.Tk):
                 "rects": rects
             })
 
-        # Preenche buckets (respeita regra “survey duplica por código”)
         for p in processed:
             pdf_path = p["pdf_path"]
             rects_by_page = p["rects_by_page"]
@@ -1573,7 +1562,6 @@ class HighlighterApp(tk.Tk):
                     rects = rects_by_page.get(pg, [])
                     add_item_if_ok(pdf_path, pg, rects, pretty_codes, is_survey)
 
-        # Respeita ordem manual, se houver
         if ordered_kept:
             new_buckets = defaultdict(list)
             for (pdf_path, pg) in ordered_kept:
@@ -1590,7 +1578,6 @@ class HighlighterApp(tk.Tk):
             for bld, lst in building_buckets.items():
                 lst.sort(key=lambda it: (os.path.basename(it["pdf_path"]).lower(), it["page_idx"]))
 
-        # Salvar PDFs por prédio/part
         saved_files = []
         for bld, lst in sorted(building_buckets.items(), key=lambda kv: kv[0]):
             if not lst:
@@ -1616,7 +1603,6 @@ class HighlighterApp(tk.Tk):
         else:
             self.lbl_status.config(text="No output files saved.")
 
-        # Resumo por código
         primary_file_pages = defaultdict(lambda: defaultdict(set))
         for cmp_key, file_map in agg_code_file_pages.items():
             primary = nosep_to_primary.get(cmp_key, cmp_key)
@@ -1638,23 +1624,13 @@ class HighlighterApp(tk.Tk):
         self._write_not_surveyed_csv(out_dir, root_name, week_number,
                                      [original_map.get(p, p) for p in missing_primary])
 
-        # Auditoria
-        if audit_log:
-            try:
-                audit_df = pd.DataFrame(audit_log, columns=["reason", "file", "page", "codes_on_page"])
-                tag = sanitize_filename(root_name) or "Job"
-                audit_csv = os.path.join(out_dir, f"{tag}_AuditLog_WK{week_number}.csv")
-                audit_df.to_csv(uniquify_path(audit_csv), index=False)
-            except Exception:
-                pass
-        # Cover Sheet (se DB externa carregada)
         try:
             if getattr(self, "external_db_df", None) is not None:
                 matched_pretty = [original_map.get(p, p) for p in sorted(found_primary)]
                 cover_path = self._generate_cover_sheet_pdf(
                     out_dir, root_name, week_number,
                     self.external_db_df,
-                    matched_pretty_codes=matched_pretty,  # fixed kwarg name
+                    matched_pretty_codes=matched_pretty,
                     scale_to_a3=scale_to_a3
                 )
                 if cover_path:
@@ -1672,7 +1648,6 @@ class HighlighterApp(tk.Tk):
         try:
             base_df = pd.DataFrame(rows, columns=["code", "total_pages", "breakdown"])
             base_df.to_csv(csv_path, index=False)
-            # enriquecido
             if getattr(self, "external_db_map", None):
                 enriched = []
                 for r in rows:
@@ -1700,7 +1675,6 @@ class HighlighterApp(tk.Tk):
             messagebox.showwarning("CSV", f"Could not save NotSurveyed CSV:\n{e}")
         return csv_path
 
-    # ====== Drawing table with Calibri 10, all borders, header each page ======
     def _draw_table_page(self, page, df, margin=36, row_h=18, header_fill=(0.92, 0.92, 0.92),
                          fontfile=None, fontsize=10):
         width, height = float(page.rect.width), float(page.rect.height)
@@ -1710,39 +1684,40 @@ class HighlighterApp(tk.Tk):
 
         cols = list(df.columns)
 
-        # Compute proportional widths from header + a sample of data
+        # Largura proporcional por conteúdo
         sample_rows = min(100, len(df))
         col_weights = []
         for c in cols:
             w = max(len(str(c)), max((len(str(df.iloc[i][c])) for i in range(sample_rows)), default=0))
-            col_weights.append(max(6, w))  # minimum weight to avoid zero-width
+            col_weights.append(max(6, w))
         total_w = sum(col_weights)
         col_widths = [(w / total_w) * (x_right - x_left) for w in col_weights]
 
-        # Header
+        # Cabeçalho (repete em cada página)
         header_top = y
         header_bottom = y + row_h
         page.draw_rect(fitz.Rect(x_left, header_top, x_right, header_bottom), color=(0, 0, 0), fill=header_fill)
 
+        font_kwargs = _text_font_kwargs(fontfile)
+
         cx = x_left
         for i, c in enumerate(cols):
             cell_rect = fitz.Rect(cx, header_top, cx + col_widths[i], header_bottom)
-            page.draw_rect(cell_rect, color=(0, 0, 0), width=0.7)  # all borders
+            page.draw_rect(cell_rect, color=(0, 0, 0), width=0.7)  # todas as bordas
             page.insert_textbox(
                 cell_rect,
                 str(c),
                 fontsize=fontsize,
-                fontfile=fontfile if fontfile else None,
-                fontname=None if fontfile else "helv",
                 align=fitz.TEXT_ALIGN_LEFT,
+                **font_kwargs,
             )
             cx += col_widths[i]
         y = header_bottom
 
-        # Rows per page
+        # Quantas linhas cabem
         max_rows = int((height - y - margin) // row_h)
 
-        # Body rows with borders
+        # Linhas do corpo com bordas
         end = min(len(df), max_rows)
         for r in range(end):
             row_top = y
@@ -1750,20 +1725,19 @@ class HighlighterApp(tk.Tk):
             cx = x_left
             for i, c in enumerate(cols):
                 cell_rect = fitz.Rect(cx, row_top, cx + col_widths[i], row_bottom)
-                page.draw_rect(cell_rect, color=(0, 0, 0), width=0.5)  # all borders
+                page.draw_rect(cell_rect, color=(0, 0, 0), width=0.5)
                 txt = "" if pd.isna(df.iloc[r][c]) else str(df.iloc[r][c])
                 page.insert_textbox(
                     fitz.Rect(cx + 2, row_top + 1, cx + col_widths[i] - 2, row_bottom - 1),
                     txt,
                     fontsize=fontsize,
-                    fontfile=fontfile if fontfile else None,
-                    fontname=None if fontfile else "helv",
                     align=fitz.TEXT_ALIGN_LEFT,
+                    **font_kwargs,
                 )
                 cx += col_widths[i]
             y = row_bottom
 
-        return end  # number of body rows drawn
+        return end
 
     def _generate_cover_sheet_pdf(self, out_dir, root_name, week_number, external_df, matched_pretty_codes, scale_to_a3=False):
         if external_df is None or external_df.empty or not matched_pretty_codes:
@@ -1777,14 +1751,14 @@ class HighlighterApp(tk.Tk):
         filt_rows = []
         for _, row in external_df.iterrows():
             raw = "" if pd.isna(row[ecs_col]) else str(row[ecs_col])
-            candidates = [t.strip() for t in re.split(r"[,\\n;/\t ]+", raw) if t.strip()]
+            candidates = [t.strip() for t in re.split(r"[,;\n/\t ]+", raw) if t.strip()]
             if any(normalize_base(t) in matched_norm for t in candidates):
                 filt_rows.append(dict(row))
         if not filt_rows:
             return None
         df_full = pd.DataFrame(filt_rows)
 
-        # Keep only requested columns: B,G,H,I,J,K,L,N,O,P,Q,S,T,U
+        # Somente colunas específicas: B, G, H, I, J, K, L, N, O, P, Q, S, T, U
         wanted_letters = ["B", "G", "H", "I", "J", "K", "L", "N", "O", "P", "Q", "S", "T", "U"]
         idxs = _excel_letters_to_indices(wanted_letters, df_full)
         if not idxs:
@@ -1792,13 +1766,13 @@ class HighlighterApp(tk.Tk):
         df = df_full.iloc[:, idxs].copy()
         df.columns = [str(c).strip() for c in df.columns]
 
-        # PDF setup
         tag = sanitize_filename(root_name) or "Job"
         cover_path = os.path.join(out_dir, f"{tag}_Cover Sheet_WK{week_number}.pdf")
         cover_path = uniquify_path(cover_path)
-        tw, th = (A3_PORTRAIT if scale_to_a3 else (595.0, 842.0))  # A4 portrait when not scaling
+        tw, th = (A3_PORTRAIT if scale_to_a3 else (595.0, 842.0))  # A4 retrato
 
         calibri_ttf = _find_calibri_fontfile()
+        font_kwargs = _text_font_kwargs(calibri_ttf)
 
         doc = fitz.open()
         try:
@@ -1810,8 +1784,7 @@ class HighlighterApp(tk.Tk):
                     fitz.Point(36, 24),
                     title,
                     fontsize=12,
-                    fontfile=calibri_ttf if calibri_ttf else None,
-                    fontname=None if calibri_ttf else "helv",
+                    **font_kwargs,
                 )
                 page.draw_line(fitz.Point(36, 28), fitz.Point(tw - 36, 28), color=(0, 0, 0), width=0.7)
 
@@ -1821,8 +1794,8 @@ class HighlighterApp(tk.Tk):
                     margin=36,
                     row_h=18,
                     header_fill=(0.92, 0.92, 0.92),
-                    fontfile=calibri_ttf,
-                    fontsize=10,  # Calibri 10 (or Helvetica fallback)
+                    fontfile=calibri_ttf,  # será convertido em kwargs internamente
+                    fontsize=10,           # Calibri 10 (ou Helvetica fallback)
                 )
                 if drawn <= 0:
                     break
@@ -1842,14 +1815,13 @@ def load_external_db_from_xlsx(xlsx_path):
     Retorna (df, map_normalizado_por_codigo).
     """
     df = pd.read_excel(xlsx_path, dtype=str, engine="openpyxl")
-    # índice por código normalizado
     cand_cols = [c for c in df.columns if str(c).strip().lower() in ("ecs code", "ecs codes")]
     idx = {}
     if cand_cols:
         c = cand_cols[0]
         for _, row in df.iterrows():
             raw = "" if pd.isna(row[c]) else str(row[c])
-            tokens = [t.strip() for t in re.split(r"[,\\n;/\t ]+", raw) if t.strip()]
+            tokens = [t.strip() for t in re.split(r"[,;\n/\t ]+", raw) if t.strip()]
             for t in tokens:
                 nb = normalize_base(t)
                 if nb:
