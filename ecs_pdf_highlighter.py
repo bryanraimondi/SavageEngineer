@@ -632,7 +632,7 @@ def select_latest_non_survey_revisions(pdf_paths: list) -> list:
             groups[base] = (p, rev)
     # mantém todos os surveys + somente o mais novo dos não-surveys
     out = [p for p in pdf_paths if is_survey_pdf(p)]
-    out.extend(v[0] for v in groups.values())  # FIX
+    out.extend(v[0] for v in groups.values())
     out = sorted(set(out), key=lambda x: os.path.basename(x).lower())
     return out
 
@@ -1001,6 +1001,41 @@ def _text_font_kwargs(fontfile_path):
     return {"fontname": "helv"}
 
 
+# ============================== Interleave helper =======================
+def _interleave_survey_drawing(items, is_survey_fn):
+    """
+    Recebe uma lista de itens [{'pdf_path', 'page_idx', 'rects'}] em ordem atual
+    e retorna uma nova lista intercalando SURVEY e DRAWING: S-D-S-D...
+    Mantém a ordem relativa original dentro de cada grupo.
+    """
+    surveys = []
+    drawings = []
+    for it in items:
+        if is_survey_fn(it["pdf_path"]):
+            surveys.append(it)
+        else:
+            drawings.append(it)
+
+    # Se um grupo estiver vazio, não força alternância
+    if not surveys or not drawings:
+        return items
+
+    out = []
+    i = j = 0
+    turn_survey = True  # começa com survey quando possível
+    while i < len(surveys) or j < len(drawings):
+        if turn_survey and i < len(surveys):
+            out.append(surveys[i]); i += 1
+        elif (not turn_survey) and j < len(drawings):
+            out.append(drawings[j]); j += 1
+        elif i < len(surveys):  # acabou o outro grupo, despeja o restante
+            out.append(surveys[i]); i += 1
+        elif j < len(drawings):
+            out.append(drawings[j]); j += 1
+        turn_survey = not turn_survey
+    return out
+
+
 # ============================== Main App ================================
 class HighlighterApp(tk.Tk):
     def __init__(self):
@@ -1023,6 +1058,7 @@ class HighlighterApp(tk.Tk):
         self.scale_to_a3_var = tk.BooleanVar(value=False)
         self.turbo_var = tk.BooleanVar(value=True)
         self.parallel_var = tk.BooleanVar(value=True)
+        self.alternate_sd_var = tk.BooleanVar(value=True)  # alternar Survey/Drawing
 
         # De-dup / survey / summary
         self.treat_survey_var = tk.BooleanVar(value=True)
@@ -1053,6 +1089,7 @@ class HighlighterApp(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 8, "pady": 6}
 
+        # Top
         fr_top = ttk.Frame(self); fr_top.pack(fill="x", **pad)
         ttk.Label(fr_top, text="Week:").pack(side="left")
         ttk.Entry(fr_top, width=8, textvariable=self.week_number).pack(side="left", padx=8)
@@ -1061,6 +1098,7 @@ class HighlighterApp(tk.Tk):
         ttk.Label(fr_top, text="Max pages per output:").pack(side="left", padx=(16, 0))
         tk.Spinbox(fr_top, from_=5, to=500, increment=1, width=6, textvariable=self.pages_per_file_var).pack(side="left", padx=6)
 
+        # Options
         fr_opts = ttk.Frame(self); fr_opts.pack(fill="x", **pad)
         ttk.Checkbutton(fr_opts, text="Only keep highlighted pages", variable=self.only_highlighted_var).pack(side="left")
         ttk.Checkbutton(fr_opts, text="Review pages before saving", variable=self.review_pages_var).pack(side="left", padx=12)
@@ -1069,16 +1107,21 @@ class HighlighterApp(tk.Tk):
         ttk.Checkbutton(fr_opts, text="Use text highlight annotations", variable=self.use_text_annots_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Scale output pages to A3", variable=self.scale_to_a3_var).pack(side="left", padx=12)
 
+        # Performance
         fr_perf = ttk.Frame(self); fr_perf.pack(fill="x", **pad)
         ttk.Checkbutton(fr_perf, text="Turbo (Aho–Corasick)", variable=self.turbo_var).pack(side="left")
         ttk.Checkbutton(fr_perf, text="Parallel PDFs", variable=self.parallel_var).pack(side="left", padx=12)
+        ttk.Checkbutton(fr_perf, text="Alternate survey & drawing pages", variable=self.alternate_sd_var).pack(side="left", padx=12)
 
+        # Rules
         fr_rules = ttk.LabelFrame(self, text="De-dup & Survey Rules"); fr_rules.pack(fill="x", **pad)
         ttk.Checkbutton(fr_rules, text="Treat 'Cut Length Report' PDFs as survey tables", variable=self.treat_survey_var).grid(row=0, column=0, sticky="w", padx=6, pady=4)
         ttk.Label(fr_rules, text="Survey size ≤ KB:").grid(row=0, column=1, sticky="e")
+        tk.Spinbox(fr_rules, from_=50, to=20000, increment=50, width=6, textvariable=self.survey_size_limit).grid(row=0, column=2, sticky="w", padx=6)
         ttk.Checkbutton(fr_rules, text="Keep only latest Survey REV", variable=self.keep_latest_survey_rev_var).grid(row=3, column=0, sticky="w", padx=6, pady=4)
         ttk.Checkbutton(fr_rules, text="Keep only latest Handbook/Drawings REV", variable=self.keep_latest_non_survey_rev_var).grid(row=3, column=1, columnspan=2, sticky="w", padx=6, pady=4)
 
+        # External DB
         fr_db = ttk.LabelFrame(self, text="External DB (optional, local .xlsx)"); fr_db.pack(fill="x", **pad)
         ttk.Label(fr_db, text="DB Excel:").grid(row=0, column=0, sticky="e")
         ttk.Entry(fr_db, textvariable=self.external_db_path).grid(row=0, column=1, sticky="ew", padx=6)
@@ -1087,6 +1130,7 @@ class HighlighterApp(tk.Tk):
         ttk.Button(fr_db, text="Load DB", command=self._load_external_db).grid(row=0, column=3, padx=6)
         ttk.Button(fr_db, text="Clear", command=self._clear_external_db).grid(row=0, column=4, padx=6)
 
+        # Excels
         fr_excel = ttk.LabelFrame(self, text="Excel files (ECS Codes)"); fr_excel.pack(fill="x", **pad)
         btns_ex = ttk.Frame(fr_excel); btns_ex.pack(fill="x", padx=6, pady=6)
         ttk.Button(btns_ex, text="Add Excel…", command=self._add_excels).pack(side="left")
@@ -1095,6 +1139,7 @@ class HighlighterApp(tk.Tk):
         self.lst_excels = tk.Listbox(fr_excel, height=5, selectmode=tk.EXTENDED)
         self.lst_excels.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
+        # PDFs
         fr_pdfs = ttk.LabelFrame(self, text="PDFs to Process"); fr_pdfs.pack(fill="both", expand=True, **pad)
         btns = ttk.Frame(fr_pdfs); btns.pack(fill="x", padx=6, pady=6)
         ttk.Button(btns, text="Add PDFs…", command=self._add_pdfs).pack(side="left")
@@ -1103,11 +1148,13 @@ class HighlighterApp(tk.Tk):
         self.lst_pdfs = tk.Listbox(fr_pdfs, height=7, selectmode=tk.EXTENDED)
         self.lst_pdfs.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
+        # Output
         fr_out = ttk.Frame(self); fr_out.pack(fill="x", **pad)
         ttk.Label(fr_out, text="Output Folder:").pack(side="left")
         ttk.Entry(fr_out, textvariable=self.output_dir).pack(side="left", expand=True, fill="x", padx=8)
         ttk.Button(fr_out, text="Select…", command=self._pick_output_dir).pack(side="left")
 
+        # Log
         fr_log = ttk.LabelFrame(self, text="Matches (ECS Code | File | Page | Codes on Page)"); fr_log.pack(fill="both", expand=True, **pad)
         cols = ("code", "file", "page", "codes_on_page")
         self.tree = ttk.Treeview(fr_log, columns=cols, show="headings", height=12)
@@ -1121,6 +1168,7 @@ class HighlighterApp(tk.Tk):
         self.tree.column("codes_on_page", width=220, anchor="w")
         self.tree.pack(fill="both", expand=True, padx=6, pady=6)
 
+        # Bottom
         self.bottom = ttk.Frame(self)
         self.bottom.pack(side="bottom", fill="x", **pad)
         fr_prog = ttk.Frame(self.bottom)
@@ -1227,6 +1275,7 @@ class HighlighterApp(tk.Tk):
         self.output_dir.set(out_dir)
         os.makedirs(out_dir, exist_ok=True)
 
+        # reset UI aggregation
         self.main_page_codes.clear()
         self.main_row_iid.clear()
         for iid in self.tree.get_children():
@@ -1272,6 +1321,7 @@ class HighlighterApp(tk.Tk):
         def post(msg_type, payload=None):
             self.msg_queue.put((msg_type, payload))
         try:
+            # 1) Carregar planilhas
             post("status", "Reading Excel files…")
             ecs_primary_all = set()
             original_map_all = {}
@@ -1293,6 +1343,7 @@ class HighlighterApp(tk.Tk):
             cmp_keys, nosep_to_primary, _max_len = build_compare_index(ecs_primary_all, ignore_leading_digit)
             self.nosep_to_primary = dict(nosep_to_primary)
 
+            # 2) Filtrar revisões
             if keep_latest_survey_rev:
                 try:
                     pdf_paths = select_latest_survey_revisions(list(pdf_paths))
@@ -1304,6 +1355,7 @@ class HighlighterApp(tk.Tk):
                 except Exception:
                     pass
 
+            # 3) Tarefas
             tasks = []
             for pdf in pdf_paths:
                 tasks.append((
@@ -1344,8 +1396,9 @@ class HighlighterApp(tk.Tk):
                 post("done", None)
                 return
 
+            # 4) Agregar + mandar linhas para UI
             processed = []
-            agg_code_file_pages = defaultdict(lambda: defaultdict(set))
+            agg_code_file_pages = defaultdict(lambda: defaultdict(set))  # cmp_key -> file -> set(pages)
 
             for res in results:
                 if "error" in res:
@@ -1411,6 +1464,7 @@ class HighlighterApp(tk.Tk):
         finally:
             post("done", None)
 
+    # ===== message pump (UI) =====
     def _poll_messages(self):
         try:
             while True:
@@ -1445,7 +1499,7 @@ class HighlighterApp(tk.Tk):
             pass
         self.after(80, self._poll_messages)
 
-    # ===== finalize: filtros, review, combine, CSVs =====
+    # ===== finalize: filtros, review (com filtro Summary/TOC), combine, CSVs =====
     def _finalize_and_save(self, bundle):
         processed = bundle["processed"]
         root_name = bundle["root_name"]
@@ -1472,6 +1526,7 @@ class HighlighterApp(tk.Tk):
 
         used_review = bool(self.review_pages_var.get())
         if used_review:
+            # --- filtra páginas Summary/TOC ANTES do Review ---
             def _is_summary_or_toc(pdf_path: str, page_idx: int) -> bool:
                 return is_summary_keyword_page(pdf_path, page_idx, first_pages_only=7)
             items = []
@@ -1479,7 +1534,7 @@ class HighlighterApp(tk.Tk):
                 pdf_path = p["pdf_path"]
                 filtered_hit_pages = [pg for pg in p["hit_pages"] if not _is_summary_or_toc(pdf_path, pg)]
                 if not filtered_hit_pages:
-                    continue
+                    continue  # sem páginas após filtro -> não entra no Review
                 items.append({
                     "display": p["display"],
                     "pdf_path": pdf_path,
@@ -1508,6 +1563,7 @@ class HighlighterApp(tk.Tk):
         audit_log = []
 
         def add_item_if_ok(pdf_path, pg, rects, pretty_codes_for_pg, is_survey: bool):
+            # 1) Summary/TOC: descarta
             if is_summary_keyword_page(pdf_path, pg, first_pages_only=7):
                 audit_log.append({
                     "reason": "summary_keyword",
@@ -1516,8 +1572,10 @@ class HighlighterApp(tk.Tk):
                     "codes_on_page": ", ".join(sorted(set(pretty_codes_for_pg))),
                 })
                 return
+            # 2) De-dup
             if dedupe_pages and (not is_survey or dedupe_surveys):
                 fp = page_fingerprint(pdf_path, pg)
+                # Opcional: incluir código no fingerprint de surveys (se dedupe_surveys marcado)
                 if is_survey and dedupe_surveys and pretty_codes_for_pg:
                     fp = fp + "::" + "\n".join(sorted(pretty_codes_for_pg))
                 if fp in seen_hashes:
@@ -1530,6 +1588,7 @@ class HighlighterApp(tk.Tk):
                     return
                 seen_hashes.add(fp)
 
+            # 3) Bucket por prédio
             bld = "UNKWN"
             if pretty_codes_for_pg:
                 inferred = [infer_building_from_code(c) for c in pretty_codes_for_pg]
@@ -1542,6 +1601,7 @@ class HighlighterApp(tk.Tk):
                 "rects": rects
             })
 
+        # Preenche buckets (respeita regra “survey duplica por código”)
         for p in processed:
             pdf_path = p["pdf_path"]
             rects_by_page = p["rects_by_page"]
@@ -1562,6 +1622,7 @@ class HighlighterApp(tk.Tk):
                     rects = rects_by_page.get(pg, [])
                     add_item_if_ok(pdf_path, pg, rects, pretty_codes, is_survey)
 
+        # Respeita ordem manual, se houver
         if ordered_kept:
             new_buckets = defaultdict(list)
             for (pdf_path, pg) in ordered_kept:
@@ -1575,9 +1636,19 @@ class HighlighterApp(tk.Tk):
                         new_buckets[bld].append(it)
             building_buckets = new_buckets
         else:
+            # Ordenação base previsível
             for bld, lst in building_buckets.items():
                 lst.sort(key=lambda it: (os.path.basename(it["pdf_path"]).lower(), it["page_idx"]))
 
+        # Alternância Survey-Drawing por bucket (se ativada)
+        if bool(self.alternate_sd_var.get()):
+            for bld, lst in list(building_buckets.items()):
+                building_buckets[bld] = _interleave_survey_drawing(
+                    lst,
+                    lambda p: is_survey_pdf(p, size_limit_bytes=survey_size_limit_bytes)
+                )
+
+        # Salvar PDFs por prédio/part (chunk DEPOIS da alternância)
         saved_files = []
         for bld, lst in sorted(building_buckets.items(), key=lambda kv: kv[0]):
             if not lst:
@@ -1603,6 +1674,7 @@ class HighlighterApp(tk.Tk):
         else:
             self.lbl_status.config(text="No output files saved.")
 
+        # Resumo por código
         primary_file_pages = defaultdict(lambda: defaultdict(set))
         for cmp_key, file_map in agg_code_file_pages.items():
             primary = nosep_to_primary.get(cmp_key, cmp_key)
@@ -1624,15 +1696,13 @@ class HighlighterApp(tk.Tk):
         self._write_not_surveyed_csv(out_dir, root_name, week_number,
                                      [original_map.get(p, p) for p in missing_primary])
 
+        # Cover Sheet (se DB externa carregada)
         try:
             if getattr(self, "external_db_df", None) is not None:
                 matched_pretty = [original_map.get(p, p) for p in sorted(found_primary)]
-                cover_path = self._generate_cover_sheet_pdf(
-                    out_dir, root_name, week_number,
-                    self.external_db_df,
-                    matched_pretty_codes=matched_pretty,
-                    scale_to_a3=scale_to_a3
-                )
+                cover_path = self._generate_cover_sheet_pdf(out_dir, root_name, week_number,
+                                                            self.external_db_df, matched_pretty_codes=matched_pretty,
+                                                            scale_to_a3=scale_to_a3)
                 if cover_path:
                     self.lbl_status.config(text=f"Cover Sheet saved: {os.path.basename(cover_path)}")
         except Exception as e:
@@ -1648,6 +1718,7 @@ class HighlighterApp(tk.Tk):
         try:
             base_df = pd.DataFrame(rows, columns=["code", "total_pages", "breakdown"])
             base_df.to_csv(csv_path, index=False)
+            # enriquecido
             if getattr(self, "external_db_map", None):
                 enriched = []
                 for r in rows:
@@ -1795,7 +1866,7 @@ class HighlighterApp(tk.Tk):
                     row_h=18,
                     header_fill=(0.92, 0.92, 0.92),
                     fontfile=calibri_ttf,  # será convertido em kwargs internamente
-                    fontsize=10,           # Calibri 10 (ou Helvetica fallback)
+                    fontsize=10,           # 10pt
                 )
                 if drawn <= 0:
                     break
@@ -1815,6 +1886,7 @@ def load_external_db_from_xlsx(xlsx_path):
     Retorna (df, map_normalizado_por_codigo).
     """
     df = pd.read_excel(xlsx_path, dtype=str, engine="openpyxl")
+    # índice por código normalizado
     cand_cols = [c for c in df.columns if str(c).strip().lower() in ("ecs code", "ecs codes")]
     idx = {}
     if cand_cols:
