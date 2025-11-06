@@ -1071,8 +1071,29 @@ class HighlighterApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ECS PDF Highlighter")
-        self.geometry("1140x1000")
+        self.geometry("1180x1040")
         self.minsize(1100, 960)
+
+        # ====== BARRA INFERIOR FIXA (criada primeiro) ======
+        self.bottom = ttk.Frame(self)
+        self.bottom.pack(side="bottom", fill="x")
+        fr_prog = ttk.Frame(self.bottom)
+        fr_prog.pack(side="left", fill="x", expand=True, padx=8, pady=6)
+        self.prog = ttk.Progressbar(fr_prog, orient="horizontal", mode="determinate", maximum=100)
+        self.prog.pack(side="left", expand=True, fill="x")
+        self.lbl_status = ttk.Label(fr_prog, text="Idle")
+        self.lbl_status.pack(side="left", padx=8)
+        fr_btns = ttk.Frame(self.bottom)
+        fr_btns.pack(side="right", padx=8, pady=6)
+        self.btn_start = ttk.Button(fr_btns, text="Start", command=self._start)
+        self.btn_start.pack(side="left")
+        self.btn_stop = ttk.Button(fr_btns, text="Stop", command=self._stop)
+        self.btn_stop.pack(side="left", padx=6)
+        self.btn_exit = ttk.Button(fr_btns, text="Exit", command=self._exit)
+        self.btn_exit.pack(side="left")
+
+        # ====== ÁREA ROLÁVEL ACIMA ======
+        self._make_scrollable_content()
 
         # Estado
         self.excel_paths = []
@@ -1088,7 +1109,6 @@ class HighlighterApp(tk.Tk):
         self.scale_to_a3_var = tk.BooleanVar(value=False)
         self.turbo_var = tk.BooleanVar(value=True)
         self.parallel_var = tk.BooleanVar(value=True)
-        self.alternate_sd_var = tk.BooleanVar(value=True)  # mantido, mas não usado com SDI por código
 
         # De-dup / survey / summary
         self.treat_survey_var = tk.BooleanVar(value=True)
@@ -1116,17 +1136,33 @@ class HighlighterApp(tk.Tk):
         self.nosep_to_primary = {}
         self.ecs_cmp_keys = set()
 
-        self.main_page_codes = defaultdict(set)
-        self.main_row_iid = {}
-
-        self._build_ui()
+        self._build_scrollable_ui(self.content)  # monta UI dentro da área rolável
         self._poll_messages()
 
-    def _build_ui(self):
+    def _make_scrollable_content(self):
+        """Cria canvas com frame rolável onde ficam os controles principais; a barra inferior fica fixa."""
+        self.canvas = tk.Canvas(self, highlightthickness=0)
+        self.canvas.pack(side="top", fill="both", expand=True)
+        self.vscroll = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.vscroll.pack(side="right", fill="y")
+        self.canvas.configure(yscrollcommand=self.vscroll.set)
+        self.content = ttk.Frame(self.canvas)
+        self.content_id = self.canvas.create_window(0, 0, anchor="nw", window=self.content)
+
+        def _on_configure(event):
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            # Ajusta largura do frame ao canvas
+            self.canvas.itemconfigure(self.content_id, width=self.canvas.winfo_width())
+
+        self.content.bind("<Configure>", _on_configure)
+        # Suporte a rolagem com roda do mouse
+        self.canvas.bind_all("<MouseWheel>", lambda e: self.canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+
+    def _build_scrollable_ui(self, root_frame: ttk.Frame):
         pad = {"padx": 8, "pady": 6}
 
         # Top
-        fr_top = ttk.Frame(self); fr_top.pack(fill="x", **pad)
+        fr_top = ttk.Frame(root_frame); fr_top.pack(fill="x", **pad)
         ttk.Label(fr_top, text="Week:").pack(side="left")
         ttk.Entry(fr_top, width=8, textvariable=self.week_number).pack(side="left", padx=8)
         ttk.Label(fr_top, text="Project/Root Name:").pack(side="left", padx=(16, 0))
@@ -1135,7 +1171,7 @@ class HighlighterApp(tk.Tk):
         tk.Spinbox(fr_top, from_=5, to=500, increment=1, width=6, textvariable=self.pages_per_file_var).pack(side="left", padx=6)
 
         # Options
-        fr_opts = ttk.Frame(self); fr_opts.pack(fill="x", **pad)
+        fr_opts = ttk.Frame(root_frame); fr_opts.pack(fill="x", **pad)
         ttk.Checkbutton(fr_opts, text="Only keep highlighted pages", variable=self.only_highlighted_var).pack(side="left")
         ttk.Checkbutton(fr_opts, text="Review pages before saving", variable=self.review_pages_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Ignore leading digit in PDF codes", variable=self.ignore_lead_digit_var).pack(side="left", padx=12)
@@ -1144,12 +1180,12 @@ class HighlighterApp(tk.Tk):
         ttk.Checkbutton(fr_opts, text="Scale output pages to A3", variable=self.scale_to_a3_var).pack(side="left", padx=12)
 
         # Performance
-        fr_perf = ttk.Frame(self); fr_perf.pack(fill="x", **pad)
+        fr_perf = ttk.Frame(root_frame); fr_perf.pack(fill="x", **pad)
         ttk.Checkbutton(fr_perf, text="Turbo (Aho–Corasick)", variable=self.turbo_var).pack(side="left")
         ttk.Checkbutton(fr_perf, text="Parallel PDFs", variable=self.parallel_var).pack(side="left", padx=12)
 
         # Rules
-        fr_rules = ttk.LabelFrame(self, text="De-dup & Survey Rules"); fr_rules.pack(fill="x", **pad)
+        fr_rules = ttk.LabelFrame(root_frame, text="De-dup & Survey Rules"); fr_rules.pack(fill="x", **pad)
         ttk.Checkbutton(fr_rules, text="Treat 'Cut Length Report' PDFs as survey tables", variable=self.treat_survey_var).grid(row=0, column=0, sticky="w", padx=6, pady=4)
         ttk.Label(fr_rules, text="Survey size ≤ KB:").grid(row=0, column=1, sticky="e")
         tk.Spinbox(fr_rules, from_=50, to=20000, increment=50, width=6, textvariable=self.survey_size_limit).grid(row=0, column=2, sticky="w", padx=6)
@@ -1157,7 +1193,7 @@ class HighlighterApp(tk.Tk):
         ttk.Checkbutton(fr_rules, text="Keep only latest Handbook/Drawings REV", variable=self.keep_latest_non_survey_rev_var).grid(row=3, column=1, columnspan=2, sticky="w", padx=6, pady=4)
 
         # External DB
-        fr_db = ttk.LabelFrame(self, text="External DB (optional, local .xlsx)"); fr_db.pack(fill="x", **pad)
+        fr_db = ttk.LabelFrame(root_frame, text="External DB (optional, local .xlsx)"); fr_db.pack(fill="x", **pad)
         ttk.Label(fr_db, text="DB Excel:").grid(row=0, column=0, sticky="e")
         ttk.Entry(fr_db, textvariable=self.external_db_path).grid(row=0, column=1, sticky="ew", padx=6)
         fr_db.columnconfigure(1, weight=1)
@@ -1166,7 +1202,7 @@ class HighlighterApp(tk.Tk):
         ttk.Button(fr_db, text="Clear", command=self._clear_external_db).grid(row=0, column=4, padx=6)
 
         # Excels
-        fr_excel = ttk.LabelFrame(self, text="Excel files (ECS Codes)"); fr_excel.pack(fill="x", **pad)
+        fr_excel = ttk.LabelFrame(root_frame, text="Excel files (ECS Codes)"); fr_excel.pack(fill="x", **pad)
         btns_ex = ttk.Frame(fr_excel); btns_ex.pack(fill="x", padx=6, pady=6)
         ttk.Button(btns_ex, text="Add Excel…", command=self._add_excels).pack(side="left")
         ttk.Button(btns_ex, text="Remove Selected", command=self._remove_selected_excels).pack(side="left", padx=6)
@@ -1175,7 +1211,7 @@ class HighlighterApp(tk.Tk):
         self.lst_excels.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
         # PDFs
-        fr_pdfs = ttk.LabelFrame(self, text="PDFs to Process"); fr_pdfs.pack(fill="both", expand=True, **pad)
+        fr_pdfs = ttk.LabelFrame(root_frame, text="PDFs to Process"); fr_pdfs.pack(fill="both", expand=True, **pad)
         btns = ttk.Frame(fr_pdfs); btns.pack(fill="x", padx=6, pady=6)
         ttk.Button(btns, text="Add PDFs…", command=self._add_pdfs).pack(side="left")
         ttk.Button(btns, text="Remove Selected", command=self._remove_selected_pdfs).pack(side="left", padx=6)
@@ -1184,7 +1220,7 @@ class HighlighterApp(tk.Tk):
         self.lst_pdfs.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
         # ITRs
-        fr_itr = ttk.LabelFrame(self, text="ITR files (DOCX or PDF, name must contain the ECS code)"); fr_itr.pack(fill="x", **pad)
+        fr_itr = ttk.LabelFrame(root_frame, text="ITR files (DOCX or PDF, name must contain the ECS code)"); fr_itr.pack(fill="x", **pad)
         btns_itr = ttk.Frame(fr_itr); btns_itr.pack(fill="x", padx=6, pady=6)
         ttk.Button(btns_itr, text="Add ITR…", command=self._add_itrs).pack(side="left")
         ttk.Button(btns_itr, text="Remove Selected", command=self._remove_selected_itrs).pack(side="left", padx=6)
@@ -1193,42 +1229,12 @@ class HighlighterApp(tk.Tk):
         self.lst_itrs.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
         # Output
-        fr_out = ttk.Frame(self); fr_out.pack(fill="x", **pad)
+        fr_out = ttk.Frame(root_frame); fr_out.pack(fill="x", **pad)
         ttk.Label(fr_out, text="Output Folder:").pack(side="left")
         ttk.Entry(fr_out, textvariable=self.output_dir).pack(side="left", expand=True, fill="x", padx=8)
         ttk.Button(fr_out, text="Select…", command=self._pick_output_dir).pack(side="left")
 
-        # Log
-        fr_log = ttk.LabelFrame(self, text="Matches (ECS Code | File | Page | Codes on Page)"); fr_log.pack(fill="both", expand=True, **pad)
-        cols = ("code", "file", "page", "codes_on_page")
-        self.tree = ttk.Treeview(fr_log, columns=cols, show="headings", height=12)
-        self.tree.heading("code", text="Code")
-        self.tree.heading("file", text="File")
-        self.tree.heading("page", text="Page")
-        self.tree.heading("codes_on_page", text="Codes (on page)")
-        self.tree.column("code", width=180, anchor="w")
-        self.tree.column("file", width=560, anchor="w")
-        self.tree.column("page", width=60, anchor="center")
-        self.tree.column("codes_on_page", width=220, anchor="w")
-        self.tree.pack(fill="both", expand=True, padx=6, pady=6)
-
-        # Bottom
-        self.bottom = ttk.Frame(self)
-        self.bottom.pack(side="bottom", fill="x", **pad)
-        fr_prog = ttk.Frame(self.bottom)
-        fr_prog.pack(side="left", fill="x", expand=True)
-        self.prog = ttk.Progressbar(fr_prog, orient="horizontal", mode="determinate", maximum=100)
-        self.prog.pack(side="left", expand=True, fill="x")
-        self.lbl_status = ttk.Label(fr_prog, text="Idle")
-        self.lbl_status.pack(side="left", padx=8)
-        fr_btns = ttk.Frame(self.bottom)
-        fr_btns.pack(side="right")
-        self.btn_start = ttk.Button(fr_btns, text="Start", command=self._start)
-        self.btn_start.pack(side="left")
-        self.btn_stop = ttk.Button(fr_btns, text="Stop", command=self._stop)
-        self.btn_stop.pack(side="left", padx=6)
-        self.btn_exit = ttk.Button(fr_btns, text="Exit", command=self._exit)
-        self.btn_exit.pack(side="left")
+        # (REMOVIDO) Painel Matches — não existe mais
 
     # ===== Handlers DB externa =====
     def _browse_external_db(self):
@@ -1242,10 +1248,22 @@ class HighlighterApp(tk.Tk):
             messagebox.showwarning("External DB", "Please select a local Excel file first.")
             return
         try:
-            df, db_map = load_external_db_from_xlsx(p)
+            df = pd.read_excel(p, dtype=str, engine="openpyxl")
+            # índice por código normalizado
+            cand_cols = [c for c in df.columns if str(c).strip().lower() in ("ecs code", "ecs codes")]
+            idx = {}
+            if cand_cols:
+                c = cand_cols[0]
+                for _, row in df.iterrows():
+                    raw = "" if pd.isna(row[c]) else str(row[c])
+                    tokens = [t.strip() for t in re.split(r"[,;\n/\t ]+", raw) if t.strip()]
+                    for t in tokens:
+                        nb = normalize_base(t)
+                        if nb:
+                            idx[nb] = dict(row)
             self.external_db_df = df
-            self.external_db_map = db_map
-            messagebox.showinfo("External DB", f"Loaded {len(db_map)} codes from:\n{os.path.basename(p)}")
+            self.external_db_map = idx
+            messagebox.showinfo("External DB", f"Loaded {len(idx)} codes from:\n{os.path.basename(p)}")
         except Exception as e:
             messagebox.showerror("External DB", f"Could not load DB:\n{e}")
 
@@ -1342,11 +1360,6 @@ class HighlighterApp(tk.Tk):
         self.output_dir.set(out_dir)
         os.makedirs(out_dir, exist_ok=True)
 
-        # reset UI aggregation
-        self.main_page_codes.clear()
-        self.main_row_iid.clear()
-        for iid in self.tree.get_children():
-            self.tree.delete(iid)
         self.cancel_flag.clear()
         self.prog["value"] = 0
         self.lbl_status.config(text="Starting…")
@@ -1471,7 +1484,7 @@ class HighlighterApp(tk.Tk):
                 post("done", None)
                 return
 
-            # 5) Agregar + mandar linhas para UI
+            # 5) Agregar dados
             processed = []
             agg_code_file_pages = defaultdict(lambda: defaultdict(set))  # cmp_key -> file -> set(pages)
 
@@ -1486,12 +1499,6 @@ class HighlighterApp(tk.Tk):
                 hit_pages = res["hit_pages"]
                 total_pages = res["total_pages"]
                 code_pages = res["code_pages"]
-                match_pairs = res["match_pairs"]
-
-                for cmp_key, page_1b in match_pairs:
-                    primary = self.nosep_to_primary.get(cmp_key, cmp_key)
-                    pretty = self.ecs_original_map.get(primary, primary)
-                    self.msg_queue.put(("match", (pretty, display, page_1b)))
 
                 for cmp_key, pages in code_pages.items():
                     agg_code_file_pages[cmp_key][display] = set(pages)
@@ -1551,18 +1558,6 @@ class HighlighterApp(tk.Tk):
                         self.prog["value"] = int(payload)
                     except Exception:
                         pass
-                elif msg_type == "match":
-                    pretty_code, file_name, page_num = payload
-                    key = (file_name, page_num)
-                    self.main_page_codes[key].add(pretty_code)
-                    codes_str = ", ".join(sorted(self.main_page_codes[key]))
-                    if key in self.main_row_iid:
-                        iid = self.main_row_iid[key]
-                        self.tree.set(iid, "codes_on_page", codes_str)
-                    else:
-                        iid = self.main_row_iid[key] = self.tree.insert(
-                            "", "end", values=(pretty_code, file_name, page_num, codes_str)
-                        )
                 elif msg_type == "error":
                     self.lbl_status.config(text="Error")
                     messagebox.showerror("Error", str(payload))
@@ -1645,12 +1640,10 @@ class HighlighterApp(tk.Tk):
                     rects = rects_by_page.get(pg, [])
                     _push_unit(pdf_path, display, pg, unit_type, "", rects)
 
-        # 2) Acrescentar ITRs por código (como catálogo; inseriremos na interlevação por código)
-        #    Vamos construir uma estrutura por prédio => por código => filas S e D, e bloco ITR único (todas as páginas).
+        # 2) Acrescentar ITRs por código
         per_building_per_code = defaultdict(lambda: defaultdict(lambda: {"S": deque(), "D": deque(), "ITR": []}))
 
         for bld, lst in units_by_building.items():
-            # ordem base previsível (arquivo+página+código)
             lst.sort(key=lambda it: (os.path.basename(it["pdf_path"]).lower(), it["page_idx"], it.get("code_pretty", "").lower()))
             for it in lst:
                 code = it.get("code_pretty") or ""
@@ -1664,15 +1657,12 @@ class HighlighterApp(tk.Tk):
         for bld, codemap in per_building_per_code.items():
             for code in list(codemap.keys()):
                 code_norm = normalize_base(code)
-                # recuperar primary a partir do code "pretty" normalizado
                 primary_guess = None
-                # tentar mapear via tabela original_map (chaves são normalized-base de primary)
                 for primary, pretty in self.ecs_original_map.items():
                     if normalize_base(pretty) == code_norm:
                         primary_guess = primary
                         break
                 if not primary_guess:
-                    # pode ser que code já seja primary
                     primary_guess = code_norm
                 itr_info = self.itr_map.get(primary_guess)
                 if itr_info and itr_info.get("pages", 0) > 0:
@@ -1687,11 +1677,10 @@ class HighlighterApp(tk.Tk):
                         "rects": []
                     } for i in range(pages)]
 
-        # 3) Interlevar por código em tríades S–D–ITR (ITR apenas uma vez por código, na primeira ocorrência)
+        # 3) Interlevar por código em tríades S–D–ITR
         review_units = []
         for bld, codemap in sorted(per_building_per_code.items(), key=lambda kv: kv[0]):
             codes_order = sorted(codemap.keys(), key=lambda c: (c.lower()))
-            # Enquanto houver qualquer S ou D restante
             has_remaining = True
             used_itr_for_code = {c: False for c in codes_order}
             while has_remaining:
@@ -1705,13 +1694,11 @@ class HighlighterApp(tk.Tk):
                     if buckets["D"]:
                         review_units.append(buckets["D"].popleft())
                         emitted = True
-                    # ITR (apenas uma vez por código, se existir)
                     if not used_itr_for_code[c] and buckets["ITR"]:
                         review_units.extend(buckets["ITR"])
                         used_itr_for_code[c] = True
                         emitted = True
                     has_remaining = has_remaining or bool(buckets["S"] or buckets["D"] or (not used_itr_for_code[c] and buckets["ITR"]))
-                # fim do round robin por códigos
 
         used_review = bool(self.review_pages_var.get())
         if used_review:
@@ -1725,26 +1712,19 @@ class HighlighterApp(tk.Tk):
             ordered_kept = [(it["pdf_path"], it["page_idx"], it.get("code_pretty"), it.get("rects", []), it.get("type", "Drawing"))
                             for it in review_units]
 
-        # 4) Aplicar dedupe (com fingerprint por code quando houver), preencher buckets FINAIS em ordem do usuário
+        # 4) Aplicar dedupe e salvar
         building_buckets = defaultdict(list)
         seen_hashes = set()
         audit_log = []
 
         def add_unit_if_ok(pdf_path, pg, rects, code_pretty, unit_type):
-            # de-dup: inclui code e type no fingerprint para permitir repetições legítimas
             fp = page_fingerprint(pdf_path, pg)
-            if fp is None:
-                fpsum = f"X:{os.path.basename(pdf_path)}:{pg}"
-            else:
-                fumsum = fp  # typo guard (won't be used)
-                fpsum = fp
+            fpsum = fp or f"X:{os.path.basename(pdf_path)}:{pg}"
             if code_pretty:
                 fpsum = f"{fpsum}::CODE::{code_pretty}"
             fpsum = f"{fpsum}::TYPE::{unit_type}"
 
-            # regra dedupe
             if bool(self.dedupe_var.get()):
-                # para surveys: respeita chave dedupe_surveys
                 if unit_type == "Survey" and not bool(self.dedupe_surveys_var.get()):
                     pass
                 else:
@@ -1758,7 +1738,6 @@ class HighlighterApp(tk.Tk):
                         return
                     seen_hashes.add(fpsum)
 
-            # bucket por prédio
             if code_pretty:
                 bld = infer_building_from_code(code_pretty)
             else:
@@ -1772,7 +1751,7 @@ class HighlighterApp(tk.Tk):
         for (pdf_path, pg, code_pretty, rects, unit_type) in ordered_kept:
             add_unit_if_ok(pdf_path, pg, rects, code_pretty or "", unit_type or "Drawing")
 
-        # 5) Salvar PDFs por prédio/part preservando ORDEM
+        # Salvar por prédio em partes
         saved_files = []
         for bld, lst in sorted(building_buckets.items(), key=lambda kv: kv[0]):
             if not lst:
@@ -1948,6 +1927,7 @@ class HighlighterApp(tk.Tk):
             return None
         df_full = pd.DataFrame(filt_rows)
 
+        # Seleção de colunas por letras
         wanted_letters = ["B", "G", "H", "I", "J", "K", "L", "N", "O", "P", "Q", "S", "T", "U"]
         idxs = _excel_letters_to_indices(wanted_letters, df_full)
         if not idxs:
