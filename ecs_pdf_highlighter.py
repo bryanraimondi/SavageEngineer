@@ -16,7 +16,7 @@ from collections import defaultdict, Counter, deque
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import bisect
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 
 # ======================= Normalização & utilitários =======================
 DASH_CHARS = "-\u2010\u2011\u2012\u2013\u2014\u2212"  # -, ‐, -, ‒, –, —, −
@@ -1094,16 +1094,16 @@ class HighlighterApp(tk.Tk):
         self.btn_start.pack(side="left")
         self.btn_stop = ttk.Button(fr_btns, text="Stop", command=self._stop)
         self.btn_stop.pack(side="left", padx=6)
-        self.btn_exit = ttk.Button(fr_btns, text="Exit", command=self._exit)
+        self.btn_exit = ttk.Button(fr_btns, text="Exit")
+        self.btn_exit.config(command=self._exit)
         self.btn_exit.pack(side="left")
 
-        # ====== ÁREA ROLÁVEL ACIMA ======
+        # ====== ÁREA COM ROLAGEM AUTOMÁTICA ======
         self._make_scrollable_content()
 
         # ====== Estilo discreto "Author" no topo ======
         style = ttk.Style()
         style.configure("Author.TLabel", foreground="#7a7a7a")  # cinza discreto
-        # Colocaremos o autor no canto direito do primeiro bloco (fr_top), ver _build_scrollable_ui
 
         # Estado
         self.excel_paths = []
@@ -1146,27 +1146,73 @@ class HighlighterApp(tk.Tk):
         self.nosep_to_primary = {}
         self.ecs_cmp_keys = set()
 
-        self._build_scrollable_ui(self.content, style)  # monta UI dentro da área rolável
+        self._build_scrollable_ui(self.content, style)
         self._poll_messages()
 
     def _make_scrollable_content(self):
-        """Cria canvas com frame rolável onde ficam os controles principais; a barra inferior fica fixa."""
+        """
+        Opção 2: Rolagem **apenas quando necessário**.
+        - A scrollbar NÃO fica visível por padrão.
+        - Aparece automaticamente quando o conteúdo ultrapassar a altura do canvas.
+        """
         self.canvas = tk.Canvas(self, highlightthickness=0)
         self.canvas.pack(side="top", fill="both", expand=True)
+
+        # Scrollbar criada mas **não exibida** inicialmente
         self.vscroll = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.vscroll.pack(side="right", fill="y")
-        self.canvas.configure(yscrollcommand=self.vscroll.set)
+        self.canvas.configure(yscrollcommand=self._on_canvas_scroll)
+
+        # Conteúdo real dentro do canvas
         self.content = ttk.Frame(self.canvas)
         self.content_id = self.canvas.create_window(0, 0, anchor="nw", window=self.content)
 
-        def _on_configure(event):
+        # Atualiza a região rolável e mostra/oculta a barra conforme necessário
+        def _update_layout(event=None):
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-            # Ajusta largura do frame ao canvas
+            # Ajusta a largura do frame ao canvas
             self.canvas.itemconfigure(self.content_id, width=self.canvas.winfo_width())
+            self._toggle_scrollbar_visibility()
 
-        self.content.bind("<Configure>", _on_configure)
-        # Suporte a rolagem com roda do mouse
-        self.canvas.bind_all("<MouseWheel>", lambda e: self.canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+        # Bind: mudanças no conteúdo e no canvas
+        self.content.bind("<Configure>", _update_layout)
+        self.canvas.bind("<Configure>", _update_layout)
+
+        # Roda do mouse: permite rolar mesmo quando a barra estiver oculta (se houver overflow)
+        def _on_mousewheel(e):
+            # Windows: e.delta múltiplos de 120
+            self.canvas.yview_scroll(-1 * (e.delta // 120), "units")
+
+        self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+    def _on_canvas_scroll(self, *args):
+        """Callback do yscrollcommand — atualiza o scroller quando necessário."""
+        # Atualiza a posição da barra se ela estiver visível
+        if getattr(self, "_scrollbar_visible", False):
+            self.vscroll.set(*args)
+
+    def _toggle_scrollbar_visibility(self):
+        """Mostra a scrollbar apenas se o conteúdo for maior que a viewport."""
+        bbox = self.canvas.bbox("all")
+        if not bbox:
+            # Sem conteúdo ainda
+            if getattr(self, "_scrollbar_visible", False):
+                self.vscroll.pack_forget()
+                self._scrollbar_visible = False
+            return
+        content_height = bbox[3] - bbox[1]
+        viewport_height = self.canvas.winfo_height()
+        need_scroll = content_height > max(1, viewport_height)
+
+        if need_scroll and not getattr(self, "_scrollbar_visible", False):
+            self.vscroll.pack(side="right", fill="y")
+            self._scrollbar_visible = True
+            # Precisamos conectar o yview apenas quando visível
+            self.canvas.configure(yscrollcommand=self.vscroll.set)
+        elif not need_scroll and getattr(self, "_scrollbar_visible", False):
+            self.vscroll.pack_forget()
+            self._scrollbar_visible = False
+            # Mantém o yscrollcommand apontando para callback para detectar futuro overflow
+            self.canvas.configure(yscrollcommand=self._on_canvas_scroll)
 
     def _build_scrollable_ui(self, root_frame: ttk.Frame, style: ttk.Style):
         pad = {"padx": 8, "pady": 6}
