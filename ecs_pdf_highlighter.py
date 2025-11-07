@@ -388,6 +388,8 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_
     """
     Insere as páginas EXATAMENTE na ordem dada por page_units (sem agrupar por PDF).
     Cada unit: { 'pdf_path', 'page_idx', 'rects' }
+    Corrigido: evita rotação inesperada usando insert_pdf no modo "tamanho original" e
+    usa bound() para decidir orientação quando escala para A3.
     """
     out = fitz.open()
     src_cache = {}
@@ -401,21 +403,23 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_
                 src_cache[pdf_path] = fitz.open(pdf_path)
             src = src_cache[pdf_path]
             src_pg = src.load_page(pg_idx)
-            sw, sh = float(src_pg.rect.width), float(src_pg.rect.height)
 
             if not scale_to_a3:
-                # Nova página com tamanho do original; desenha o conteúdo
-                out_pg = out.new_page(width=sw, height=sh)
-                out_pg.show_pdf_page(out_pg.rect, src, pg_idx)
+                # Copia a página exatamente como está (mantém rotação/crop/coords)
+                out.insert_pdf(src, from_page=pg_idx, to_page=pg_idx)
+                out_pg = out.load_page(out.page_count - 1)
                 if use_text_annotations and rects:
                     add_text_highlights(out_pg, rects, color=(1, 1, 0), opacity=0.35)
             else:
-                # A3 com preservação de aspecto
+                # Para A3, usar dimensões VISUAIS (respeita rotação/crop)
+                b = src_pg.bound()
+                sw, sh = float(b.width), float(b.height)
                 src_landscape = sw >= sh
                 tw, th = (A3_LANDSCAPE if src_landscape else A3_PORTRAIT)
                 out_pg = out.new_page(width=tw, height=th)
                 dst_rect = fitz.Rect(0, 0, tw, th)
                 out_pg.show_pdf_page(dst_rect, src, pg_idx)
+                # Ajustar rects para o novo tamanho
                 s, dx, dy = _fit_scale_and_offset(sw, sh, tw, th)
                 if use_text_annotations and rects:
                     xfm_rects = []
@@ -737,7 +741,7 @@ def build_itr_map(itr_paths: List[str], cmp_keys: set, nosep_to_primary: Dict[st
             pdfp = try_convert_docx_to_pdf(p)
             if not pdfp:
                 messagebox.showwarning("ITR DOCX", f"Não foi possível converter ITR: {os.path.basename(p)}. "
-                                                   f"Instale 'docx2pdf' e tenha o Microsoft Word no Windows.")
+                                                   f"Instale 'docx2pdf' (requer Microsoft Word).")
                 continue
             mapped_pdf = pdfp
         elif ext == ".pdf":
@@ -1070,7 +1074,8 @@ def _text_font_kwargs(fontfile_path):
 class HighlighterApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("ECS PDF Highlighter")
+        # ===== Nome da aplicação =====
+        self.title("WorkPack Creator")
         self.geometry("1180x1040")
         self.minsize(1100, 960)
 
@@ -1094,6 +1099,11 @@ class HighlighterApp(tk.Tk):
 
         # ====== ÁREA ROLÁVEL ACIMA ======
         self._make_scrollable_content()
+
+        # ====== Estilo discreto "Author" no topo ======
+        style = ttk.Style()
+        style.configure("Author.TLabel", foreground="#7a7a7a")  # cinza discreto
+        # Colocaremos o autor no canto direito do primeiro bloco (fr_top), ver _build_scrollable_ui
 
         # Estado
         self.excel_paths = []
@@ -1136,7 +1146,7 @@ class HighlighterApp(tk.Tk):
         self.nosep_to_primary = {}
         self.ecs_cmp_keys = set()
 
-        self._build_scrollable_ui(self.content)  # monta UI dentro da área rolável
+        self._build_scrollable_ui(self.content, style)  # monta UI dentro da área rolável
         self._poll_messages()
 
     def _make_scrollable_content(self):
@@ -1158,7 +1168,7 @@ class HighlighterApp(tk.Tk):
         # Suporte a rolagem com roda do mouse
         self.canvas.bind_all("<MouseWheel>", lambda e: self.canvas.yview_scroll(-1 * (e.delta // 120), "units"))
 
-    def _build_scrollable_ui(self, root_frame: ttk.Frame):
+    def _build_scrollable_ui(self, root_frame: ttk.Frame, style: ttk.Style):
         pad = {"padx": 8, "pady": 6}
 
         # Top
@@ -1169,6 +1179,8 @@ class HighlighterApp(tk.Tk):
         ttk.Entry(fr_top, width=30, textvariable=self.building_name).pack(side="left", padx=8, fill="x", expand=True)
         ttk.Label(fr_top, text="Max pages per output:").pack(side="left", padx=(16, 0))
         tk.Spinbox(fr_top, from_=5, to=500, increment=1, width=6, textvariable=self.pages_per_file_var).pack(side="left", padx=6)
+        # Author discreto no topo direito
+        ttk.Label(fr_top, text="Author: Bryan Raimondi", style="Author.TLabel").pack(side="right")
 
         # Options
         fr_opts = ttk.Frame(root_frame); fr_opts.pack(fill="x", **pad)
@@ -1804,7 +1816,7 @@ class HighlighterApp(tk.Tk):
             if getattr(self, "external_db_df", None) is not None:
                 matched_pretty = [original_map.get(p, p) for p in sorted(found_primary)]
                 cover_path = self._generate_cover_sheet_pdf(out_dir, root_name, week_number,
-                                                            self.external_db_df, matched_pretty_codes=matched_pretty,
+                                                            self.external_db_df, matched_prety_codes=matched_pretty,
                                                             scale_to_a3=scale_to_a3)
                 if cover_path:
                     self.lbl_status.config(text=f"Cover Sheet saved: {os.path.basename(cover_path)}")
