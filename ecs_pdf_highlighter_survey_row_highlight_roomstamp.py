@@ -1,0 +1,1979 @@
+import os
+import re
+import sys
+import base64
+import hashlib
+import threading
+import queue
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+import fitz  # PyMuPDF
+import pandas as pd
+
+from collections import defaultdict, Counter
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import bisect
+
+# ======================= Normalização & utilitários =======================
+DASH_CHARS = "-\u2010\u2011\u2012\u2013\u2014\u2212"  # -, ‐, -, ‒, –, —, −
+_STRIP_EDGE_PUNCT = re.compile(r'^[\s"\'\(\)\[\]\{\}:;,.–—\-]+|[\s"\'\(\)\[\]\{\}:;,.–—\-]+$')
+
+# A3 (72 pt/in)
+A3_PORTRAIT = (842.0, 1191.0)
+A3_LANDSCAPE = (1191.0, 842.0)
+
+# “Summary-like”
+SUMMARY_KEYWORDS = [
+    "summary", "contents", "index", "bill of materials", "bom",
+    "schedule", "table of contents", "support schedule", "legend"
+]
+SUMMARY_KEYWORDS_RE = [re.compile(rf"\b{re.escape(k)}\b", re.IGNORECASE) for k in SUMMARY_KEYWORDS]
+
+EMIT_DIAGNOSTICS = False  # opcional: CSV extra de diagnóstico
+
+# === New summary rule (only for PDFs > 1 MB): discard pages containing these keywords ===
+SUMMARY_BIGPDF_RE = [re.compile(r"\bsummary\b", re.IGNORECASE),
+                     re.compile(r"\btable of contents\b", re.IGNORECASE)]
+
+def is_summary_keyword_page_bigpdf(pdf_path, page_idx, min_size_bytes=1_000_000):
+    try:
+        # Only check the first 7 pages (0..6)
+        if page_idx >= 7:
+            return False
+        if os.path.getsize(pdf_path) <= min_size_bytes:
+            return False
+    except Exception:
+        return False
+    try:
+        with fitz.open(pdf_path) as doc:
+            pg = doc.load_page(page_idx)
+            txt = (pg.get_text("text") or "")
+            for rx in SUMMARY_BIGPDF_RE:
+                if rx.search(txt):
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+
+# ====================== Unit-aware matching (hybrid) ======================
+# Prefixes that REQUIRE unit-specific matching for DRAWINGS.
+UNIT_REQUIRED_DRAWING_PREFIXES = {"HG"}
+
+_UNIT_DIGITS = set("0129")
+
+def split_unit_and_base_from_nosep(nosep_code: str):
+    """Return (unit, base_nosep, prefix_letters).
+    unit: '0','1','2','9' if present; None if missing; '-' if unknown placeholder.
+    base_nosep: code without leading unit digit or leading '-' placeholder.
+    prefix_letters: first 2-3 letters of base (upper) if available.
+    """
+    s = (nosep_code or "").lower()
+    if not s:
+        return None, "", ""
+    unit = None
+    rest = s
+    if s[0] in _UNIT_DIGITS:
+        unit = s[0]
+        rest = s[1:]
+    elif s[0] == "-":
+        unit = "-"
+        rest = s[1:]
+    rest = rest.lstrip("-")
+    m = re.match(r"([a-z]{2,3})", rest)
+    prefix = (m.group(1).upper() if m else "")
+    return unit, rest, prefix
+
+def pretty_base_from_pretty(pretty_code: str) -> str:
+    """Remove a leading unit digit from a pretty code if present."""
+    if not pretty_code:
+        return ""
+    s = str(pretty_code).strip()
+    if s and s[0] in _UNIT_DIGITS:
+        return s[1:]
+    return s[1:]
+    return s
+def unify_dashes(s: str) -> str:
+    if not s:
+        return s
+    for ch in DASH_CHARS[1:]:
+        s = s.replace(ch, "-")
+    return s.replace("\u00AD", "")  # soft hyphen
+
+
+def normalize_base(token: str) -> str:
+    if not token:
+        return ""
+    cleaned = _STRIP_EDGE_PUNCT.sub("", token)
+    if not cleaned:
+        return ""
+    cleaned = unify_dashes(cleaned)
+    return cleaned.strip().lower()
+
+
+def normalize_nosep(token: str) -> str:
+    if not token:
+        return ""
+    token = unify_dashes(token).lower()
+    # Mantém apenas [0-9a-z-]
+    return re.sub(r'[^0-9a-z\-]', '', token)
+
+
+def sanitize_filename(name: str) -> str:
+    return re.sub(r'[\\/:*?"<>|]+', "_", name).strip()
+
+
+def uniquify_path(path: str) -> str:
+    base, ext = os.path.splitext(path)
+    out = path
+    i = 1
+    while os.path.exists(out):
+        out = f"{base} ({i}){ext}"
+        i += 1
+    return out
+
+
+# ========================== Excel & lista de ECS ==========================
+def load_table_with_dynamic_header(xlsx_path, sheet_name=None):
+    df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None, dtype=str, engine="openpyxl")
+    target_labels = {"ecs codes", "ecs code"}
+    header_row_idx = None
+    for i in range(len(df)):
+        row = df.iloc[i].astype(str)
+        if any(str(cell).strip().lower() in target_labels for cell in row):
+            header_row_idx = i
+            break
+    if header_row_idx is None:
+        return None
+    header = df.iloc[header_row_idx].tolist()
+    data = df.iloc[header_row_idx + 1:].reset_index(drop=True)
+    data.columns = header
+    data = data.dropna(axis=1, how='all')
+    return data
+
+
+def extract_ecs_codes_from_df(df):
+    if df is None or df.empty:
+        return set(), {}
+    cols = [c for c in df.columns if str(c).strip().lower() in ("ecs codes", "ecs code")]
+    if not cols:
+        return set(), {}
+    raw = []
+    for c in cols:
+        raw += df[c].dropna().astype(str).tolist()
+
+    # Split robusto
+    tokens = []
+    for v in raw:
+        parts = re.split(r"[,;\n/\t ]+", v)
+        for p in parts:
+            t = p.strip().strip('"\'')
+            if t and re.search(r"[A-Za-z]", t) and re.search(r"\d", t) and " " not in t:
+                tokens.append(t)
+
+    ecs_set = set()
+    original_map = {}
+    for t in tokens:
+        low = normalize_base(t)
+        if low and (low not in ecs_set):
+            ecs_set.add(low)
+            original_map[low] = t
+    return ecs_set, original_map
+
+
+def build_compare_index(ecs_primary, ignore_leading_digit):
+    """
+    Build comparison keys for matching in PDFs.
+    - Always includes FULL keys (unit-specific if present in Excel).
+    - Also includes BASE keys (without leading unit digit) to match drawings that show '-' or omit unit.
+    Returns:
+      cmp_keys: set of keys to search (nosep)
+      nosep_to_primary: mapping for FULL (and legacy ignore_leading_digit if enabled)
+      base_to_primaries: mapping base_key -> list of Excel primaries that share this base
+      max_code_len: max length among cmp_keys
+    """
+    cmp_keys = set()
+    nosep_to_primary = {}
+    base_to_primaries = {}
+    for primary in ecs_primary:
+        k_full = normalize_nosep(primary)
+        if k_full:
+            cmp_keys.add(k_full)
+            nosep_to_primary[k_full] = primary
+
+        _unit, base_key, _pref = split_unit_and_base_from_nosep(k_full)
+        if base_key:
+            cmp_keys.add(base_key)
+            base_to_primaries.setdefault(base_key, []).append(primary)
+
+        if ignore_leading_digit and primary and primary[0].isdigit():
+            k2 = normalize_nosep(primary[1:])
+            if k2:
+                cmp_keys.add(k2)
+                nosep_to_primary[k2] = primary
+
+    max_code_len = max((len(k) for k in cmp_keys), default=0)
+    return cmp_keys, nosep_to_primary, base_to_primaries, max_code_len
+
+
+
+def build_prefixes_and_firstchars(cmp_keys_nosep):
+    prefixes = set()
+    first_chars = set()
+    for key in cmp_keys_nosep:
+        if not key:
+            continue
+        first_chars.add(key[0])
+        for i in range(1, len(key) + 1):
+            prefixes.add(key[:i])
+    return prefixes, first_chars
+
+
+# ========================= Turbo (Aho–Corasick) =========================
+try:
+    import ahocorasick  # pyahocorasick
+    _HAS_AC = True
+except Exception:
+    _HAS_AC = False
+
+
+def build_aho_automaton(cmp_keys_nosep):
+    A = ahocorasick.Automaton()
+    for k in cmp_keys_nosep:
+        if k:
+            A.add_word(k, k)
+    A.make_automaton()
+    return A
+
+
+# ============================ Scanners de PDF ===========================
+def scan_pdf_for_rects_fallback(pdf_path,
+                                cmp_keys_nosep,
+                                max_code_len,
+                                cancel_flag,
+                                highlight_all_occurrences=False,
+                                prefixes=None,
+                                first_chars=None):
+    """
+    Fallback (por palavras + janela multi-palavra + fallback por texto corrido)
+    """
+    if prefixes is None:
+        prefixes, first_chars = build_prefixes_and_firstchars(cmp_keys_nosep)
+    if first_chars is None:
+        first_chars = {k[0] for k in cmp_keys_nosep if k}
+
+    idx_by_first = {}
+    for k in cmp_keys_nosep:
+        if k:
+            idx_by_first.setdefault(k[0], []).append(k)
+
+    doc = fitz.open(pdf_path)
+    hits = 0
+    matched = set()
+    rects_by_page = {}
+    code_pages = defaultdict(set)
+    code_rects_by_page = defaultdict(lambda: defaultdict(list))
+    try:
+        for page in doc:
+            if cancel_flag.is_set():
+                break
+            words = page.get_text("words", sort=True)
+            W = []
+            for w in words:
+                x0, y0, x1, y1, t = float(w[0]), float(w[1]), float(w[2]), float(w[3]), (w[4] or "")
+                norm = normalize_nosep(t)
+                if not norm:
+                    continue
+                W.append(((x0, y0, x1, y1), norm, t))
+
+            page_rects = []
+            rect_key_set = set()
+
+            if W:
+                # 1) match por palavra (substring)
+                for (x0, y0, x1, y1), norm, raw in W:
+                    cands = idx_by_first.get(norm[0], [])
+                    for k in cands:
+                        if len(k) > len(norm):
+                            continue
+                        if k in norm:
+                            code_pages[k].add(page.number)
+                            matched.add(k)
+                            rkey = (round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2))
+                            if rkey not in rect_key_set:
+                                rect_key_set.add(rkey)
+                                page_rects.append((x0, y0, x1, y1))
+                                code_rects_by_page[page.number][k].append((x0, y0, x1, y1))
+                                hits += 1
+
+                # 2) janela multi-palavra (até 20)
+                N = len(W)
+                for i in range(N):
+                    if cancel_flag.is_set():
+                        break
+                    if not W[i][1] or W[i][1][0] not in first_chars:
+                        continue
+                    parts = []
+                    rects_run = []
+                    for j in range(i, min(i + 20, N)):
+                        rect, norm, raw = W[j]
+                        parts.append(norm)
+                        rects_run.append(rect)
+                        s = "".join(parts)
+                        if len(s) > max_code_len + 6:
+                            break
+                        if s not in prefixes:
+                            break
+                        if s in cmp_keys_nosep:
+                            code_pages[s].add(page.number)
+                            matched.add(s)
+                            for (rx0, ry0, rx1, ry1) in rects_run:
+                                rkey = (round(rx0, 2), round(ry0, 2), round(rx1, 2), round(ry1, 2))
+                                if rkey not in rect_key_set:
+                                    rect_key_set.add(rkey)
+                                    page_rects.append((rx0, ry0, rx1, ry1))
+                                    code_rects_by_page[page.number][s].append((rx0, ry0, rx1, ry1))
+                                    hits += 1
+
+            # 3) fallback texto corrido (marca página mesmo sem rects)
+            if not page_rects:
+                txt = (page.get_text("text") or "")
+                S_flat = normalize_nosep(txt)
+                for k in cmp_keys_nosep:
+                    if k and (k in S_flat):
+                        code_pages[k].add(page.number)
+                        matched.add(k)
+                        hits += 1
+            else:
+                rects_by_page[page.number] = page_rects
+
+        return hits, matched, rects_by_page, code_pages, code_rects_by_page, doc.page_count
+    finally:
+        doc.close()
+
+
+def scan_pdf_for_rects_ac(pdf_path,
+                          automaton,
+                          cancel_flag,
+                          highlight_all_occurrences=False):
+    """
+    Scanner Aho–Corasick (por palavras).
+    """
+    doc = fitz.open(pdf_path)
+    hits = 0
+    matched = set()
+    rects_by_page = {}
+    code_pages = defaultdict(set)
+    code_rects_by_page = defaultdict(lambda: defaultdict(list))
+    try:
+        for page in doc:
+            if cancel_flag.is_set():
+                break
+            words = page.get_text("words", sort=True)
+            if not words:
+                continue
+            rects = []
+            norms = []
+            for w in words:
+                x0, y0, x1, y1, t = float(w[0]), float(w[1]), float(w[2]), float(w[3]), (w[4] or "")
+                n = normalize_nosep(t)
+                if not n:
+                    continue
+                rects.append((x0, y0, x1, y1))
+                norms.append(n)
+            if not norms:
+                continue
+            cum = [0]
+            for n in norms:
+                cum.append(cum[-1] + len(n))
+            S = "".join(norms)
+            page_rects = []
+            rect_key_set = set()
+            for end_idx, key in automaton.iter(S):
+                start_idx = end_idx - len(key) + 1
+                ws = bisect.bisect_right(cum, start_idx) - 1
+                we = bisect.bisect_right(cum, end_idx) - 1
+                if ws < 0 or we < 0 or ws >= len(rects) or we >= len(rects) or we < ws:
+                    continue
+                code_pages[key].add(page.number)
+                matched.add(key)
+                for k in range(ws, we + 1):
+                    x0, y0, x1, y1 = rects[k]
+                    rkey = (round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2))
+                    if rkey not in rect_key_set:
+                        rect_key_set.add(rkey)
+                        page_rects.append((x0, y0, x1, y1))
+                        code_rects_by_page[page.number][key].append((x0, y0, x1, y1))
+                        hits += 1
+            if page_rects:
+                rects_by_page[page.number] = page_rects
+        return hits, matched, rects_by_page, code_pages, code_rects_by_page, doc.page_count
+    finally:
+        doc.close()
+
+
+# ========================= Anotar & combinar ============================
+def add_text_highlights(page, rects, color=(1, 1, 0), opacity=0.35):
+    for (x0, y0, x1, y1) in rects:
+        r = fitz.Rect(x0, y0, x1, y1)
+        ann = page.add_highlight_annot(r)
+        try:
+            ann.set_colors(stroke=color)
+            ann.set_opacity(opacity)
+            if hasattr(fitz, "ANNOT_PRINT"):
+                ann.set_flags(fitz.ANNOT_PRINT)
+        except Exception:
+            pass
+        ann.update()
+
+
+def _fit_scale_and_offset(src_w, src_h, dst_w, dst_h):
+    if src_w <= 0 or src_h <= 0:
+        return 1.0, 0.0, 0.0
+    sx = dst_w / src_w
+    sy = dst_h / src_h
+    s = min(sx, sy)
+    new_w = src_w * s
+    new_h = src_h * s
+    dx = (dst_w - new_w) * 0.5
+    dy = (dst_h - new_h) * 0.5
+    return s, dx, dy
+
+
+def combine_pages_to_new(out_path, page_items, use_text_annotations=True, scale_to_a3=False):
+    out = fitz.open()
+    try:
+        by_pdf = defaultdict(list)
+        for it in page_items:
+            by_pdf[it["pdf_path"]].append(it)
+
+        for pdf_path, items in by_pdf.items():
+            items.sort(key=lambda x: x["page_idx"])
+            with fitz.open(pdf_path) as src:
+                for it in items:
+                    p = it["page_idx"]
+                    src_pg = src.load_page(p)
+                    src_rect = src_pg.rect
+                    sw, sh = float(src_rect.width), float(src_rect.height)
+
+                    if not scale_to_a3:
+                        out.insert_pdf(src, from_page=p, to_page=p)
+                        out_pg = out.load_page(out.page_count - 1)
+                        # Survey extras
+                        if it.get("is_survey") and it.get("room_loc"):
+                            stamp_room_location(out_pg, it.get("room_loc"), margin=100, fontsize=12)
+                        if it.get("is_survey") and it.get("row_bands"):
+                            for rb in it.get("row_bands", []):
+                                add_row_band(out_pg, rb, fill=(1, 1, 0), opacity=0.25)
+                        # Normal text highlights
+                        if use_text_annotations and it.get("rects"):
+                            add_text_highlights(out_pg, it["rects"], color=(1, 1, 0), opacity=0.35)
+                        continue
+
+                    # scale to A3# scale to A3 (ALWAYS LANDSCAPE)
+                    tw, th = A3_LANDSCAPE
+                    out_pg = out.new_page(width=tw, height=th)
+                    dst_rect = fitz.Rect(0, 0, tw, th)
+                    out_pg.show_pdf_page(dst_rect, src, p)
+                    s, dx, dy = _fit_scale_and_offset(sw, sh, tw, th)
+                    # Survey extras (transform row bands to A3 coords)
+                    if it.get("is_survey") and it.get("room_loc"):
+                        stamp_room_location(out_pg, it.get("room_loc"), margin=100, fontsize=12)
+                    if it.get("is_survey") and it.get("row_bands"):
+                        xfm_bands = []
+                        for (x0, y0, x1, y1) in it.get("row_bands", []):
+                            fx0 = x0 * s + dx
+                            fy0 = y0 * s + dy
+                            fx1 = x1 * s + dx
+                            fy1 = y1 * s + dy
+                            xfm_bands.append((fx0, fy0, fx1, fy1))
+                        for rb in xfm_bands:
+                            add_row_band(out_pg, rb, fill=(1, 1, 0), opacity=0.25)
+                    if use_text_annotations and it["rects"]:
+                        xfm_rects = []
+                        for (x0, y0, x1, y1) in it["rects"]:
+                            fx0 = x0 * s + dx
+                            fy0 = y0 * s + dy
+                            fx1 = x1 * s + dx
+                            fy1 = y1 * s + dy
+                            xfm_rects.append((fx0, fy0, fx1, fy1))
+                        add_text_highlights(out_pg, xfm_rects, color=(1, 1, 0), opacity=0.35)
+
+        out_path = uniquify_path(out_path)
+        out.save(out_path)
+        return out_path
+    finally:
+        out.close()
+
+
+def chunk_list(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i+n]
+
+
+# ====================== Regras de prédio (agrupamento) ==================
+_FIRST_LETTERS = re.compile(r'[a-z]+', re.I)
+
+
+def infer_building_from_code(pretty_code: str) -> str:
+    s = unify_dashes(pretty_code or "").strip()
+    if not s:
+        return "UNKWN"
+    s_no = re.sub(r'[^0-9A-Za-z\-]', '', s)
+    # Regra simples: se tiver hífen cedo, 2 letras; senão 3 letras
+    t = re.sub(r'^[0-9\-]+', '', s_no)
+    m2 = _FIRST_LETTERS.match(t)
+    if not m2:
+        return "UNKWN"
+    letters = m2.group(0).upper()
+    if '-' in s_no[:5]:
+        return letters[:2] if len(letters) >= 2 else letters
+    return letters[:3] if len(letters) >= 3 else letters
+
+
+# ========================= Survey / Duplicatas / Rev ====================
+def is_survey_pdf(path, size_limit_bytes=1_200_000):
+    try:
+        sz = os.path.getsize(path)
+    except Exception:
+        sz = 0
+    name = os.path.basename(path).lower()
+    looks_name = ("cut l" in name) or ("cut length report" in name)
+    return looks_name and (sz > 0 and sz <= size_limit_bytes)
+
+
+# ===================== Survey extras: Room stamp + full-row highlight =====================
+_ROOM_RE = re.compile(r"Room/Section\s+Location:\s*([A-Za-z0-9\-]+)", re.IGNORECASE)
+
+def get_room_section_location(pdf_path: str) -> str:
+    """Extract Room/Section Location from page 1 (index 0) of a Cut Length Report PDF."""
+    try:
+        with fitz.open(pdf_path) as doc:
+            if doc.page_count <= 0:
+                return ""
+            txt = doc.load_page(0).get_text("text") or ""
+            m = _ROOM_RE.search(txt)
+            return (m.group(1).strip() if m else "")
+    except Exception:
+        return ""
+
+def stamp_room_location(out_pg, room_text: str, margin=100, box_w=260, box_h=40, fontsize=12):
+    """Stamp room text at top-right, with safe margins for printing."""
+    if not room_text:
+        return
+    try:
+        r = out_pg.rect
+        box = fitz.Rect(r.width - margin - box_w, margin, r.width - margin, margin + box_h)
+        out_pg.insert_textbox(
+            box,
+            f"{room_text}",
+            fontsize=fontsize,
+            fontname="helv",
+            align=fitz.TEXT_ALIGN_RIGHT
+        )
+    except Exception:
+        pass
+
+def compute_row_band_rect(src_pg, code_rect, x_margin=20, y_pad=1.5):
+    """Compute a full-width row band rect for a table row containing code_rect."""
+    try:
+        r = fitz.Rect(*code_rect)
+    except Exception:
+        return None
+    try:
+        yc = (r.y0 + r.y1) * 0.5
+        words = src_pg.get_text("words", sort=True) or []
+        row_words = []
+        for w in words:
+            try:
+                x0, y0, x1, y1 = float(w[0]), float(w[1]), float(w[2]), float(w[3])
+            except Exception:
+                continue
+            ymid = (y0 + y1) * 0.5
+            if (y0 <= yc <= y1) or (abs(ymid - yc) <= 3.0):
+                row_words.append((x0, y0, x1, y1))
+        if row_words:
+            row_y0 = min(y0 for (_, y0, _, _) in row_words)
+            row_y1 = max(y1 for (_, _, _, y1) in row_words)
+        else:
+            row_y0, row_y1 = r.y0, r.y1
+
+        row_y0 = max(0.0, row_y0 - y_pad)
+        row_y1 = min(float(src_pg.rect.height), row_y1 + y_pad)
+
+        px0 = float(src_pg.rect.x0) + x_margin
+        px1 = float(src_pg.rect.x1) - x_margin
+        if px1 <= px0:
+            px0, px1 = float(src_pg.rect.x0), float(src_pg.rect.x1)
+        return (px0, row_y0, px1, row_y1)
+    except Exception:
+        return None
+
+def add_row_band(page, rect, fill=(1, 1, 0), opacity=0.25):
+    """Draw a filled rectangle band across a row."""
+    try:
+        r = fitz.Rect(*rect)
+        ann = page.add_rect_annot(r)
+        ann.set_colors(stroke=fill, fill=fill)
+        ann.set_opacity(opacity)
+        if hasattr(fitz, "ANNOT_PRINT"):
+            ann.set_flags(fitz.ANNOT_PRINT)
+        ann.update()
+    except Exception:
+        pass
+
+
+# Fingerprints de página
+def fingerprint_page_text(pg):
+    try:
+        txt = pg.get_text("text") or ""
+        txt = re.sub(r'\s+', ' ', txt).strip().lower()
+        h = hashlib.sha1()
+        h.update(txt.encode("utf-8", errors="ignore"))
+        r = pg.rect
+        h.update(f"{int(r.width)}x{int(r.height)}".encode())
+        return "T:" + h.hexdigest()
+    except Exception:
+        return None
+
+
+def fingerprint_page_image(pg, scale=0.35):
+    try:
+        mat = fitz.Matrix(scale, scale)
+        pix = pg.get_pixmap(matrix=mat, alpha=False)
+        b = pix.samples
+        h = hashlib.sha1()
+        h.update(b[:200000])
+        return "I:" + h.hexdigest()
+    except Exception:
+        return None
+
+
+def page_fingerprint(pdf_path, page_idx):
+    try:
+        with fitz.open(pdf_path) as doc:
+            pg = doc.load_page(page_idx)
+            fh = fingerprint_page_text(pg)
+            if fh:
+                return fh
+            ih = fingerprint_page_image(pg)
+            return ih or f"X:{pdf_path}:{page_idx}"
+    except Exception:
+        return f"X:{pdf_path}:{page_idx}"
+
+
+# -------- Detecção de summary --------
+_NEIGHBOR_DELTAS = (-4, -3, -2, -1, 1, 2, 3, 4)
+_TRAILING_NUM_RE = re.compile(r"^(.*?)(\d+)$", re.IGNORECASE)
+
+
+def _neighbors_of_code_norm(norm_code: str):
+    m = _TRAILING_NUM_RE.match(norm_code)
+    if not m:
+        return []
+    prefix, num = m.groups()
+    width = len(num)
+    base = int(num)
+    out = []
+    for d in _NEIGHBOR_DELTAS:
+        n = base + d
+        if n < 0:
+            continue
+        out.append(f"{prefix}{str(n).zfill(width)}")
+    return out
+
+
+def looks_like_summary_by_neighbors(codes_on_page_pretty, neighbor_min_hits=3):
+    norm_set = {normalize_base(c) for c in codes_on_page_pretty if c}
+    if not norm_set:
+        return False
+    for norm_code in norm_set:
+        neighbors = _neighbors_of_code_norm(norm_code)
+        if not neighbors:
+            continue
+        hits = sum(1 for nc in neighbors if nc in norm_set)
+        if hits >= neighbor_min_hits:
+            return True
+    return False
+
+
+def is_summary_like(pdf_path, page_idx, codes_on_page, threshold=15, neighbor_min_hits=3):
+    """
+    Heurística para páginas 'summary':
+      - contém 'summary' (ou keywords)
+      - OU muitos códigos distintos (>= threshold)
+      - OU cluster de vizinhos (±1..±4) com hits >= neighbor_min_hits
+    Nunca usado para SURVEYS.
+    """
+    try:
+        if codes_on_page and looks_like_summary_by_neighbors(codes_on_page, neighbor_min_hits=neighbor_min_hits):
+            return True
+        if len(set(codes_on_page or ())) >= threshold:
+            return True
+
+        with fitz.open(pdf_path) as doc:
+            pg = doc.load_page(page_idx)
+            txt = (pg.get_text("text") or "")
+            for rx in SUMMARY_KEYWORDS_RE:
+                if rx.search(txt):
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+# -------- Escolha da última revisão (survey & handbooks/desenhos) --------
+_REV_LET_RE = re.compile(r'(?:^|[^A-Z0-9])REV\s*([A-Z])(?:[^A-Z0-9]|$)', re.IGNORECASE)
+_REV_NUM_RE = re.compile(r'(?:^|[^0-9])REV\s*([0-9]{1,3})(?:[^0-9]|$)', re.IGNORECASE)
+# sufixo do tipo "__E.pdf" ou "_E.pdf"
+_TAIL_LET_RE = re.compile(r'([_\-])([A-Z])(?:\.pdf)?$', re.IGNORECASE)
+
+
+def _parse_revision_from_name(name: str) -> int:
+    if not name:
+        return 0
+    m = _REV_LET_RE.search(name)
+    if m:
+        return 1000 + (ord(m.group(1).upper()) - ord('A'))  # letras acima de números
+    m = _REV_NUM_RE.search(name)
+    if m:
+        return int(m.group(1))
+    m = _TAIL_LET_RE.search(os.path.splitext(name)[0])
+    if m:
+        return 1000 + (ord(m.group(2).upper()) - ord('A'))
+    return 0
+
+
+def _strip_revision_tokens(name: str) -> str:
+    base = _REV_LET_RE.sub(' ', name)
+    base = _REV_NUM_RE.sub(' ', base)
+    base = _TAIL_LET_RE.sub('', os.path.splitext(base)[0])
+    base = re.sub(r'\s+', ' ', base).strip().lower()
+    return base
+
+
+def select_latest_survey_revisions(pdf_paths: list) -> list:
+    keep = []
+    groups = {}
+    for p in pdf_paths:
+        fname = os.path.basename(p)
+        if is_survey_pdf(p):
+            base = _strip_revision_tokens(fname)
+            rev = _parse_revision_from_name(fname)
+            cur = groups.get(base)
+            if cur is None or rev > cur[1]:
+                groups[base] = (p, rev)
+        else:
+            keep.append(p)
+    keep.extend([v[0] for v in groups.values()])
+    keep = sorted(set(keep), key=lambda x: os.path.basename(x).lower())
+    return keep
+
+
+def select_latest_non_survey_revisions(pdf_paths: list) -> list:
+    groups = {}
+    for p in pdf_paths:
+        if is_survey_pdf(p):
+            continue
+        fname = os.path.basename(p)
+        base = _strip_revision_tokens(fname)
+        rev = _parse_revision_from_name(fname)
+        cur = groups.get(base)
+        if cur is None or rev > cur[1]:
+            groups[base] = (p, rev)
+    # mantém todos os surveys + somente o mais novo dos não-surveys
+    out = [p for p in pdf_paths if is_survey_pdf(p)]
+    out.extend(v[0] for v in groups.values())
+    out = sorted(set(out), key=lambda x: os.path.basename(x).lower())
+    return out
+
+
+# ========================== Tarefa do worker (MP) =======================
+class _DummyCancel:
+    def is_set(self): return False
+
+
+def _process_pdf_task(args):
+    (pdf_path,
+     cmp_keys_list,
+     use_ac,
+     highlight_all_occurrences) = args
+    cancel_flag = _DummyCancel()
+    cmp_keys = set(cmp_keys_list)
+    try:
+        if use_ac and _HAS_AC:
+            automaton = build_aho_automaton(cmp_keys)
+            hits, matched, rects_by_page, code_pages, code_rects_by_page, total_pages = scan_pdf_for_rects_ac(
+                pdf_path=pdf_path,
+                automaton=automaton,
+                cancel_flag=cancel_flag,
+                highlight_all_occurrences=highlight_all_occurrences
+            )
+        else:
+            prefixes, first_chars = build_prefixes_and_firstchars(cmp_keys)
+            max_code_len = max((len(k) for k in cmp_keys), default=0)
+            hits, matched, rects_by_page, code_pages, code_rects_by_page, total_pages = scan_pdf_for_rects_fallback(
+                pdf_path=pdf_path,
+                cmp_keys_nosep=cmp_keys,
+                max_code_len=max_code_len,
+                cancel_flag=cancel_flag,
+                highlight_all_occurrences=highlight_all_occurrences,
+                prefixes=prefixes,
+                first_chars=first_chars
+            )
+
+        rects_by_page_ser = {int(k): [tuple(r) for r in v] for k, v in rects_by_page.items()}
+        code_pages_ser = {k: sorted(list(v)) for k, v in code_pages.items()}
+
+        # Serializa page -> code -> [rects]
+        code_rects_ser = {}
+        for p, mp in code_rects_by_page.items():
+            code_rects_ser[int(p)] = {}
+            for ck, rect_list in mp.items():
+                safe_list = []
+                if isinstance(rect_list, list):
+                    for r in rect_list:
+                        try:
+                            safe_list.append(tuple(r))
+                        except Exception:
+                            pass
+                code_rects_ser[int(p)][ck] = safe_list
+
+        match_pairs = []
+        for k, pages in code_pages_ser.items():
+            for p in pages:
+                match_pairs.append((k, p + 1))
+
+        return {
+            "pdf_path": pdf_path,
+            "display": os.path.basename(pdf_path),
+            "hits": int(sum(len(v) for v in rects_by_page_ser.values())),
+            "rects_by_page": rects_by_page_ser,
+            "code_pages": code_pages_ser,
+            "code_rects_by_page": code_rects_ser,
+            "hit_pages": sorted(list(rects_by_page_ser.keys())),
+            "total_pages": int(total_pages),
+            "match_pairs": match_pairs
+        }
+    except Exception as e:
+        return {
+            "pdf_path": pdf_path,
+            "display": os.path.basename(pdf_path),
+            "error": str(e)
+        }
+
+
+# ============================ UI: Review Dialog =========================
+class ReviewDialog(tk.Toplevel):
+    def __init__(self, master, items):
+        super().__init__(master)
+        self.title("Review highlighted pages to keep")
+        self.geometry("1200x740")
+        self.minsize(1080, 660)
+        self.transient(master)
+        self.grab_set()
+
+        paned = ttk.Panedwindow(self, orient="horizontal")
+        paned.pack(fill="both", expand=True, padx=8, pady=8)
+        left = ttk.Frame(paned)
+        right = ttk.Frame(paned)
+        paned.add(left, weight=3)
+        paned.add(right, weight=2)
+
+        ttk.Label(left, text="Pages (double-click to toggle keep). Click headers to sort.").pack(anchor="w")
+        tree_frame = ttk.Frame(left)
+        tree_frame.pack(fill="both", expand=True)
+
+        self.tree = ttk.Treeview(
+            tree_frame,
+            columns=("order", "keep", "file", "page", "codes"),
+            show="headings",
+            selectmode="browse",
+            height=24
+        )
+        self.tree.heading("order", text="#")
+        self.tree.heading("keep", text="Keep", command=lambda: self._sort_tree("keep"))
+        self.tree.heading("file", text="File", command=lambda: self._sort_tree("file"))
+        self.tree.heading("page", text="Page", command=lambda: self._sort_tree("page"))
+        self.tree.heading("codes", text="Codes", command=lambda: self._sort_tree("codes"))
+        self.tree.column("order", width=40, anchor="center")
+        self.tree.column("keep", width=60, anchor="center")
+        self.tree.column("file", width=500, anchor="w")
+        self.tree.column("page", width=70, anchor="center")
+        self.tree.column("codes", width=300, anchor="w")
+
+        ybar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        xbar = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        ybar.grid(row=0, column=1, sticky="ns")
+        xbar.grid(row=1, column=0, sticky="ew")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+
+        self.keep_map = {}
+        self.page_rects = {}
+        self.page_codes = {}
+        self._row_mapping = {}
+        self._pdf_display = {}
+
+        row_idx = 1
+        for it in items:
+            pdf_path = it["pdf_path"]
+            disp = it["display"]
+            hit_pages = it["hit_pages"]
+            rects_by_page = it["rects_by_page"]
+            page_codes = it.get("page_codes", {})
+            self._pdf_display[pdf_path] = disp
+            self.keep_map[pdf_path] = set(hit_pages)
+            for p in hit_pages:
+                codes_pretty = ", ".join(sorted(page_codes.get(p, [])))
+                iid = self.tree.insert("", "end", values=(row_idx, "[x]", disp, p + 1, codes_pretty))
+                self._row_mapping[iid] = (pdf_path, p)
+                self.page_rects[(pdf_path, p)] = rects_by_page.get(p, [])
+                self.page_codes[(pdf_path, p)] = page_codes.get(p, [])
+                row_idx += 1
+
+        ttk.Label(right, text="Preview").pack(anchor="w")
+        canvas_frame = ttk.Frame(right)
+        canvas_frame.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(canvas_frame, bg="#202020", highlightthickness=0)
+        xscroll = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self.canvas.xview)
+        yscroll = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        canvas_frame.rowconfigure(0, weight=1)
+        canvas_frame.columnconfigure(0, weight=1)
+
+        self._preview_img = None
+        self._zoom = 1.25
+        controls = ttk.Frame(right)
+        controls.pack(fill="x", pady=(6, 0))
+        ttk.Button(controls, text="Zoom -", command=lambda: self._change_zoom(-0.15)).pack(side="left")
+        ttk.Button(controls, text="Zoom +", command=lambda: self._change_zoom(+0.15)).pack(side="left", padx=6)
+        self.stat = ttk.Label(controls, text="—")
+        self.stat.pack(side="right")
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=8, pady=(6, 8))
+        ttk.Button(btns, text="Select All", command=self._select_all).pack(side="left")
+        ttk.Button(btns, text="Clear All", command=self._clear_all).pack(side="left", padx=6)
+        ttk.Button(btns, text="OK", command=self._ok).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right", padx=6)
+
+        self.tree.bind("<Double-1>", self._toggle_keep)
+        self.tree.bind("<<TreeviewSelect>>", self._preview_selected)
+
+        if self.tree.get_children():
+            first = self.tree.get_children()[0]
+            self.tree.selection_set(first)
+            self.tree.focus(first)
+            self._preview_selected()
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def _rows_snapshot(self):
+        rows = []
+        for iid in self.tree.get_children():
+            pdf_path, page = self._row_mapping[iid]
+            disp = self._pdf_display.get(pdf_path, os.path.basename(pdf_path))
+            keep = (page in self.keep_map.get(pdf_path, set()))
+            codes = ", ".join(sorted(self.page_codes.get((pdf_path, page), [])))
+            order = int(self.tree.set(iid, "order") or "0")
+            rows.append({
+                "iid": iid, "order": order, "pdf_path": pdf_path,
+                "page": page, "display": disp, "keep": keep, "codes": codes
+            })
+        return rows
+
+    def _rebuild_tree(self, rows):
+        self.tree.delete(*self.tree.get_children())
+        self._row_mapping.clear()
+        for idx, r in enumerate(rows, start=1):
+            keep_txt = "[x]" if r["keep"] else "[ ]"
+            iid = self.tree.insert("", "end", values=(idx, keep_txt, r["display"], r["page"] + 1, r["codes"]))
+            self._row_mapping[iid] = (r["pdf_path"], r["page"])
+
+    def _sort_tree(self, column):
+        rows = self._rows_snapshot()
+        if column == "file":
+            rows.sort(key=lambda r: (r["display"].lower(), r["page"]))
+        elif column == "page":
+            rows.sort(key=lambda r: r["page"])
+        elif column == "keep":
+            rows.sort(key=lambda r: ((not r["keep"]), r["display"].lower(), r["page"]))
+        elif column == "codes":
+            rows.sort(key=lambda r: (r["codes"].lower(), r["display"].lower(), r["page"]))
+        else:
+            return
+        self._rebuild_tree(rows)
+
+    def _toggle_keep(self, event=None):
+        iid = self.tree.identify_row(event.y) if event else self.tree.focus()
+        if not iid:
+            return
+        pdf_path, page = self._row_mapping[iid]
+        if page in self.keep_map[pdf_path]:
+            self.keep_map[pdf_path].remove(page)
+            self.tree.set(iid, "keep", "[ ]")
+        else:
+            self.keep_map[pdf_path].add(page)
+            self.tree.set(iid, "keep", "[x]")
+
+    def _select_all(self):
+        for iid, (pdf_path, page) in self._row_mapping.items():
+            self.keep_map[pdf_path].add(page)
+            self.tree.set(iid, "keep", "[x]")
+
+    def _clear_all(self):
+        for iid, (pdf_path, page) in self._row_mapping.items():
+            self.keep_map[pdf_path].discard(page)
+            self.tree.set(iid, "keep", "[ ]")
+
+    def _ok(self):
+        seq = []
+        for iid in self.tree.get_children():
+            pdf_path, page = self._row_mapping[iid]
+            keep = (page in self.keep_map.get(pdf_path, set()))
+            if keep:
+                seq.append((pdf_path, page))
+        self.selection = {"keep_map": self.keep_map, "sequence": seq}
+        self.destroy()
+
+    def _cancel(self):
+        self.selection = None
+        self.destroy()
+
+    def _change_zoom(self, delta):
+        self._zoom = max(0.3, min(3.0, getattr(self, "_zoom", 1.25) + delta))
+        self._preview_selected()
+
+    def _preview_selected(self, event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        pdf_path, page_idx = self._row_mapping[iid]
+        self._render_page(pdf_path, page_idx)
+
+    def _render_page(self, pdf_path, page_idx):
+        self.stat.config(text=f"{os.path.basename(pdf_path)} — page {page_idx+1}")
+        try:
+            with fitz.open(pdf_path) as doc:
+                pg = doc.load_page(page_idx)
+                z = getattr(self, "_zoom", 1.25)
+                mat = fitz.Matrix(z, z)
+                pix = pg.get_pixmap(matrix=mat, alpha=False)
+                png_bytes = pix.tobytes("png")
+                b64 = base64.b64encode(png_bytes).decode("ascii")
+                img = tk.PhotoImage(data=b64)
+                self._preview_img = img
+                self.canvas.delete("all")
+                self.canvas.create_image(0, 0, anchor="nw", image=img)
+                self.canvas.config(scrollregion=(0, 0, img.width(), img.height()))
+        except Exception as e:
+            self.canvas.delete("all")
+            self.canvas.create_text(10, 10, anchor="nw", fill="white",
+                                    text=f"Preview error:\n{e}")
+
+
+# ============================ UI: Summary Dialog ========================
+class SummaryDialog(tk.Toplevel):
+    def __init__(self, master, rows, not_found_count, summary_csv_path):
+        super().__init__(master)
+        self.title("Match Summary")
+        self.geometry("900x520")
+        self.minsize(860, 480)
+        self.transient(master)
+        self.grab_set()
+        info = ttk.Label(self, text=f"Codes not found: {not_found_count} \n Summary CSV: {summary_csv_path}")
+        info.pack(fill="x", padx=10, pady=(10, 0))
+        cols = ("code", "total_pages", "breakdown")
+        tree = ttk.Treeview(self, columns=cols, show="headings")
+        tree.heading("code", text="ECS Code")
+        tree.heading("total_pages", text="Pages Matched (total)")
+        tree.heading("breakdown", text="Per-file breakdown")
+        tree.column("code", width=220, anchor="w")
+        tree.column("total_pages", width=160, anchor="center")
+        tree.column("breakdown", width=460, anchor="w")
+        tree.pack(fill="both", expand=True, padx=10, pady=10)
+        for r in rows:
+            tree.insert("", "end", values=(r["code"], r["total_pages"], r["breakdown"]))
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
+
+
+# ============================== Main App ================================
+class HighlighterApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("ECS PDF Highlighter")
+        self.geometry("1140x980")
+        self.minsize(1100, 930)
+
+        # Estado
+        self.excel_paths = []
+        self.week_number = tk.StringVar()
+        self.building_name = tk.StringVar()
+        self.output_dir = tk.StringVar()
+
+        self.pages_per_file_var = tk.IntVar(value=20)
+        self.only_highlighted_var = tk.BooleanVar(value=True)
+        self.review_pages_var = tk.BooleanVar(value=True)
+        self.ignore_lead_digit_var = tk.BooleanVar(value=False)
+        self.highlight_all_var = tk.BooleanVar(value=True)
+        self.use_text_annots_var = tk.BooleanVar(value=True)
+        self.scale_to_a3_var = tk.BooleanVar(value=False)
+        self.turbo_var = tk.BooleanVar(value=True)
+        self.parallel_var = tk.BooleanVar(value=True)
+
+        # De-dup / survey / summary
+        self.treat_survey_var = tk.BooleanVar(value=True)
+        self.survey_size_limit = tk.IntVar(value=1200)  # KB
+        self.dedupe_var = tk.BooleanVar(value=True)
+        self.dedupe_surveys_var = tk.BooleanVar(value=False)  # NOVO: por padrão NÃO deduplica surveys
+# NOVO: limiar do cluster ±1..±4
+        self.keep_latest_survey_rev_var = tk.BooleanVar(value=True)
+        self.keep_latest_non_survey_rev_var = tk.BooleanVar(value=True)  # NOVO: também para handbooks/desenhos
+
+        # DB externa (opcional)
+        self.external_db_path = tk.StringVar()
+        self.external_db_df = None
+        self.external_db_map = {}
+
+        self.pdf_list = []
+        self.cancel_flag = threading.Event()
+        self.worker_thread = None
+        self.msg_queue = queue.Queue()
+
+        self.ecs_original_map = {}
+        self.nosep_to_primary = {}
+        self.main_page_codes = defaultdict(set)
+        self.main_row_iid = {}
+
+        self._build_ui()
+        self._poll_messages()
+
+    def _build_ui(self):
+        pad = {"padx": 8, "pady": 6}
+
+        # Top sections (packed in order)
+        fr_top = ttk.Frame(self); fr_top.pack(fill="x", **pad)
+        ttk.Label(fr_top, text="Week:").pack(side="left")
+        ttk.Entry(fr_top, width=8, textvariable=self.week_number).pack(side="left", padx=8)
+        ttk.Label(fr_top, text="Project/Root Name:").pack(side="left", padx=(16, 0))
+        ttk.Entry(fr_top, width=30, textvariable=self.building_name).pack(side="left", padx=8, fill="x", expand=True)
+        ttk.Label(fr_top, text="Max pages per output:").pack(side="left", padx=(16, 0))
+        tk.Spinbox(fr_top, from_=5, to=500, increment=1, width=6, textvariable=self.pages_per_file_var).pack(side="left", padx=6)
+
+        fr_opts = ttk.Frame(self); fr_opts.pack(fill="x", **pad)
+        ttk.Checkbutton(fr_opts, text="Only keep highlighted pages", variable=self.only_highlighted_var).pack(side="left")
+        ttk.Checkbutton(fr_opts, text="Review pages before saving", variable=self.review_pages_var).pack(side="left", padx=12)
+        ttk.Checkbutton(fr_opts, text="Ignore leading digit in PDF codes", variable=self.ignore_lead_digit_var).pack(side="left", padx=12)
+        ttk.Checkbutton(fr_opts, text="Highlight every occurrence", variable=self.highlight_all_var).pack(side="left", padx=12)
+        ttk.Checkbutton(fr_opts, text="Use text highlight annotations", variable=self.use_text_annots_var).pack(side="left", padx=12)
+        ttk.Checkbutton(fr_opts, text="Scale output pages to A3", variable=self.scale_to_a3_var).pack(side="left", padx=12)
+
+        fr_perf = ttk.Frame(self); fr_perf.pack(fill="x", **pad)
+        ttk.Checkbutton(fr_perf, text="Turbo (Aho–Corasick)", variable=self.turbo_var).pack(side="left")
+        ttk.Checkbutton(fr_perf, text="Parallel PDFs", variable=self.parallel_var).pack(side="left", padx=12)
+
+        fr_rules = ttk.LabelFrame(self, text="De-dup & Survey Rules"); fr_rules.pack(fill="x", **pad)
+        ttk.Checkbutton(fr_rules, text="Treat 'Cut Length Report' PDFs as survey tables", variable=self.treat_survey_var).grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ttk.Label(fr_rules, text="Survey size ≤ KB:").grid(row=0, column=1, sticky="e")
+        ttk.Checkbutton(fr_rules, text="Keep only latest Survey REV", variable=self.keep_latest_survey_rev_var).grid(row=3, column=0, sticky="w", padx=6, pady=4)
+        ttk.Checkbutton(fr_rules, text="Keep only latest Handbook/Drawings REV", variable=self.keep_latest_non_survey_rev_var).grid(row=3, column=1, columnspan=2, sticky="w", padx=6, pady=4)
+
+        # DB externa
+        fr_db = ttk.LabelFrame(self, text="External DB (optional, local .xlsx)"); fr_db.pack(fill="x", **pad)
+        ttk.Label(fr_db, text="DB Excel:").grid(row=0, column=0, sticky="e")
+        ttk.Entry(fr_db, textvariable=self.external_db_path).grid(row=0, column=1, sticky="ew", padx=6)
+        fr_db.columnconfigure(1, weight=1)
+        ttk.Button(fr_db, text="Browse…", command=self._browse_external_db).grid(row=0, column=2, padx=6)
+        ttk.Button(fr_db, text="Load DB", command=self._load_external_db).grid(row=0, column=3, padx=6)
+        ttk.Button(fr_db, text="Clear", command=self._clear_external_db).grid(row=0, column=4, padx=6)
+
+        # Excels
+        fr_excel = ttk.LabelFrame(self, text="Excel files (ECS Codes)"); fr_excel.pack(fill="x", **pad)
+        btns_ex = ttk.Frame(fr_excel); btns_ex.pack(fill="x", padx=6, pady=6)
+        ttk.Button(btns_ex, text="Add Excel…", command=self._add_excels).pack(side="left")
+        ttk.Button(btns_ex, text="Remove Selected", command=self._remove_selected_excels).pack(side="left", padx=6)
+        ttk.Button(btns_ex, text="Clear List", command=self._clear_excels).pack(side="left")
+        self.lst_excels = tk.Listbox(fr_excel, height=5, selectmode=tk.EXTENDED)
+        self.lst_excels.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # PDFs
+        fr_pdfs = ttk.LabelFrame(self, text="PDFs to Process"); fr_pdfs.pack(fill="both", expand=True, **pad)
+        btns = ttk.Frame(fr_pdfs); btns.pack(fill="x", padx=6, pady=6)
+        ttk.Button(btns, text="Add PDFs…", command=self._add_pdfs).pack(side="left")
+        ttk.Button(btns, text="Remove Selected", command=self._remove_selected_pdfs).pack(side="left", padx=6)
+        ttk.Button(btns, text="Clear List", command=self._clear_pdfs).pack(side="left")
+        self.lst_pdfs = tk.Listbox(fr_pdfs, height=7, selectmode=tk.EXTENDED)
+        self.lst_pdfs.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Output
+        fr_out = ttk.Frame(self); fr_out.pack(fill="x", **pad)
+        ttk.Label(fr_out, text="Output Folder:").pack(side="left")
+        ttk.Entry(fr_out, textvariable=self.output_dir).pack(side="left", expand=True, fill="x", padx=8)
+        ttk.Button(fr_out, text="Select…", command=self._pick_output_dir).pack(side="left")
+
+        # Log
+        fr_log = ttk.LabelFrame(self, text="Matches (ECS Code | File | Page | Codes on Page)"); fr_log.pack(fill="both", expand=True, **pad)
+        cols = ("code", "file", "page", "codes_on_page")
+        self.tree = ttk.Treeview(fr_log, columns=cols, show="headings", height=12)
+        self.tree.heading("code", text="Code")
+        self.tree.heading("file", text="File")
+        self.tree.heading("page", text="Page")
+        self.tree.heading("codes_on_page", text="Codes (on page)")
+        self.tree.column("code", width=180, anchor="w")
+        self.tree.column("file", width=560, anchor="w")
+        self.tree.column("page", width=60, anchor="center")
+        self.tree.column("codes_on_page", width=220, anchor="w")
+        self.tree.pack(fill="both", expand=True, padx=6, pady=6)
+
+        # ===== Fixed bottom bar (progress + Start/Stop/Exit) =====
+        self.bottom = ttk.Frame(self)
+        self.bottom.pack(side="bottom", fill="x", **pad)
+
+        fr_prog = ttk.Frame(self.bottom)
+        fr_prog.pack(side="left", fill="x", expand=True)
+        self.prog = ttk.Progressbar(fr_prog, orient="horizontal", mode="determinate", maximum=100)
+        self.prog.pack(side="left", expand=True, fill="x")
+        self.lbl_status = ttk.Label(fr_prog, text="Idle")
+        self.lbl_status.pack(side="left", padx=8)
+
+        fr_btns = ttk.Frame(self.bottom)
+        fr_btns.pack(side="right")
+        # Keep strong references so they never get GC'd:
+        self.btn_start = ttk.Button(fr_btns, text="Start", command=self._start)
+        self.btn_start.pack(side="left")
+        self.btn_stop = ttk.Button(fr_btns, text="Stop", command=self._stop)
+        self.btn_stop.pack(side="left", padx=6)
+        self.btn_exit = ttk.Button(fr_btns, text="Exit", command=self._exit)
+        self.btn_exit.pack(side="left")
+
+    # ===== Handlers DB externa =====
+    def _browse_external_db(self):
+        p = filedialog.askopenfilename(title="Select External DB Excel", filetypes=[("Excel files", "*.xlsx *.xls")])
+        if p:
+            self.external_db_path.set(p)
+
+    def _load_external_db(self):
+        p = self.external_db_path.get().strip()
+        if not p:
+            messagebox.showwarning("External DB", "Please select a local Excel file first.")
+            return
+        try:
+            df, db_map = load_external_db_from_xlsx(p)
+            self.external_db_df = df
+            self.external_db_map = db_map
+            messagebox.showinfo("External DB", f"Loaded {len(db_map)} codes from:\n{os.path.basename(p)}")
+        except Exception as e:
+            messagebox.showerror("External DB", f"Could not load DB:\n{e}")
+
+    def _clear_external_db(self):
+        self.external_db_path.set("")
+        self.external_db_df = None
+        self.external_db_map = {}
+        messagebox.showinfo("External DB", "Cleared external database.")
+
+    # ======= Excel / PDF pickers =======
+    def _add_excels(self):
+        paths = filedialog.askopenfilenames(title="Select Excel files", filetypes=[("Excel files", "*.xlsx *.xls")])
+        if paths:
+            for p in paths:
+                if p not in self.excel_paths:
+                    self.excel_paths.append(p)
+                    self.lst_excels.insert("end", p)
+
+    def _remove_selected_excels(self):
+        sels = list(self.lst_excels.curselection())[::-1]
+        for i in sels:
+            path = self.lst_excels.get(i)
+            self.lst_excels.delete(i)
+            try:
+                self.excel_paths.remove(path)
+            except ValueError:
+                pass
+
+    def _clear_excels(self):
+        self.lst_excels.delete(0, "end")
+        self.excel_paths.clear()
+
+    def _add_pdfs(self):
+        paths = filedialog.askopenfilenames(title="Select PDFs", filetypes=[("PDF files", "*.pdf")])
+        if paths:
+            for p in paths:
+                if p not in self.pdf_list:
+                    self.pdf_list.append(p)
+                    self.lst_pdfs.insert("end", p)
+
+    def _remove_selected_pdfs(self):
+        sels = list(self.lst_pdfs.curselection())[::-1]
+        for i in sels:
+            path = self.lst_pdfs.get(i)
+            self.lst_pdfs.delete(i)
+            try:
+                self.pdf_list.remove(path)
+            except ValueError:
+                pass
+
+    def _clear_pdfs(self):
+        self.lst_pdfs.delete(0, "end")
+        self.pdf_list.clear()
+
+    def _pick_output_dir(self):
+        d = filedialog.askdirectory(title="Select Output Folder")
+        if d:
+            self.output_dir.set(d)
+
+    # ===== run controls =====
+    def _start(self):
+        if self.worker_thread and self.worker_thread.is_alive():
+            return
+        week = self.week_number.get().strip()
+        rootname = self.building_name.get().strip()
+        excels = list(self.excel_paths)
+        if not week or not excels or not self.pdf_list:
+            messagebox.showwarning("Input", "Please provide Week, at least ONE Excel, and PDFs.")
+            return
+        out_dir = self.output_dir.get().strip() or os.path.dirname(self.pdf_list[0])
+        self.output_dir.set(out_dir)
+        os.makedirs(out_dir, exist_ok=True)
+
+        # reset UI aggregation
+        self.main_page_codes.clear()
+        self.main_row_iid.clear()
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+
+        self.cancel_flag.clear()
+        self.prog["value"] = 0
+        self.lbl_status.config(text="Starting…")
+
+        args = (
+            week, rootname, list(excels), list(self.pdf_list), out_dir,
+            int(self.pages_per_file_var.get()),
+            bool(self.ignore_lead_digit_var.get()),
+            bool(self.highlight_all_var.get()),
+            bool(self.use_text_annots_var.get()),
+            bool(self.turbo_var.get()),
+            bool(self.parallel_var.get()),
+            bool(self.scale_to_a3_var.get()),
+            bool(self.treat_survey_var.get()),
+            int(self.survey_size_limit.get()) * 1024,
+            bool(self.dedupe_var.get()),
+            bool(self.dedupe_surveys_var.get()),
+                        bool(self.keep_latest_survey_rev_var.get()),
+            bool(self.keep_latest_non_survey_rev_var.get()),
+        )
+        self.worker_thread = threading.Thread(target=self._worker, args=args, daemon=True)
+        self.worker_thread.start()
+
+    def _stop(self):
+        self.cancel_flag.set()
+        self.lbl_status.config(text="Stopping…")
+
+    def _exit(self):
+        self.destroy()
+
+    # ===== background worker =====
+    def _worker(self, week_number, root_name, excel_paths, pdf_paths, out_dir, pages_per_file,
+                ignore_leading_digit, highlight_all_occurrences, use_text_annotations,
+                turbo_mode, parallel_mode, scale_to_a3, treat_survey, survey_size_limit_bytes,
+                dedupe_pages, dedupe_surveys, 
+                keep_latest_survey_rev, keep_latest_non_survey_rev):
+        def post(msg_type, payload=None):
+            self.msg_queue.put((msg_type, payload))
+        try:
+            # 1) Carregar todas as planilhas e unir códigos
+            post("status", "Reading Excel files…")
+            ecs_primary_all = set()
+            original_map_all = {}
+            for xp in excel_paths:
+                try:
+                    df = load_table_with_dynamic_header(xp, sheet_name=0)
+                    if df is None:
+                        df = pd.read_excel(xp, dtype=str, engine="openpyxl")
+                    ecs_primary, original_map = extract_ecs_codes_from_df(df)
+                    ecs_primary_all |= ecs_primary
+                    for k, v in original_map.items():
+                        original_map_all.setdefault(k, v)
+                except Exception as e:
+                    post("status", f"Excel error {os.path.basename(xp)}: {e}")
+
+            if not ecs_primary_all:
+                post("error", "No ECS codes found in the selected Excel files.")
+                return
+            self.ecs_original_map = dict(original_map_all)
+            cmp_keys, nosep_to_primary, base_to_primaries, _max_len = build_compare_index(ecs_primary_all, ignore_leading_digit)
+            self.nosep_to_primary = dict(nosep_to_primary)
+            self.base_to_primaries = dict(base_to_primaries)
+
+            # 2) Filtrar revisões
+            if keep_latest_survey_rev:
+                try:
+                    pdf_paths = select_latest_survey_revisions(list(pdf_paths))
+                except Exception:
+                    pass
+            if keep_latest_non_survey_rev:
+                try:
+                    pdf_paths = select_latest_non_survey_revisions(list(pdf_paths))
+                except Exception:
+                    pass
+
+            # 3) Tarefas
+            tasks = []
+            for pdf in pdf_paths:
+                tasks.append((
+                    pdf,
+                    sorted(list(cmp_keys)),
+                    bool(turbo_mode and _HAS_AC),
+                    bool(highlight_all_occurrences),
+                ))
+
+            results = []
+            total = len(tasks) if tasks else 1
+            completed = 0
+
+            if parallel_mode and len(tasks) > 1:
+                max_workers = max(1, (os.cpu_count() or 2))
+                post("status", f"Scanning in parallel ({max_workers} workers)…")
+                with ProcessPoolExecutor(max_workers=max_workers) as ex:
+                    fut_to_pdf = {ex.submit(_process_pdf_task, t): t[0] for t in tasks}
+                    for fut in as_completed(fut_to_pdf):
+                        if self.cancel_flag.is_set():
+                            break
+                        res = fut.result()
+                        results.append(res)
+                        completed += 1
+                        post("status", f"Processed: {os.path.basename(res.get('pdf_path',''))}")
+                        post("progress", int((completed / total) * 100))
+            else:
+                post("status", "Scanning (single process)…")
+                for t in tasks:
+                    if self.cancel_flag.is_set():
+                        break
+                    res = _process_pdf_task(t)
+                    results.append(res)
+                    completed += 1
+                    post("status", f"Processed: {os.path.basename(res.get('pdf_path',''))}")
+                    post("progress", int((completed / total) * 100))
+
+            if self.cancel_flag.is_set():
+                post("done", None)
+                return
+
+            # 4) Agregar + mandar linhas para UI
+            processed = []
+            agg_code_file_pages = defaultdict(lambda: defaultdict(set))  # cmp_key -> file -> set(pages)
+
+            for res in results:
+                if "error" in res:
+                    post("status", f"Error in {os.path.basename(res['pdf_path'])}: {res['error']}")
+                    continue
+
+                pdf_path = res["pdf_path"]
+                display = res["display"]
+                rects_by_page = res["rects_by_page"]
+                code_rects_by_page = res["code_rects_by_page"]
+                hit_pages = res["hit_pages"]
+                total_pages = res["total_pages"]
+                code_pages = res["code_pages"]
+                match_pairs = res["match_pairs"]
+
+                for cmp_key, page_1b in match_pairs:
+                    primary = self.nosep_to_primary.get(cmp_key, cmp_key)
+                    pretty = self.ecs_original_map.get(primary, primary)
+                    self.msg_queue.put(("match", (pretty, display, page_1b)))
+
+                for cmp_key, pages in code_pages.items():
+                    agg_code_file_pages[cmp_key][display] = set(pages)
+
+                processed.append({
+                    "display": display,
+                    "pdf_path": pdf_path,
+                    "hit_pages": hit_pages,
+                    "rects_by_page": rects_by_page,
+                    "code_rects_by_page": code_rects_by_page,
+                    "page_cmp_keys": {
+                        int(p): sorted([ck for ck, pglist in code_pages.items() if int(p) in pglist])
+                        for p in hit_pages
+                    },
+                    "page_codes": {
+                        int(p): sorted({
+                            self.ecs_original_map.get(self.nosep_to_primary.get(cmp_key, cmp_key), cmp_key)
+                            for cmp_key, pglist in code_pages.items() if int(p) in pglist and (cmp_key in nosep_to_primary)
+                        })
+                        for p in hit_pages
+                    },
+                    "total_pages": total_pages
+                })
+
+            agg_serializable = {
+                cmp_key: {fn: sorted(list(pages)) for fn, pages in filepages.items()}
+                for cmp_key, filepages in agg_code_file_pages.items()
+            }
+
+            post("review_data", {
+                "processed": processed,
+                "root_name": root_name,
+                "week_number": week_number,
+                "out_dir": out_dir,
+                "use_text_annotations": bool(use_text_annotations),
+                "ecs_primary": sorted(list(ecs_primary_all)),
+                "original_map": dict(original_map_all),
+                "nosep_to_primary": dict(nosep_to_primary),
+                "base_to_primaries": dict(base_to_primaries),
+                "agg_code_file_pages": agg_serializable,
+                "pages_per_file": int(pages_per_file),
+                "scale_to_a3": bool(scale_to_a3),
+                "treat_survey": bool(treat_survey),
+                "survey_size_limit_bytes": int(survey_size_limit_bytes),
+                "dedupe_pages": bool(dedupe_pages),
+                "dedupe_surveys": bool(dedupe_surveys),})
+        except Exception as e:
+            post("error", f"Unexpected error: {e}")
+        finally:
+            post("done", None)
+
+    # ===== message pump (UI) =====
+    def _poll_messages(self):
+        try:
+            while True:
+                msg_type, payload = self.msg_queue.get_nowait()
+                if msg_type == "status":
+                    self.lbl_status.config(text=str(payload))
+                elif msg_type == "progress":
+                    try:
+                        self.prog["value"] = int(payload)
+                    except Exception:
+                        pass
+                elif msg_type == "match":
+                    pretty_code, file_name, page_num = payload
+                    key = (file_name, page_num)
+                    self.main_page_codes[key].add(pretty_code)
+                    codes_str = ", ".join(sorted(self.main_page_codes[key]))
+                    if key in self.main_row_iid:
+                        iid = self.main_row_iid[key]
+                        self.tree.set(iid, "codes_on_page", codes_str)
+                    else:
+                        iid = self.main_row_iid[key] = self.tree.insert(
+                            "", "end", values=(pretty_code, file_name, page_num, codes_str)
+                        )
+                elif msg_type == "error":
+                    self.lbl_status.config(text="Error")
+                    messagebox.showerror("Error", str(payload))
+                elif msg_type == "review_data":
+                    self._finalize_and_save(payload)
+                elif msg_type == "done":
+                    pass
+        except queue.Empty:
+            pass
+        self.after(80, self._poll_messages)
+
+    # ===== finalize: filtros, revision, combine, CSVs =====
+    def _finalize_and_save(self, bundle):
+        processed = bundle["processed"]
+        root_name = bundle["root_name"]
+        week_number = bundle["week_number"]
+        out_dir = bundle["out_dir"]
+        use_text_annotations = bool(bundle.get("use_text_annotations", True))
+        ecs_primary = set(bundle.get("ecs_primary", []))
+        original_map = dict(bundle.get("original_map", {}))
+        nosep_to_primary = dict(bundle.get("nosep_to_primary", {}))
+        base_to_primaries = dict(bundle.get("base_to_primaries", {}))
+        agg_code_file_pages = dict(bundle.get("agg_code_file_pages", {}))
+        pages_per_file = max(1, int(bundle.get("pages_per_file", 20)))
+        scale_to_a3 = bool(bundle.get("scale_to_a3", False))
+        treat_survey = bool(bundle.get("treat_survey", True))
+        survey_size_limit_bytes = int(bundle.get("survey_size_limit_bytes", 1_200_000))
+        dedupe_pages = bool(bundle.get("dedupe_pages", True))
+        dedupe_surveys = bool(bundle.get("dedupe_surveys", False))
+        if not processed:
+            messagebox.showinfo("No Matches", "No pages matched; nothing to save.")
+            self.lbl_status.config(text="No matches.")
+            self._write_not_surveyed_csv(out_dir, root_name, week_number,
+                                         [original_map.get(p, p) for p in sorted(ecs_primary)])
+            return
+
+        used_review = bool(self.review_pages_var.get())
+        if used_review:
+            items = [{
+                "display": p["display"],
+                "pdf_path": p["pdf_path"],
+                "hit_pages": p["hit_pages"],
+                "rects_by_page": p["rects_by_page"],
+                "page_codes": p.get("page_codes", {})
+            } for p in processed]
+            dlg = ReviewDialog(self, items)
+            self.wait_window(dlg)
+            if dlg.selection is None:
+                self.lbl_status.config(text="Review canceled.")
+                return
+            if isinstance(dlg.selection, dict) and "keep_map" in dlg.selection:
+                keep_map = dlg.selection["keep_map"]
+                ordered_kept = dlg.selection.get("sequence", [])
+            else:
+                keep_map = dlg.selection
+                ordered_kept = None
+        else:
+            keep_map = {p["pdf_path"]: set(p["hit_pages"]) for p in processed}
+            ordered_kept = None
+
+        building_buckets = defaultdict(list)
+        seen_hashes = set()
+        audit_log = []
+        room_cache = {}
+
+        def add_item_if_ok(pdf_path, pg, rects, pretty_codes_for_pg, is_survey: bool):
+            # 1) New summary rule: for PDFs > 1 MB, discard pages containing "Summary" or "Table of Contents"
+            if (not is_survey) and is_summary_keyword_page_bigpdf(pdf_path, pg):
+                audit_log.append({
+                    "reason": "summary_keyword_bigpdf",
+                    "file": os.path.basename(pdf_path),
+                    "page": int(pg) + 1,
+                    "codes_on_page": ", ".join(sorted(set(pretty_codes_for_pg))),
+                })
+                return
+            # 2) De-dup
+            if dedupe_pages and (not is_survey or dedupe_surveys):
+                fp = page_fingerprint(pdf_path, pg)
+                # Opcional: incluir código no fingerprint de surveys (se dedupe_surveys marcado)
+                if is_survey and dedupe_surveys and pretty_codes_for_pg:
+                    fp = fp + "::" + "|".join(sorted(pretty_codes_for_pg))
+                if fp in seen_hashes:
+                    audit_log.append({
+                        "reason": "duplicate_page",
+                        "file": os.path.basename(pdf_path),
+                        "page": int(pg) + 1,
+                        "codes_on_page": ", ".join(sorted(set(pretty_codes_for_pg))),
+                    })
+                    return
+                seen_hashes.add(fp)
+
+            # 3) Bucket por prédio
+            bld = "UNKWN"
+            if pretty_codes_for_pg:
+                inferred = [infer_building_from_code(c) for c in pretty_codes_for_pg]
+                cnt = Counter(inferred)
+                max_freq = max(cnt.values())
+                bld = sorted([b for b, f in cnt.items() if f == max_freq])[0]
+            building_buckets[bld].append({
+                "pdf_path": pdf_path,
+                "page_idx": pg,
+                "rects": rects,
+                "is_survey": bool(is_survey),
+                "room_loc": room_loc if is_survey else "",
+                "row_bands": row_bands if (is_survey and row_bands) else []
+            })
+
+        # Preenche buckets (respeita regra “survey duplica por código”)
+        for p in processed:
+            pdf_path = p["pdf_path"]
+            rects_by_page = p["rects_by_page"]
+            code_rects_by_page = p["code_rects_by_page"]
+            page_codes = p.get("page_codes", {})
+            keep_pages = sorted(list(keep_map.get(pdf_path, set())))
+            is_survey = treat_survey and is_survey_pdf(pdf_path, size_limit_bytes=survey_size_limit_bytes)
+
+            room_loc = ""
+            if is_survey:
+                room_loc = room_cache.get(pdf_path, "")
+                if room_loc == "":
+                    room_loc = get_room_section_location(pdf_path)
+                    room_cache[pdf_path] = room_loc
+
+            for pg in keep_pages:
+                # Resolve codes for this page with unit-aware rules
+                cmp_list = p.get("page_cmp_keys", {}).get(pg, [])
+                pretty_codes = []
+                full_bases_on_page = set()
+
+                # Full-key matches (unit-specific)
+                for ck in cmp_list:
+                    if ck in nosep_to_primary:
+                        primary = nosep_to_primary.get(ck, ck)
+                        pr = original_map.get(primary, primary)
+                        pretty_codes.append(pr)
+                        _u, _base, _pref = split_unit_and_base_from_nosep(ck)
+                        if _base:
+                            full_bases_on_page.add(_base)
+
+                # Base-key matches (unitless in PDF)
+                for ck in cmp_list:
+                    if ck in nosep_to_primary:
+                        continue
+                    _u, base_key, pref = split_unit_and_base_from_nosep(ck)
+                    if not base_key:
+                        base_key = ck
+                    candidates = base_to_primaries.get(base_key, [])
+                    if not candidates:
+                        continue
+
+                    is_survey = treat_survey and is_survey_pdf(pdf_path, size_limit_bytes=survey_size_limit_bytes)
+
+                    if is_survey:
+                        # Surveys require unit: ignore ambiguous base matches
+                        if base_key in full_bases_on_page:
+                            continue
+                        if len(candidates) == 1:
+                            primary = candidates[0]
+                            pretty_codes.append(original_map.get(primary, primary))
+                        else:
+                            continue
+                    else:
+                        # Drawings: keep unitless by default; HG requires unit unless code is explicitly shown with leading '-'
+                        if pref in UNIT_REQUIRED_DRAWING_PREFIXES:
+                            try:
+                                with fitz.open(pdf_path) as _d:
+                                    _pg = _d.load_page(pg)
+                                    _txt = normalize_nosep(_pg.get_text("text") or "")
+                                    if ("-" + base_key) in _txt:
+                                        primary = candidates[0]
+                                        pretty_codes.append(pretty_base_from_pretty(original_map.get(primary, primary)))
+                                    else:
+                                        continue
+                            except Exception:
+                                continue
+                        else:
+                            primary = candidates[0]
+                            pretty_codes.append(pretty_base_from_pretty(original_map.get(primary, primary)))
+
+                pretty_codes = sorted(set(pretty_codes))
+                if is_survey and pretty_codes:
+                    for pretty in sorted(pretty_codes):
+                        cmp_key = normalize_nosep(pretty)
+                        per_code_rects = code_rects_by_page.get(pg, {}).get(cmp_key, [])
+                        if not per_code_rects:
+                            per_code_rects = rects_by_page.get(pg, [])
+                        # Full-row band highlight across table width
+                        row_bands = []
+                        try:
+                            if per_code_rects:
+                                with fitz.open(pdf_path) as _sd:
+                                    _spg = _sd.load_page(pg)
+                                    rb = compute_row_band_rect(_spg, per_code_rects[0], x_margin=20, y_pad=1.5)
+                                    if rb:
+                                        row_bands = [rb]
+                        except Exception:
+                            row_bands = []
+                        add_item_if_ok(pdf_path, pg, per_code_rects, [pretty], is_survey)
+                else:
+                    rects = rects_by_page.get(pg, [])
+                    add_item_if_ok(pdf_path, pg, rects, pretty_codes, is_survey)
+
+        # Respeita ordem manual, se houver
+        if ordered_kept:
+            new_buckets = defaultdict(list)
+            for (pdf_path, pg) in ordered_kept:
+                for bld, lst in building_buckets.items():
+                    for it in lst:
+                        if it["pdf_path"] == pdf_path and it.get("page_idx") == pg:
+                            new_buckets[bld].append(it)
+            for bld, lst in building_buckets.items():
+                for it in lst:
+                    if it not in new_buckets[bld]:
+                        new_buckets[bld].append(it)
+            building_buckets = new_buckets
+        else:
+            for bld, lst in building_buckets.items():
+                lst.sort(key=lambda it: (os.path.basename(it["pdf_path"]).lower(), it["page_idx"]))
+
+        # Salvar PDFs por prédio/part
+        saved_files = []
+        for bld, lst in sorted(building_buckets.items(), key=lambda kv: kv[0]):
+            if not lst:
+                continue
+            part_idx = 1
+            for chunk in chunk_list(lst, pages_per_file):
+                tag = sanitize_filename(root_name) or "Job"
+                fname = f"{tag}_{bld}_Highlighted_WK{week_number}_part{part_idx}.pdf"
+                out_path = os.path.join(out_dir, fname)
+                try:
+                    final_path = combine_pages_to_new(out_path, chunk,
+                                                      use_text_annotations=use_text_annotations,
+                                                      scale_to_a3=scale_to_a3)
+                    if final_path:
+                        saved_files.append(final_path)
+                except Exception as e:
+                    messagebox.showerror("Combine", f"Could not save {fname}:\n{e}")
+                part_idx += 1
+
+        if saved_files:
+            self.lbl_status.config(text=f"Saved {len(saved_files)} file(s)")
+            messagebox.showinfo("Done", "Outputs saved:\n" + "\n".join(saved_files))
+        else:
+            self.lbl_status.config(text="No output files saved.")
+
+        # Resumo por código
+        primary_file_pages = defaultdict(lambda: defaultdict(set))
+        for cmp_key, file_map in agg_code_file_pages.items():
+            primary = nosep_to_primary.get(cmp_key, cmp_key)
+            for fn, pages in file_map.items():
+                primary_file_pages[primary][fn] = set(pages)
+
+        rows = []
+        found_primary = set()
+        for primary in sorted(primary_file_pages.keys()):
+            total_pages = sum(len(pages) for pages in primary_file_pages[primary].values())
+            found_primary.add(primary)
+            pretty = original_map.get(primary, primary)
+            breakdown = "; ".join(f"{fn}:{len(sorted(list(pages)))}"
+                                  for fn, pages in sorted(primary_file_pages[primary].items()))
+            rows.append({"code": pretty, "total_pages": total_pages, "breakdown": breakdown})
+
+        missing_primary = sorted(list(ecs_primary - found_primary))
+        summary_csv = self._write_summary_csv(out_dir, root_name, week_number, rows)
+        self._write_not_surveyed_csv(out_dir, root_name, week_number,
+                                     [original_map.get(p, p) for p in missing_primary])
+
+        # Auditoria
+        if audit_log:
+            try:
+                audit_df = pd.DataFrame(audit_log, columns=["reason", "file", "page", "codes_on_page"])
+                tag = sanitize_filename(root_name) or "Job"
+                audit_csv = os.path.join(out_dir, f"{tag}_AuditLog_WK{week_number}.csv")
+                audit_df.to_csv(uniquify_path(audit_csv), index=False)
+            except Exception:
+                pass
+
+        # Cover Sheet (se DB externa carregada)
+        try:
+            if getattr(self, "external_db_df", None) is not None:
+                matched_pretty = [original_map.get(p, p) for p in sorted(found_primary)]
+                cover_path = self._generate_cover_sheet_pdf(out_dir, root_name, week_number,
+                                                            self.external_db_df, matched_pretty_codes=matched_pretty,
+                                                            scale_to_a3=scale_to_a3)
+                if cover_path:
+                    self.lbl_status.config(text=f"Cover Sheet saved: {os.path.basename(cover_path)}")
+        except Exception as e:
+            messagebox.showwarning("Cover Sheet", f"Falha ao gerar Cover Sheet:\n{e}")
+
+        SummaryDialog(self, rows, len(missing_primary), summary_csv)
+
+    # ===== CSVs & Cover =====
+    def _write_summary_csv(self, out_dir, root_name, week_number, rows):
+        tag = sanitize_filename(root_name) or "Job"
+        csv_path = os.path.join(out_dir, f"{tag}_MatchesSummary_WK{week_number}.csv")
+        csv_path = uniquify_path(csv_path)
+        try:
+            base_df = pd.DataFrame(rows, columns=["code", "total_pages", "breakdown"])
+            base_df.to_csv(csv_path, index=False)
+            # enriquecido
+            if getattr(self, "external_db_map", None):
+                enriched = []
+                for r in rows:
+                    nb = normalize_base(r["code"])
+                    db_row = self.external_db_map.get(nb, {})
+                    enriched.append({**r, **db_row})
+                big = pd.DataFrame(enriched)
+                big_csv = os.path.join(out_dir, f"{tag}_MatchesWithDB_WK{week_number}.csv")
+                big_csv = uniquify_path(big_csv)
+                big.to_csv(big_csv, index=False)
+        except Exception as e:
+            messagebox.showwarning("CSV", f"Could not save MatchesSummary CSV:\n{e}")
+        return csv_path
+
+    def _write_not_surveyed_csv(self, out_dir, root_name, week_number, not_found_pretty_list):
+        if not not_found_pretty_list:
+            return None
+        tag = sanitize_filename(root_name) or "Job"
+        csv_path = os.path.join(out_dir, f"{tag}_NotSurveyed_WK{week_number}.csv")
+        csv_path = uniquify_path(csv_path)
+        try:
+            pd.DataFrame({"ECS_Code_Not_Found": sorted(not_found_pretty_list)}).to_csv(csv_path, index=False)
+            self.lbl_status.config(text=f"CSV saved: {os.path.basename(csv_path)}")
+        except Exception as e:
+            messagebox.showwarning("CSV", f"Could not save NotSurveyed CSV:\n{e}")
+        return csv_path
+
+    def _draw_table_page(self, page, df, margin=36, row_h=16, header_fill=(0.92, 0.92, 0.92)):
+        width, height = float(page.rect.width), float(page.rect.height)
+        x = margin
+        y = margin + 24
+        max_rows = int((height - 2*margin - 30) // row_h) - 1  # -1 header
+        cols = list(df.columns)
+        weights = [max(6, len(str(c))) for c in cols]
+        total_w = sum(weights)
+        col_widths = [(w/total_w) * (width - 2*margin) for w in weights]
+
+        # header
+        page.draw_rect(fitz.Rect(x, y, width - margin, y + row_h), color=(0, 0, 0), fill=header_fill)
+        cx = x
+        for i, c in enumerate(cols):
+            page.insert_text(fitz.Point(cx+2, y + row_h - 4), str(c), fontsize=9)
+            cx += col_widths[i]
+        y += row_h
+
+        # linhas
+        end = min(len(df), max_rows)
+        for r in range(0, end):
+            cx = x
+            for i, c in enumerate(cols):
+                txt = "" if pd.isna(df.iloc[r][c]) else str(df.iloc[r][c])
+                page.insert_textbox(fitz.Rect(cx+2, y+1, cx+col_widths[i]-2, y+row_h-2),
+                                    txt, fontsize=8, align=fitz.TEXT_ALIGN_LEFT)
+                cx += col_widths[i]
+            y += row_h
+        return end
+
+    def _generate_cover_sheet_pdf(self, out_dir, root_name, week_number, external_df, matched_pretty_codes, scale_to_a3=False):
+        if external_df is None or external_df.empty or not matched_pretty_codes:
+            return None
+        cols_candidate = [c for c in external_df.columns if str(c).strip().lower() in ("ecs code", "ecs codes")]
+        if not cols_candidate:
+            return None
+        ecs_col = cols_candidate[0]
+        matched_norm = {normalize_base(c) for c in matched_pretty_codes if c}
+        filt_rows = []
+        for _, row in external_df.iterrows():
+            raw = "" if pd.isna(row[ecs_col]) else str(row[ecs_col])
+            candidates = [t.strip() for t in re.split(r"[,\n;/\t ]+", raw) if t.strip()]
+            if any(normalize_base(t) in matched_norm for t in candidates):
+                filt_rows.append(dict(row))
+        if not filt_rows:
+            return None
+        df = pd.DataFrame(filt_rows)
+        tag = sanitize_filename(root_name) or "Job"
+        cover_path = os.path.join(out_dir, f"{tag}_Cover Sheet_WK{week_number}.pdf")
+        cover_path = uniquify_path(cover_path)
+        tw, th = (A3_PORTRAIT if scale_to_a3 else (595.0, 842.0))  # A4 portrait
+        doc = fitz.open()
+        try:
+            remaining = df.copy()
+            while len(remaining) > 0:
+                page = doc.new_page(width=tw, height=th)
+                title = f"{tag} — Cover Sheet — WK{week_number}"
+                page.insert_text(fitz.Point(36, 24), title, fontsize=14, fontname="helv")
+                page.draw_line(fitz.Point(36, 28), fitz.Point(tw-36, 28), color=(0, 0, 0), width=0.7)
+                drawn = self._draw_table_page(page, remaining, margin=36, row_h=18, header_fill=(0.92, 0.92, 0.92))
+                if drawn <= 0:
+                    break
+                remaining = remaining.iloc[drawn:].reset_index(drop=True)
+            if doc.page_count > 0:
+                doc.save(cover_path)
+                return cover_path
+        finally:
+            doc.close()
+        return None
+
+
+# ================================ main ==================================
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    try:
+        app = HighlighterApp()
+        app.mainloop()
+    except Exception as e:
+        try:
+            messagebox.showerror("Fatal Error", str(e))
+        except Exception:
+            pass
+        sys.exit(1)
