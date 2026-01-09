@@ -498,17 +498,18 @@ def infer_building_from_code(pretty_code: str) -> str:
 # ========================= Survey / Duplicatas / Rev ====================
 def is_survey_pdf(path, size_limit_bytes=1_200_000):
     """
-    Detects whether a PDF should be treated as a Survey (Cut Length Report).
+    Detecta se um PDF deve ser tratado como Survey (Cut Length Report).
 
-    Robust name matching:
-    - Accepts variants like:
+    Robustez no nome:
+    - Aceita variações com espaços/underscore/hífen, por exemplo:
       - "Cut L Report ..."
       - "Cut Length Report ..."
       - "Cut_Length_Report ..."
       - "Cut-Length-Report ..."
-    Size gate:
-    - By default keeps the historical behavior (<= size_limit_bytes).
-    - If size_limit_bytes is None or <= 0, the size gate is disabled.
+
+    Gate de tamanho:
+    - Mantém o comportamento histórico (<= size_limit_bytes).
+    - Se size_limit_bytes for None ou <= 0, ignora o gate de tamanho.
     """
     try:
         sz = os.path.getsize(path)
@@ -516,11 +517,10 @@ def is_survey_pdf(path, size_limit_bytes=1_200_000):
         sz = 0
 
     fname = os.path.basename(path) or ""
-    # Normalize separators so underscores/dashes/spaces behave the same
     name = unify_dashes(fname).lower()
+    # Normaliza separadores para espaço único
     name_norm = re.sub(r"[_\-\s]+", " ", name).strip()
 
-    # Match "cut l report" and "cut length report" (and close variants)
     looks_name = bool(re.search(r"\bcut\s+(?:l|length)\s+report\b", name_norm))
 
     if not looks_name or sz <= 0:
@@ -536,6 +536,7 @@ def is_survey_pdf(path, size_limit_bytes=1_200_000):
         return True
 
     return sz <= lim
+
 
 
 # Fingerprints de página
@@ -1965,32 +1966,161 @@ class HighlighterApp(tk.Tk):
             messagebox.showwarning("CSV", f"Could not save NotSurveyed CSV:\n{e}")
         return csv_path
 
-    # ====== Cover Sheet generator =====
-    def _generate_cover_sheet_pdf(self, out_dir, root_name, week_number, df, matched_prety_codes, scale_to_a3=False):
-        # Placeholder: mantém compatibilidade caso já exista implementação completa no seu arquivo local.
-        # Se você já tem essa função completa, substitua este corpo pelo seu original.
-        try:
-            tag = sanitize_filename(root_name) or "Job"
-            out_path = os.path.join(out_dir, f"{tag}_CoverSheet_WK{week_number}.pdf")
-            out_path = uniquify_path(out_path)
-            doc = fitz.open()
-            w, h = (A3_LANDSCAPE if scale_to_a3 else (595.0, 842.0))
-            page = doc.new_page(width=w, height=h)
-            page.insert_text((36, 48), f"Cover Sheet - {tag} - WK{week_number}", fontsize=18, fontname="helv")
-            page.insert_text((36, 80), f"Matched codes: {len(matched_prety_codes)}", fontsize=12, fontname="helv")
-            y = 110
-            for c in matched_prety_codes[:60]:
-                page.insert_text((36, y), str(c), fontsize=10, fontname="helv")
-                y += 14
-                if y > h - 40:
-                    break
-            doc.save(out_path)
-            doc.close()
-            return out_path
-        except Exception:
+    def _draw_table_page(self, page, df, margin=36, row_h=18, header_fill=(0.92, 0.92, 0.92),
+                         fontfile=None, fontsize=10):
+        width, height = float(page.rect.width), float(page.rect.height)
+        x_left = margin
+        x_right = width - margin
+        y = margin + 24
+
+        cols = list(df.columns)
+
+        sample_rows = min(100, len(df))
+        col_weights = []
+        for c in cols:
+            w = max(len(str(c)), max((len(str(df.iloc[i][c])) for i in range(sample_rows)), default=0))
+            col_weights.append(max(6, w))
+        total_w = sum(col_weights)
+        col_widths = [(w / total_w) * (x_right - x_left) for w in col_weights]
+
+        header_top = y
+        header_bottom = y + row_h
+        page.draw_rect(fitz.Rect(x_left, header_top, x_right, header_bottom), color=(0, 0, 0), fill=header_fill)
+
+        font_kwargs = _text_font_kwargs(fontfile)
+
+        cx = x_left
+        for i, c in enumerate(cols):
+            cell_rect = fitz.Rect(cx, header_top, cx + col_widths[i], header_bottom)
+            page.draw_rect(cell_rect, color=(0, 0, 0), width=0.7)
+            page.insert_textbox(
+                cell_rect,
+                str(c),
+                fontsize=fontsize,
+                align=fitz.TEXT_ALIGN_LEFT,
+                **font_kwargs,
+            )
+            cx += col_widths[i]
+        y = header_bottom
+
+        max_rows = int((height - y - margin) // row_h)
+
+        end = min(len(df), max_rows)
+        for r in range(end):
+            row_top = y
+            row_bottom = y + row_h
+            cx = x_left
+            for i, c in enumerate(cols):
+                cell_rect = fitz.Rect(cx, row_top, cx + col_widths[i], row_bottom)
+                page.draw_rect(cell_rect, color=(0, 0, 0), width=0.5)
+                txt = "" if pd.isna(df.iloc[r][c]) else str(df.iloc[r][c])
+                page.insert_textbox(
+                    fitz.Rect(cx + 2, row_top + 1, cx + col_widths[i] - 2, row_bottom - 1),
+                    txt,
+                    fontsize=fontsize,
+                    align=fitz.TEXT_ALIGN_LEFT,
+                    **font_kwargs,
+                )
+                cx += col_widths[i]
+            y = row_bottom
+
+        return end
+
+    def _generate_cover_sheet_pdf(self, out_dir, root_name, week_number, external_df, matched_pretty_codes, scale_to_a3=False):
+        if external_df is None or external_df.empty or not matched_pretty_codes:
             return None
+        cols_candidate = [c for c in external_df.columns if str(c).strip().lower() in ("ecs code", "ecs codes")]
+        if not cols_candidate:
+            return None
+        ecs_col = cols_candidate[0]
+
+        matched_norm = {normalize_base(c) for c in matched_pretty_codes if c}
+        filt_rows = []
+        for _, row in external_df.iterrows():
+            raw = "" if pd.isna(row[ecs_col]) else str(row[ecs_col])
+            candidates = [t.strip() for t in re.split(r"[,;\n/\t ]+", raw) if t.strip()]
+            if any(normalize_base(t) in matched_norm for t in candidates):
+                filt_rows.append(dict(row))
+        if not filt_rows:
+            return None
+        df_full = pd.DataFrame(filt_rows)
+
+        # Seleção de colunas por letras
+        wanted_letters = ["B", "G", "H", "I", "J", "K", "L", "N", "O", "P", "Q", "S", "T", "U"]
+        idxs = _excel_letters_to_indices(wanted_letters, df_full)
+        if not idxs:
+            return None
+        df = df_full.iloc[:, idxs].copy()
+        df.columns = [str(c).strip() for c in df.columns]
+
+        tag = sanitize_filename(root_name) or "Job"
+        cover_path = os.path.join(out_dir, f"{tag}_Cover Sheet_WK{week_number}.pdf")
+        cover_path = uniquify_path(cover_path)
+        tw, th = (A3_PORTRAIT if scale_to_a3 else (595.0, 842.0))  # A4 retrato
+
+        calibri_ttf = _find_calibri_fontfile()
+        font_kwargs = _text_font_kwargs(calibri_ttf)
+
+        doc = fitz.open()
+        try:
+            remaining = df.copy()
+            while len(remaining) > 0:
+                page = doc.new_page(width=tw, height=th)
+                title = f"{tag} — Cover Sheet — WK{week_number}"
+                page.insert_text(
+                    fitz.Point(36, 24),
+                    title,
+                    fontsize=12,
+                    **font_kwargs,
+                )
+                page.draw_line(fitz.Point(36, 28), fitz.Point(tw - 36, 28), color=(0, 0, 0), width=0.7)
+
+                drawn = self._draw_table_page(
+                    page,
+                    remaining,
+                    margin=36,
+                    row_h=18,
+                    header_fill=(0.92, 0.92, 0.92),
+                    fontfile=calibri_ttf,
+                    fontsize=10,
+                )
+                if drawn <= 0:
+                    break
+                remaining = remaining.iloc[drawn:].reset_index(drop=True)
+            if doc.page_count > 0:
+                doc.save(cover_path)
+                return cover_path
+        finally:
+            doc.close()
+        return None
 
 
+# ============================ DB externa util ============================
+def load_external_db_from_xlsx(xlsx_path):
+    df = pd.read_excel(xlsx_path, dtype=str, engine="openpyxl")
+    cand_cols = [c for c in df.columns if str(c).strip().lower() in ("ecs code", "ecs codes")]
+    idx = {}
+    if cand_cols:
+        c = cand_cols[0]
+        for _, row in df.iterrows():
+            raw = "" if pd.isna(row[c]) else str(row[c])
+            tokens = [t.strip() for t in re.split(r"[,;\n/\t ]+", raw) if t.strip()]
+            for t in tokens:
+                nb = normalize_base(t)
+                if nb:
+                    idx[nb] = dict(row)
+    return df, idx
+
+
+# ================================ main ==================================
 if __name__ == "__main__":
-    app = HighlighterApp()
-    app.mainloop()
+    multiprocessing.freeze_support()
+    try:
+        app = HighlighterApp()
+        app.mainloop()
+    except Exception as e:
+        try:
+            messagebox.showerror("Fatal Error", str(e))
+        except Exception:
+            pass
+        sys.exit(1)
