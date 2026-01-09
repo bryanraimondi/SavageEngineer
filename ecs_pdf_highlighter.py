@@ -371,6 +371,27 @@ def add_text_highlights(page, rects, color=(1, 1, 0), opacity=0.35):
         ann.update()
 
 
+
+def stamp_filename_top_left(page, filename: str, margin=100, box_w=800, box_h=40, fontsize=12):
+    """Stamp survey filename (without .pdf) at top-left. Uses Arial if available, else Helvetica."""
+    if not filename:
+        return
+    try:
+        name = os.path.splitext(os.path.basename(str(filename)))[0]
+        if not name:
+            return
+        r = page.rect
+        box = fitz.Rect(margin, margin, min(r.width - margin, margin + box_w), margin + box_h)
+
+        arial = r"C:\Windows\Fonts\arial.ttf"
+        if os.path.exists(arial):
+            page.insert_textbox(box, name, fontsize=fontsize, fontfile=arial, align=fitz.TEXT_ALIGN_LEFT)
+        else:
+            page.insert_textbox(box, name, fontsize=fontsize, fontname="helv", align=fitz.TEXT_ALIGN_LEFT)
+    except Exception:
+        pass
+
+
 def _fit_scale_and_offset(src_w, src_h, dst_w, dst_h):
     if src_w <= 0 or src_h <= 0:
         return 1.0, 0.0, 0.0
@@ -408,6 +429,9 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_
                 # Copia a página exatamente como está (mantém rotação/crop/coords)
                 out.insert_pdf(src, from_page=pg_idx, to_page=pg_idx)
                 out_pg = out.load_page(out.page_count - 1)
+                # Stamp survey filename at top-left (Arial 12). Uses file name without .pdf
+                if it.get("type") == "Survey":
+                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path), margin=100, fontsize=12)
                 if use_text_annotations and rects:
                     add_text_highlights(out_pg, rects, color=(1, 1, 0), opacity=0.35)
             else:
@@ -419,6 +443,9 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_
                 out_pg = out.new_page(width=tw, height=th)
                 dst_rect = fitz.Rect(0, 0, tw, th)
                 out_pg.show_pdf_page(dst_rect, src, pg_idx)
+                # Stamp survey filename at top-left (Arial 12). Uses file name without .pdf
+                if it.get("type") == "Survey":
+                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path), margin=100, fontsize=12)
                 # Ajustar rects para o novo tamanho
                 s, dx, dy = _fit_scale_and_offset(sw, sh, tw, th)
                 if use_text_annotations and rects:
