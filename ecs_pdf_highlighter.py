@@ -623,6 +623,25 @@ def _fit_scale_and_offset(src_w, src_h, dst_w, dst_h):
     return s, dx, dy
 
 
+def _rotate_rects_90_cw(rects, src_w, src_h):
+    """Rotate rectangles 90 degrees clockwise from a src (w,h) space to dst (h,w)."""
+    if not rects:
+        return rects
+    out = []
+    for (x0, y0, x1, y1) in rects:
+        # Normalize ordering just in case
+        if x1 < x0:
+            x0, x1 = x1, x0
+        if y1 < y0:
+            y0, y1 = y1, y0
+        nx0 = src_h - y1
+        ny0 = x0
+        nx1 = src_h - y0
+        ny1 = x1
+        out.append((nx0, ny0, nx1, ny1))
+    return out
+
+
 def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_to_a3=False):
     """
     Insere as páginas EXATAMENTE na ordem dada por page_units (sem agrupar por PDF).
@@ -644,22 +663,29 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_
             src_pg = src.load_page(pg_idx)
 
             if not scale_to_a3:
-                # Copia a página exatamente como está (mantém rotação/crop/coords)
-                out.insert_pdf(src, from_page=pg_idx, to_page=pg_idx)
-                out_pg = out.load_page(out.page_count - 1)
-                # --- Survey orientation normalization ---
-                if it.get("type") == "Survey":
-                    try:
-                        # If the page is portrait with rotation 0, rotate for landscape display
-                        if out_pg.rotation == 0 and out_pg.rect.height > out_pg.rect.width:
-                            out_pg.set_rotation(90)
-                        # If the page has rotation 90/270, align cropbox so text coordinates stay consistent
-                        if out_pg.rotation in (90, 270):
-                            w = float(out_pg.rect.height)
-                            h = float(out_pg.rect.width)
-                            out_pg.set_cropbox(fitz.Rect(0, 0, w, h))
-                    except Exception:
-                        pass
+                # Drawings: copy page as-is (keeps rotation/crop/coords)
+                if it.get("type") != "Survey":
+                    out.insert_pdf(src, from_page=pg_idx, to_page=pg_idx)
+                    out_pg = out.load_page(out.page_count - 1)
+                else:
+                    # Surveys: normalize page to LANDSCAPE *before* any highlight/stamp by rendering
+                    # the visual page into a fresh page with rotation=0 and consistent mediabox/cropbox.
+                    b = src_pg.bound()  # visual bound (respects rotation/crop)
+                    sw, sh = float(b.width), float(b.height)
+
+                    if sw >= sh:
+                        tw, th = sw, sh
+                        rotate = 0
+                        rects = rects  # no-op
+                    else:
+                        # Force landscape: rotate visual page 90° clockwise into a (h,w) page
+                        tw, th = sh, sw
+                        rotate = 90
+                        rects = _rotate_rects_90_cw(rects, sw, sh)
+
+                    out_pg = out.new_page(width=tw, height=th)
+                    dst_rect = fitz.Rect(0, 0, tw, th)
+                    out_pg.show_pdf_page(dst_rect, src, pg_idx, rotate=rotate)
 
                 # Stamp survey filename at top-left (Arial 12). Uses file name without .pdf
                 if it.get("type") == "Survey":
