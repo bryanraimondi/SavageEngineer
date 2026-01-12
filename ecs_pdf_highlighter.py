@@ -582,12 +582,13 @@ def add_text_highlights(page, rects, color=(1, 1, 0), opacity=0.35):
 
 
 
-def stamp_filename_top_left(page, filename: str, margin: float = 28.346, fontsize: float = 9.0):
-    """Stamp survey filename (without .pdf) at top-left.
+def stamp_filename_top_left(page, filename: str, x_margin: float = 28.346, y_margin: float = 12.0, fontsize: float = 9.0):
+    """Stamp survey filename (without .pdf) at top-left header band.
 
     Requirements:
       - Font size = 9
-      - Margin = 10 mm from edge (≈ 28.346 pt)
+      - X margin = 10 mm from left edge (≈ 28.346 pt)
+      - Y position = fixed header band (default y_margin=12 pt + fontsize) to match the red-bar area
       - No background box
     Uses Arial if available, else Helvetica.
     """
@@ -598,8 +599,10 @@ def stamp_filename_top_left(page, filename: str, margin: float = 28.346, fontsiz
         if not name:
             return
 
-        x = float(margin)
-        y = float(margin) + float(fontsize)
+        x = float(x_margin)
+        # Place text in the header safe-zone (red bar area): closer to top edge than 10mm.
+        # y_margin is the top margin to the TOP of the text; PyMuPDF uses the baseline, so add fontsize.
+        y = float(y_margin) + float(fontsize)
 
         arial = r"C:\\Windows\\Fonts\\arial.ttf"
         if os.path.exists(arial):
@@ -670,7 +673,7 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_
                 else:
                     # Surveys: normalize page to LANDSCAPE *before* any highlight/stamp by rendering
                     # the visual page into a fresh page with rotation=0 and consistent mediabox/cropbox.
-                    b = src_pg.bound()  # visual bound (respects rotation/crop)
+                    b = src_pg.rect  # visual page rect (respects rotation); more reliable than bound() for HOR
                     sw, sh = float(b.width), float(b.height)
 
                     if sw >= sh:
@@ -687,9 +690,9 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_
                     dst_rect = fitz.Rect(0, 0, tw, th)
                     out_pg.show_pdf_page(dst_rect, src, pg_idx, rotate=rotate)
 
-                # Stamp survey filename at top-left (Arial 12). Uses file name without .pdf
+                # Stamp survey filename at top-left (Arial 9, 10mm). Uses file name without .pdf
                 if it.get("type") == "Survey":
-                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path), margin=100, fontsize=12)
+                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path))
                 if use_text_annotations and rects:
                     add_text_highlights(out_pg, rects, color=(1, 1, 0), opacity=0.35)
             else:
@@ -701,9 +704,9 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_
                 out_pg = out.new_page(width=tw, height=th)
                 dst_rect = fitz.Rect(0, 0, tw, th)
                 out_pg.show_pdf_page(dst_rect, src, pg_idx)
-                # Stamp survey filename at top-left (Arial 12). Uses file name without .pdf
+                # Stamp survey filename at top-left (Arial 9, 10mm). Uses file name without .pdf
                 if it.get("type") == "Survey":
-                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path), margin=100, fontsize=12)
+                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path))
                 # Ajustar rects para o novo tamanho
                 s, dx, dy = _fit_scale_and_offset(sw, sh, tw, th)
                 if use_text_annotations and rects:
