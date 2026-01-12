@@ -82,7 +82,7 @@ from typing import List, Dict, Optional
 
 # ======================= Normalização & utilitários =======================
 DASH_CHARS = "-\u2010\u2011\u2012\u2013\u2014\u2212"  # -, ‐, -, ‒, –, —, −
-_STRIP_EDGE_PUNCT = re.compile(r'^[\s\"\'\(\)\[\]\{\}:;,.–—\-]+|[\s\"\'\(\)\[\]\{\}:;,.–—\-]+$')
+_STRIP_EDGE_PUNCT = re.compile(r'^[\s\"\'\(\)\[\]\{\}:;,.–—-]+|[\s\"\'\(\)\[\]\{\}:;,.–—-]+$')
 
 # A3 (72 pt/in)
 A3_PORTRAIT = (842.0, 1191.0)
@@ -207,21 +207,7 @@ def extract_ecs_codes_from_df(df):
     return ecs_set, original_map
 
 
-def build_compare_index(ecs_primary, ignore_leading_digit):
-    cmp_keys = set()
-    nosep_to_primary = {}
-    for primary in ecs_primary:
-        k = normalize_nosep(primary)
-        if k:
-            cmp_keys.add(k)
-            nosep_to_primary[k] = primary
-        if ignore_leading_digit and primary and primary[0].isdigit():
-            k2 = normalize_nosep(primary[1:])
-            if k2:
-                cmp_keys.add(k2)
-                nosep_to_primary[k2] = primary
-    max_code_len = max((len(k) for k in cmp_keys), default=0)
-    return cmp_keys, nosep_to_primary, max_code_len
+# (removed) legacy build_compare_index was deleted per spec
 
 
 def build_contextual_indexes(ecs_primary_all: set):
@@ -662,7 +648,7 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_
                     xfm_rects = rects
                     if use_text_annotations and rects and (src_pg.rotation or 0):
                         try:
-                            rm = src_pg.rotation_matrix
+                            rm = fitz.Matrix(1, 1).preRotate(int(src_pg.rotation or 0))
                             xfm_rects = []
                             for (x0, y0, x1, y1) in rects:
                                 r = fitz.Rect(x0, y0, x1, y1)
@@ -693,7 +679,7 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_
 
                 # Stamp survey filename at top-left (Arial 12). Uses file name without .pdf
                 if it.get("type") == "Survey":
-                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path), margin=100, fontsize=12)
+                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path), margin=28.346, fontsize=9)
                 if use_text_annotations and rects:
                     add_text_highlights(out_pg, rects, color=(1, 1, 0), opacity=0.35)
             else:
@@ -707,7 +693,7 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_
                 out_pg.show_pdf_page(dst_rect, src, pg_idx)
                 # Stamp survey filename at top-left (Arial 12). Uses file name without .pdf
                 if it.get("type") == "Survey":
-                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path), margin=100, fontsize=12)
+                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path), margin=28.346, fontsize=9)
                 # Ajustar rects para o novo tamanho
                 s, dx, dy = _fit_scale_and_offset(sw, sh, tw, th)
                 if use_text_annotations and rects:
@@ -1064,14 +1050,13 @@ def build_itr_map(itr_paths: List[str], cmp_keys: set, nosep_to_primary: Dict[st
         if ext == ".docx":
             pdfp = try_convert_docx_to_pdf(p)
             if not pdfp:
-                messagebox.showwarning("ITR DOCX", f"Não foi possível converter ITR: {os.path.basename(p)}. "
-                                                   f"Instale 'docx2pdf' (requer Microsoft Word).")
-                continue
+                _log(f'ITR DOCX conversion failed: {os.path.basename(p)}')
+            continue
             mapped_pdf = pdfp
         elif ext == ".pdf":
             mapped_pdf = p
         else:
-            messagebox.showwarning("ITR", f"Formato não suportado (somente .docx ou .pdf): {os.path.basename(p)}")
+            _log(f'ITR unsupported format: {os.path.basename(p)}')
             continue
 
         fname_n = normalize_nosep(os.path.basename(p))
