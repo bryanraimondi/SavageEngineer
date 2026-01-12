@@ -467,7 +467,7 @@ def scan_pdf_for_rects_ac(
             cum = [0]
             for n in norms:
                 cum.append(cum[-1] + len(n))
-            S = "".join(norms).join(norms)
+            S = "".join(norms)
             page_rects = []
             rect_key_set = set()
             for end_idx, key in automaton.iter(S):
@@ -2169,4 +2169,10 @@ class HighlighterApp(tk.Tk):
 
     def _generate_cover_sheet_pdf(self, *args, **kwargs):
         return None
-        sys.exit(1)
+
+# --- ENTRY POINT ---
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+    app = HighlighterApp()
+    app.mainloop()
