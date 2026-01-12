@@ -191,6 +191,39 @@ def build_aho_automaton(cmp_keys_nosep):
     return A
 
 
+
+
+
+# ====================== Survey: highlight linha inteira ======================
+def _compute_survey_full_line_rect(page_width: float, words_norm_list, target_rect, y_tol: float = 2.5, margin: float = 1.5):
+    """Return a rect spanning the full line (x=0..page_width) for Survey PDFs.
+
+    words_norm_list: list of tuples (x0,y0,x1,y1,norm,raw) for the page.
+    target_rect: (x0,y0,x1,y1) of a matched token/run.
+    """
+    try:
+        tx0, ty0, tx1, ty1 = target_rect
+        tcy = (ty0 + ty1) * 0.5
+        line = []
+        for (x0, y0, x1, y1, _norm, _raw) in (words_norm_list or []):
+            cy = (y0 + y1) * 0.5
+            if abs(cy - tcy) <= y_tol:
+                line.append((x0, y0, x1, y1))
+                continue
+            ov = min(ty1, y1) - max(ty0, y0)
+            if ov > 0 and ov >= 0.5 * min((ty1 - ty0), (y1 - y0)):
+                line.append((x0, y0, x1, y1))
+        if line:
+            y0 = min(r[1] for r in line)
+            y1 = max(r[3] for r in line)
+        else:
+            y0, y1 = ty0, ty1
+        y0 = max(0.0, y0 - margin)
+        y1 = y1 + margin
+        return (0.0, y0, float(page_width), y1)
+    except Exception:
+        return target_rect
+
 # ============================ Scanners de PDF ===========================
 def scan_pdf_for_rects_fallback(
     pdf_path,
@@ -198,6 +231,7 @@ def scan_pdf_for_rects_fallback(
     max_code_len,
     cancel_flag,
     highlight_all_occurrences=False,
+    survey_full_line=False,
     prefixes=None,
     first_chars=None
 ):
@@ -230,6 +264,9 @@ def scan_pdf_for_rects_fallback(
                     continue
                 W.append(((x0, y0, x1, y1), norm, t))
 
+
+            words_norm_list = [(rx0, ry0, rx1, ry1, nn, rr) for ((rx0, ry0, rx1, ry1), nn, rr) in W]
+
             page_rects = []
             rect_key_set = set()
 
@@ -246,8 +283,13 @@ def scan_pdf_for_rects_fallback(
                             rkey = (round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2))
                             if rkey not in rect_key_set:
                                 rect_key_set.add(rkey)
-                                page_rects.append((x0, y0, x1, y1))
-                            code_rects_by_page[page.number][k].append((x0, y0, x1, y1))
+                                if survey_full_line:
+                                    lr = _compute_survey_full_line_rect(page.rect.width, words_norm_list, (x0, y0, x1, y1))
+                                    page_rects.append(lr)
+                                    code_rects_by_page[page.number][k].append(lr)
+                                else:
+                                    page_rects.append((x0, y0, x1, y1))
+                                    code_rects_by_page[page.number][k].append((x0, y0, x1, y1))
                             hits += 1
 
                 # 2) janela multi-palavra (até 20)
@@ -271,12 +313,21 @@ def scan_pdf_for_rects_fallback(
                         if s in cmp_keys_nosep:
                             code_pages[s].add(page.number)
                             matched.add(s)
-                            for (rx0, ry0, rx1, ry1) in rects_run:
-                                rkey = (round(rx0, 2), round(ry0, 2), round(rx1, 2), round(ry1, 2))
+                            if survey_full_line:
+                                rx0, ry0, rx1, ry1 = rects_run[0]
+                                lr = _compute_survey_full_line_rect(page.rect.width, words_norm_list, (rx0, ry0, rx1, ry1))
+                                rkey = (round(lr[0], 2), round(lr[1], 2), round(lr[2], 2), round(lr[3], 2))
                                 if rkey not in rect_key_set:
                                     rect_key_set.add(rkey)
-                                    page_rects.append((rx0, ry0, rx1, ry1))
-                                code_rects_by_page[page.number][s].append((rx0, ry0, rx1, ry1))
+                                    page_rects.append(lr)
+                                code_rects_by_page[page.number][s].append(lr)
+                            else:
+                                for (rx0, ry0, rx1, ry1) in rects_run:
+                                    rkey = (round(rx0, 2), round(ry0, 2), round(rx1, 2), round(ry1, 2))
+                                    if rkey not in rect_key_set:
+                                        rect_key_set.add(rkey)
+                                        page_rects.append((rx0, ry0, rx1, ry1))
+                                    code_rects_by_page[page.number][s].append((rx0, ry0, rx1, ry1))
                             hits += 1
 
             # 3) fallback texto corrido (marca página mesmo sem rects)
@@ -300,7 +351,8 @@ def scan_pdf_for_rects_ac(
     pdf_path,
     automaton,
     cancel_flag,
-    highlight_all_occurrences=False
+    highlight_all_occurrences=False,
+    survey_full_line=False
 ):
     """Scanner Aho–Corasick (por palavras)."""
     doc = fitz.open(pdf_path)
@@ -318,6 +370,7 @@ def scan_pdf_for_rects_ac(
                 continue
             rects = []
             norms = []
+            raws = []
             for w in words:
                 x0, y0, x1, y1, t = float(w[0]), float(w[1]), float(w[2]), float(w[3]), (w[4] or "")
                 n = normalize_nosep(t)
@@ -325,12 +378,16 @@ def scan_pdf_for_rects_ac(
                     continue
                 rects.append((x0, y0, x1, y1))
                 norms.append(n)
+                raws.append(t)
+
             if not norms:
                 continue
+
+            words_norm_list = [(r[0], r[1], r[2], r[3], nn, rr) for r, nn, rr in zip(rects, norms, raws)]
             cum = [0]
             for n in norms:
                 cum.append(cum[-1] + len(n))
-            S = "".join(norms)
+            S = "".join(norms).join(norms)
             page_rects = []
             rect_key_set = set()
             for end_idx, key in automaton.iter(S):
@@ -341,13 +398,22 @@ def scan_pdf_for_rects_ac(
                     continue
                 code_pages[key].add(page.number)
                 matched.add(key)
-                for k in range(ws, we + 1):
-                    x0, y0, x1, y1 = rects[k]
-                    rkey = (round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2))
+                if survey_full_line:
+                    x0, y0, x1, y1 = rects[ws]
+                    lr = _compute_survey_full_line_rect(page.rect.width, words_norm_list, (x0, y0, x1, y1))
+                    rkey = (round(lr[0], 2), round(lr[1], 2), round(lr[2], 2), round(lr[3], 2))
                     if rkey not in rect_key_set:
                         rect_key_set.add(rkey)
-                        page_rects.append((x0, y0, x1, y1))
-                    code_rects_by_page[page.number][key].append((x0, y0, x1, y1))
+                        page_rects.append(lr)
+                    code_rects_by_page[page.number][key].append(lr)
+                else:
+                    for k in range(ws, we + 1):
+                        x0, y0, x1, y1 = rects[k]
+                        rkey = (round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2))
+                        if rkey not in rect_key_set:
+                            rect_key_set.add(rkey)
+                            page_rects.append((x0, y0, x1, y1))
+                        code_rects_by_page[page.number][key].append((x0, y0, x1, y1))
                 hits += 1
             if page_rects:
                 rects_by_page[page.number] = page_rects
@@ -497,46 +563,13 @@ def infer_building_from_code(pretty_code: str) -> str:
 
 # ========================= Survey / Duplicatas / Rev ====================
 def is_survey_pdf(path, size_limit_bytes=1_200_000):
-    """
-    Detecta se um PDF deve ser tratado como Survey (Cut Length Report).
-
-    Robustez no nome:
-    - Aceita variações com espaços/underscore/hífen, por exemplo:
-      - "Cut L Report ..."
-      - "Cut Length Report ..."
-      - "Cut_Length_Report ..."
-      - "Cut-Length-Report ..."
-
-    Gate de tamanho:
-    - Mantém o comportamento histórico (<= size_limit_bytes).
-    - Se size_limit_bytes for None ou <= 0, ignora o gate de tamanho.
-    """
     try:
         sz = os.path.getsize(path)
     except Exception:
         sz = 0
-
-    fname = os.path.basename(path) or ""
-    name = unify_dashes(fname).lower()
-    # Normaliza separadores para espaço único
-    name_norm = re.sub(r"[_\-\s]+", " ", name).strip()
-
-    looks_name = bool(re.search(r"\bcut\s+(?:l|length)\s+report\b", name_norm))
-
-    if not looks_name or sz <= 0:
-        return False
-
-    if size_limit_bytes is None:
-        return True
-    try:
-        lim = int(size_limit_bytes)
-    except Exception:
-        lim = 0
-    if lim <= 0:
-        return True
-
-    return sz <= lim
-
+    name = os.path.basename(path).lower()
+    looks_name = ("cut l" in name) or ("cut length report" in name)
+    return looks_name and (sz > 0 and sz <= size_limit_bytes)
 
 
 # Fingerprints de página
@@ -697,6 +730,22 @@ def select_latest_non_survey_revisions(pdf_paths: list) -> list:
     return out
 
 
+
+
+def select_latest_revisions_any(pdf_paths: list) -> list:
+    """Keep only the latest REV per base filename (generic, no survey/drawing classification)."""
+    groups = {}
+    for p in pdf_paths:
+        fname = os.path.basename(p)
+        base = _strip_revision_tokens(fname)
+        rev = _parse_revision_from_name(fname)
+        cur = groups.get(base)
+        if cur is None or rev > cur[1]:
+            groups[base] = (p, rev)
+    out = [v[0] for v in groups.values()]
+    out = sorted(set(out), key=lambda x: os.path.basename(x).lower())
+    return out
+
 # ========================== Tarefa do worker (MP) =======================
 class _DummyCancel:
     def is_set(self): return False
@@ -707,7 +756,8 @@ def _process_pdf_task(args):
         pdf_path,
         cmp_keys_list,
         use_ac,
-        highlight_all_occurrences
+        highlight_all_occurrences,
+        survey_full_line
     ) = args
     cancel_flag = _DummyCancel()
     cmp_keys = set(cmp_keys_list)
@@ -718,7 +768,8 @@ def _process_pdf_task(args):
                 pdf_path=pdf_path,
                 automaton=automaton,
                 cancel_flag=cancel_flag,
-                highlight_all_occurrences=highlight_all_occurrences
+                highlight_all_occurrences=highlight_all_occurrences,
+                survey_full_line=bool(survey_full_line)
             )
         else:
             prefixes, first_chars = build_prefixes_and_firstchars(cmp_keys)
@@ -729,6 +780,7 @@ def _process_pdf_task(args):
                 max_code_len=max_code_len,
                 cancel_flag=cancel_flag,
                 highlight_all_occurrences=highlight_all_occurrences,
+                survey_full_line=bool(survey_full_line),
                 prefixes=prefixes,
                 first_chars=first_chars
             )
@@ -1176,7 +1228,6 @@ class HighlighterApp(tk.Tk):
         self.ignore_lead_digit_var = tk.BooleanVar(value=False)
         self.highlight_all_var = tk.BooleanVar(value=True)
         self.use_text_annots_var = tk.BooleanVar(value=True)
-        self.scale_to_a3_var = tk.BooleanVar(value=False)
         self.turbo_var = tk.BooleanVar(value=True)
         self.parallel_var = tk.BooleanVar(value=True)
 
@@ -1188,16 +1239,12 @@ class HighlighterApp(tk.Tk):
         self.keep_latest_survey_rev_var = tk.BooleanVar(value=True)
         self.keep_latest_non_survey_rev_var = tk.BooleanVar(value=True)
 
-        # DB externa (opcional)
-        self.external_db_path = tk.StringVar()
-        self.external_db_df = None
-        self.external_db_map = {}
-
         # ITR
         self.itr_paths = []  # caminhos .docx/.pdf
         self.itr_map = {}    # primary_code -> {'pdf_path', 'pages'}
 
-        self.pdf_list = []
+        self.drawing_pdfs = []
+        self.survey_pdfs = []
         self.cancel_flag = threading.Event()
         self.worker_thread = None
         self.msg_queue = queue.Queue()
@@ -1295,7 +1342,6 @@ class HighlighterApp(tk.Tk):
         ttk.Checkbutton(fr_opts, text="Ignore leading digit in PDF codes", variable=self.ignore_lead_digit_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Highlight every occurrence", variable=self.highlight_all_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Use text highlight annotations", variable=self.use_text_annots_var).pack(side="left", padx=12)
-        ttk.Checkbutton(fr_opts, text="Scale output pages to A3", variable=self.scale_to_a3_var).pack(side="left", padx=12)
 
         # Performance
         fr_perf = ttk.Frame(root_frame); fr_perf.pack(fill="x", **pad)
@@ -1310,15 +1356,6 @@ class HighlighterApp(tk.Tk):
         ttk.Checkbutton(fr_rules, text="Keep only latest Survey REV", variable=self.keep_latest_survey_rev_var).grid(row=3, column=0, sticky="w", padx=6, pady=4)
         ttk.Checkbutton(fr_rules, text="Keep only latest Handbook/Drawings REV", variable=self.keep_latest_non_survey_rev_var).grid(row=3, column=1, columnspan=2, sticky="w", padx=6, pady=4)
 
-        # External DB
-        fr_db = ttk.LabelFrame(root_frame, text="External DB (optional, local .xlsx)"); fr_db.pack(fill="x", **pad)
-        ttk.Label(fr_db, text="DB Excel:").grid(row=0, column=0, sticky="e")
-        ttk.Entry(fr_db, textvariable=self.external_db_path).grid(row=0, column=1, sticky="ew", padx=6)
-        fr_db.columnconfigure(1, weight=1)
-        ttk.Button(fr_db, text="Browse…", command=self._browse_external_db).grid(row=0, column=2, padx=6)
-        ttk.Button(fr_db, text="Load DB", command=self._load_external_db).grid(row=0, column=3, padx=6)
-        ttk.Button(fr_db, text="Clear", command=self._clear_external_db).grid(row=0, column=4, padx=6)
-
         # Excels
         fr_excel = ttk.LabelFrame(root_frame, text="Excel files (ECS Codes)"); fr_excel.pack(fill="x", **pad)
         btns_ex = ttk.Frame(fr_excel); btns_ex.pack(fill="x", padx=6, pady=6)
@@ -1328,14 +1365,25 @@ class HighlighterApp(tk.Tk):
         self.lst_excels = tk.Listbox(fr_excel, height=5, selectmode=tk.EXTENDED)
         self.lst_excels.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
-        # PDFs
-        fr_pdfs = ttk.LabelFrame(root_frame, text="PDFs to Process"); fr_pdfs.pack(fill="both", expand=True, **pad)
-        btns = ttk.Frame(fr_pdfs); btns.pack(fill="x", padx=6, pady=6)
-        ttk.Button(btns, text="Add PDFs…", command=self._add_pdfs).pack(side="left")
-        ttk.Button(btns, text="Remove Selected", command=self._remove_selected_pdfs).pack(side="left", padx=6)
-        ttk.Button(btns, text="Clear List", command=self._clear_pdfs).pack(side="left")
-        self.lst_pdfs = tk.Listbox(fr_pdfs, height=7, selectmode=tk.EXTENDED)
-        self.lst_pdfs.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+
+        # Drawings
+        fr_draw = ttk.LabelFrame(root_frame, text="Drawings (PDFs)"); fr_draw.pack(fill="both", expand=True, **pad)
+        btns_d = ttk.Frame(fr_draw); btns_d.pack(fill="x", padx=6, pady=6)
+        ttk.Button(btns_d, text="Add Drawings…", command=self._add_drawings).pack(side="left")
+        ttk.Button(btns_d, text="Remove Selected", command=self._remove_selected_drawings).pack(side="left", padx=6)
+        ttk.Button(btns_d, text="Clear List", command=self._clear_drawings).pack(side="left")
+        self.lst_drawings = tk.Listbox(fr_draw, height=7, selectmode=tk.EXTENDED)
+        self.lst_drawings.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Surveys (Cut Length Reports)
+        fr_surv = ttk.LabelFrame(root_frame, text="Surveys (Cut Length Reports PDFs)"); fr_surv.pack(fill="both", expand=True, **pad)
+        btns_s = ttk.Frame(fr_surv); btns_s.pack(fill="x", padx=6, pady=6)
+        ttk.Button(btns_s, text="Add Surveys…", command=self._add_surveys).pack(side="left")
+        ttk.Button(btns_s, text="Remove Selected", command=self._remove_selected_surveys).pack(side="left", padx=6)
+        ttk.Button(btns_s, text="Clear List", command=self._clear_surveys).pack(side="left")
+        self.lst_surveys = tk.Listbox(fr_surv, height=6, selectmode=tk.EXTENDED)
+        self.lst_surveys.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
         # ITRs
         fr_itr = ttk.LabelFrame(root_frame, text="ITR files (DOCX or PDF, name must contain the ECS code)"); fr_itr.pack(fill="x", **pad)
@@ -1353,43 +1401,6 @@ class HighlighterApp(tk.Tk):
         ttk.Button(fr_out, text="Select…", command=self._pick_output_dir).pack(side="left")
 
         # (REMOVIDO) Painel Matches — não existe mais
-
-    # ===== Handlers DB externa =====
-    def _browse_external_db(self):
-        p = filedialog.askopenfilename(title="Select External DB Excel", filetypes=[("Excel files", "*.xlsx *.xls")])
-        if p:
-            self.external_db_path.set(p)
-
-    def _load_external_db(self):
-        p = self.external_db_path.get().strip()
-        if not p:
-            messagebox.showwarning("External DB", "Please select a local Excel file first.")
-            return
-        try:
-            df = pd.read_excel(p, dtype=str, engine="openpyxl")
-            # índice por código normalizado
-            cand_cols = [c for c in df.columns if str(c).strip().lower() in ("ecs code", "ecs codes")]
-            idx = {}
-            if cand_cols:
-                c = cand_cols[0]
-                for _, row in df.iterrows():
-                    raw = "" if pd.isna(row[c]) else str(row[c])
-                    tokens = [t.strip() for t in re.split(r"[,;\n/\t ]+", raw) if t.strip()]
-                    for t in tokens:
-                        nb = normalize_base(t)
-                        if nb:
-                            idx[nb] = dict(row)
-            self.external_db_df = df
-            self.external_db_map = idx
-            messagebox.showinfo("External DB", f"Loaded {len(idx)} codes from:\n{os.path.basename(p)}")
-        except Exception as e:
-            messagebox.showerror("External DB", f"Could not load DB:\n{e}")
-
-    def _clear_external_db(self):
-        self.external_db_path.set("")
-        self.external_db_df = None
-        self.external_db_map = {}
-        messagebox.showinfo("External DB", "Cleared external database.")
 
     # ======= Excel / PDF pickers =======
     def _add_excels(self):
@@ -1414,28 +1425,51 @@ class HighlighterApp(tk.Tk):
         self.lst_excels.delete(0, "end")
         self.excel_paths.clear()
 
-    def _add_pdfs(self):
-        paths = filedialog.askopenfilenames(title="Select PDFs", filetypes=[("PDF files", "*.pdf")])
+
+    def _add_drawings(self):
+        paths = filedialog.askopenfilenames(title="Select Drawing PDFs", filetypes=[("PDF files", "*.pdf")])
         if paths:
             for p in paths:
-                if p not in self.pdf_list:
-                    self.pdf_list.append(p)
-                    self.lst_pdfs.insert("end", p)
-
-    def _remove_selected_pdfs(self):
-        sels = list(self.lst_pdfs.curselection())[:: -1]
+                if p not in self.drawing_pdfs:
+                    self.drawing_pdfs.append(p)
+                    self.lst_drawings.insert("end", p)
+    
+    def _remove_selected_drawings(self):
+        sels = list(self.lst_drawings.curselection())[:: -1]
         for i in sels:
-            path = self.lst_pdfs.get(i)
-            self.lst_pdfs.delete(i)
+            path = self.lst_drawings.get(i)
+            self.lst_drawings.delete(i)
             try:
-                self.pdf_list.remove(path)
+                self.drawing_pdfs.remove(path)
             except ValueError:
                 pass
-
-    def _clear_pdfs(self):
-        self.lst_pdfs.delete(0, "end")
-        self.pdf_list.clear()
-
+    
+    def _clear_drawings(self):
+        self.lst_drawings.delete(0, "end")
+        self.drawing_pdfs.clear()
+    
+    def _add_surveys(self):
+        paths = filedialog.askopenfilenames(title="Select Survey PDFs (Cut Length Reports)", filetypes=[("PDF files", "*.pdf")])
+        if paths:
+            for p in paths:
+                if p not in self.survey_pdfs:
+                    self.survey_pdfs.append(p)
+                    self.lst_surveys.insert("end", p)
+    
+    def _remove_selected_surveys(self):
+        sels = list(self.lst_surveys.curselection())[:: -1]
+        for i in sels:
+            path = self.lst_surveys.get(i)
+            self.lst_surveys.delete(i)
+            try:
+                self.survey_pdfs.remove(path)
+            except ValueError:
+                pass
+    
+    def _clear_surveys(self):
+        self.lst_surveys.delete(0, "end")
+        self.survey_pdfs.clear()
+    
     # ====== ITR pickers ======
     def _add_itrs(self):
         paths = filedialog.askopenfilenames(title="Select ITR files", filetypes=[("ITR files", "*.docx *.pdf")])
@@ -1471,10 +1505,11 @@ class HighlighterApp(tk.Tk):
         week = self.week_number.get().strip()
         rootname = self.building_name.get().strip()
         excels = list(self.excel_paths)
-        if not week or not excels or not self.pdf_list:
-            messagebox.showwarning("Input", "Please provide Week, at least ONE Excel, and PDFs.")
+        if not week or not excels or (not self.drawing_pdfs and not self.survey_pdfs):
+            messagebox.showwarning("Input", "Please provide Week, at least ONE Excel, and at least one Drawing or Survey PDF.")
             return
-        out_dir = self.output_dir.get().strip() or os.path.dirname(self.pdf_list[0])
+        first_pdf = (self.drawing_pdfs[0] if self.drawing_pdfs else self.survey_pdfs[0])
+        out_dir = self.output_dir.get().strip() or os.path.dirname(first_pdf)
         self.output_dir.set(out_dir)
         os.makedirs(out_dir, exist_ok=True)
 
@@ -1483,14 +1518,14 @@ class HighlighterApp(tk.Tk):
         self.lbl_status.config(text="Starting…")
 
         args = (
-            week, rootname, list(excels), list(self.pdf_list), list(self.itr_paths), out_dir,
+            week, rootname, list(excels), list(self.drawing_pdfs), list(self.survey_pdfs), list(self.itr_paths), out_dir,
             int(self.pages_per_file_var.get()),
             bool(self.ignore_lead_digit_var.get()),
             bool(self.highlight_all_var.get()),
             bool(self.use_text_annots_var.get()),
             bool(self.turbo_var.get()),
             bool(self.parallel_var.get()),
-            bool(self.scale_to_a3_var.get()),
+            
             bool(self.treat_survey_var.get()),
             int(self.survey_size_limit.get()) * 1024,
             bool(self.dedupe_var.get()),
@@ -1510,9 +1545,9 @@ class HighlighterApp(tk.Tk):
 
     # ===== background worker =====
     def _worker(
-        self, week_number, root_name, excel_paths, pdf_paths, itr_paths, out_dir, pages_per_file,
+        self, week_number, root_name, excel_paths, drawing_paths, survey_paths, itr_paths, out_dir, pages_per_file,
         ignore_leading_digit, highlight_all_occurrences, use_text_annotations,
-        turbo_mode, parallel_mode, scale_to_a3, treat_survey, survey_size_limit_bytes,
+        turbo_mode, parallel_mode, treat_survey, survey_size_limit_bytes,
         dedupe_pages, dedupe_surveys,
         keep_latest_survey_rev, keep_latest_non_survey_rev
     ):
@@ -1545,14 +1580,17 @@ class HighlighterApp(tk.Tk):
             # 2) Filtrar revisões
             if keep_latest_survey_rev:
                 try:
-                    pdf_paths = select_latest_survey_revisions(list(pdf_paths))
+                    survey_paths = select_latest_revisions_any(list(survey_paths))
                 except Exception:
                     pass
             if keep_latest_non_survey_rev:
                 try:
-                    pdf_paths = select_latest_non_survey_revisions(list(pdf_paths))
+                    drawing_paths = select_latest_revisions_any(list(drawing_paths))
                 except Exception:
                     pass
+
+            combined_pdfs = list(drawing_paths) + list(survey_paths)
+            survey_set = set(survey_paths)
 
             # 3) Mapear ITRs (docx/pdf) por código
             try:
@@ -1563,12 +1601,14 @@ class HighlighterApp(tk.Tk):
 
             # 4) Tarefas de scan
             tasks = []
-            for pdf in pdf_paths:
+            for pdf in combined_pdfs:
+                is_survey_task = (pdf in survey_set)
                 tasks.append((
                     pdf,
                     sorted(list(cmp_keys)),
                     bool(turbo_mode and _HAS_AC),
                     bool(highlight_all_occurrences),
+                    bool(is_survey_task),
                 ))
 
             results = []
@@ -1643,6 +1683,7 @@ class HighlighterApp(tk.Tk):
             }
 
             post("review_data", {
+                "survey_paths": list(survey_paths),
                 "processed": processed,
                 "root_name": root_name,
                 "week_number": week_number,
@@ -1653,7 +1694,6 @@ class HighlighterApp(tk.Tk):
                 "nosep_to_primary": dict(nosep_to_primary),
                 "agg_code_file_pages": agg_serializable,
                 "pages_per_file": int(pages_per_file),
-                "scale_to_a3": bool(scale_to_a3),
                 "treat_survey": bool(treat_survey),
                 "survey_size_limit_bytes": int(survey_size_limit_bytes),
                 "dedupe_pages": bool(dedupe_pages),
@@ -1699,9 +1739,9 @@ class HighlighterApp(tk.Tk):
         nosep_to_primary = dict(bundle.get("nosep_to_primary", {}))
         agg_code_file_pages = dict(bundle.get("agg_code_file_pages", {}))
         pages_per_file = max(1, int(bundle.get("pages_per_file", 20)))
-        scale_to_a3 = bool(bundle.get("scale_to_a3", False))
         treat_survey = bool(bundle.get("treat_survey", True))
         survey_size_limit_bytes = int(bundle.get("survey_size_limit_bytes", 1_200_000))
+        survey_set = set(bundle.get("survey_paths", []) or [])
         dedupe_pages = bool(bundle.get("dedupe_pages", True))
         dedupe_surveys = bool(bundle.get("dedupe_surveys", False))
 
@@ -1742,7 +1782,7 @@ class HighlighterApp(tk.Tk):
             keep_pages_base = sorted(list(p["hit_pages"]))
             keep_pages = [pg for pg in keep_pages_base if not _is_summary_or_toc(pdf_path, pg)]
 
-            is_survey_flag = treat_survey and is_survey_pdf(pdf_path, size_limit_bytes=survey_size_limit_bytes)
+            is_survey_flag = bool(treat_survey) and (pdf_path in survey_set)
             unit_type = "Survey" if is_survey_flag else "Drawing"
 
             for pg in keep_pages:
@@ -1882,7 +1922,7 @@ class HighlighterApp(tk.Tk):
                 try:
                     final_path = combine_pages_to_new(out_path, chunk,
                                                       use_text_annotations=use_text_annotations,
-                                                      scale_to_a3=scale_to_a3)
+                                                      scale_to_a3=False)
                     if final_path:
                         saved_files.append(final_path)
                 except Exception as e:
@@ -1919,11 +1959,9 @@ class HighlighterApp(tk.Tk):
 
         # Cover Sheet (se DB externa carregada)
         try:
-            if getattr(self, "external_db_df", None) is not None:
                 matched_pretty = [original_map.get(p, p) for p in sorted(found_primary)]
                 cover_path = self._generate_cover_sheet_pdf(out_dir, root_name, week_number,
-                                                            self.external_db_df, matched_prety_codes=matched_pretty,
-                                                            scale_to_a3=scale_to_a3)
+                                                            scale_to_a3=False)
                 if cover_path:
                     self.lbl_status.config(text=f"Cover Sheet saved: {os.path.basename(cover_path)}")
         except Exception as e:
@@ -1939,16 +1977,6 @@ class HighlighterApp(tk.Tk):
         try:
             base_df = pd.DataFrame(rows, columns=["code", "total_pages", "breakdown"])
             base_df.to_csv(csv_path, index=False)
-            if getattr(self, "external_db_map", None):
-                enriched = []
-                for r in rows:
-                    nb = normalize_base(r["code"])
-                    db_row = self.external_db_map.get(nb, {})
-                    enriched.append({**r, **db_row})
-                big = pd.DataFrame(enriched)
-                big_csv = os.path.join(out_dir, f"{tag}_MatchesWithDB_WK{week_number}.csv")
-                big_csv = uniquify_path(big_csv)
-                big.to_csv(big_csv, index=False)
         except Exception as e:
             messagebox.showwarning("CSV", f"Could not save MatchesSummary CSV:\n{e}")
         return csv_path
@@ -2094,22 +2122,6 @@ class HighlighterApp(tk.Tk):
             doc.close()
         return None
 
-
-# ============================ DB externa util ============================
-def load_external_db_from_xlsx(xlsx_path):
-    df = pd.read_excel(xlsx_path, dtype=str, engine="openpyxl")
-    cand_cols = [c for c in df.columns if str(c).strip().lower() in ("ecs code", "ecs codes")]
-    idx = {}
-    if cand_cols:
-        c = cand_cols[0]
-        for _, row in df.iterrows():
-            raw = "" if pd.isna(row[c]) else str(row[c])
-            tokens = [t.strip() for t in re.split(r"[,;\n/\t ]+", raw) if t.strip()]
-            for t in tokens:
-                nb = normalize_base(t)
-                if nb:
-                    idx[nb] = dict(row)
-    return df, idx
 
 
 # ================================ main ==================================
