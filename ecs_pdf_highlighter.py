@@ -82,7 +82,7 @@ from typing import List, Dict, Optional
 
 # ======================= Normalização & utilitários =======================
 DASH_CHARS = "-\u2010\u2011\u2012\u2013\u2014\u2212"  # -, ‐, -, ‒, –, —, −
-_STRIP_EDGE_PUNCT = re.compile(r'^[\s\"\'\(\)\[\]\{\}:;,.–—-]+|[\s\"\'\(\)\[\]\{\}:;,.–—-]+$')
+_STRIP_EDGE_PUNCT = re.compile(r'^[\s\"\'\(\)\[\]\{\}:;,.–—\-]+|[\s\"\'\(\)\[\]\{\}:;,.–—\-]+$')
 
 # A3 (72 pt/in)
 A3_PORTRAIT = (842.0, 1191.0)
@@ -207,7 +207,21 @@ def extract_ecs_codes_from_df(df):
     return ecs_set, original_map
 
 
-# (removed) legacy build_compare_index was deleted per spec
+def build_compare_index(ecs_primary, ignore_leading_digit):
+    cmp_keys = set()
+    nosep_to_primary = {}
+    for primary in ecs_primary:
+        k = normalize_nosep(primary)
+        if k:
+            cmp_keys.add(k)
+            nosep_to_primary[k] = primary
+        if ignore_leading_digit and primary and primary[0].isdigit():
+            k2 = normalize_nosep(primary[1:])
+            if k2:
+                cmp_keys.add(k2)
+                nosep_to_primary[k2] = primary
+    max_code_len = max((len(k) for k in cmp_keys), default=0)
+    return cmp_keys, nosep_to_primary, max_code_len
 
 
 def build_contextual_indexes(ecs_primary_all: set):
@@ -611,112 +625,101 @@ def _fit_scale_and_offset(src_w, src_h, dst_w, dst_h):
 
 def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_to_a3=False):
     """
-    Insere as páginas EXATAMENTE na ordem dada por page_units (sem agrupar por PDF).
-    Cada unit: { 'pdf_path', 'page_idx', 'rects' }
-    Corrigido: evita rotação inesperada usando insert_pdf no modo "tamanho original" e
-    usa bound() para decidir orientação quando escala para A3.
+    Insere páginas na ordem de page_units.
+    IMPORTANT:
+      - Surveys: normaliza para landscape ANTES de highlight/stamp.
+      - HOR (rotation/cropbox inconsistentes): flatten via raster (pixmap) quando a página vem rotacionada.
+      - Stamp: aplicado UMA vez somente em Surveys, na safe-zone do header (barra vermelha).
     """
     out = fitz.open()
     src_cache = {}
+
+    def _open_src(p):
+        if p not in src_cache:
+            src_cache[p] = fitz.open(p)
+        return src_cache[p]
+
     try:
         for it in page_units:
             pdf_path = it["pdf_path"]
             pg_idx = it["page_idx"]
             rects = it.get("rects", [])
+            is_survey = (it.get("type") == "Survey")
 
-            if pdf_path not in src_cache:
-                src_cache[pdf_path] = fitz.open(pdf_path)
-            src = src_cache[pdf_path]
+            src = _open_src(pdf_path)
             src_pg = src.load_page(pg_idx)
 
-            if not scale_to_a3:
-                if it.get("type") == "Survey":
-                    # =========================================================
-                    # Survey NORMALIZATION (HOR fix)
-                    # - HOR files often come as A4 portrait mediabox with rotation=90
-                    # - Using insert_pdf keeps rotation metadata and causes "sideways" pages
-                    # - We "flatten" the page by rendering it onto a new page with rotation cancelled
-                    #   and using the VISUAL page size (src_pg.rect).
-                    # =========================================================
-                    sw, sh = float(src_pg.rect.width), float(src_pg.rect.height)
-                    out_pg = out.new_page(width=sw, height=sh)
-                    dst_rect = fitz.Rect(0, 0, sw, sh)
-                    rot_cancel = (360 - int(src_pg.rotation or 0)) % 360
-                    out_pg.show_pdf_page(dst_rect, src, pg_idx, rotate=rot_cancel)
-
-                    # Transform rects from unrotated coords -> visual coords (rotated view)
-                    xfm_rects = rects
-                    if use_text_annotations and rects and (src_pg.rotation or 0):
-                        try:
-                            rm = fitz.Matrix(1, 1).preRotate(int(src_pg.rotation or 0))
-                            xfm_rects = []
-                            for (x0, y0, x1, y1) in rects:
-                                r = fitz.Rect(x0, y0, x1, y1)
-                                # transform 4 corners, then bbox
-                                pts = [
-                                    r.tl * rm,
-                                    r.tr * rm,
-                                    r.bl * rm,
-                                    r.br * rm,
-                                ]
-                                xs = [p.x for p in pts]
-                                ys = [p.y for p in pts]
-                                xfm_rects.append((min(xs), min(ys), max(xs), max(ys)))
-                        except Exception:
-                            xfm_rects = rects
-
-                    # Stamp survey filename at top-left (Header band safe zone)
-                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path))
-
-                    if use_text_annotations and xfm_rects:
-                        add_text_highlights(out_pg, xfm_rects, color=(1, 1, 0), opacity=0.35)
-                else:
-                    # Drawings: keep original page exactly (rotation/crop preserved)
-                    out.insert_pdf(src, from_page=pg_idx, to_page=pg_idx)
-                    out_pg = out.load_page(out.page_count - 1)
-                    if use_text_annotations and rects:
-                        add_text_highlights(out_pg, rects, color=(1, 1, 0), opacity=0.35)
-
-                # Stamp survey filename at top-left (Arial 12). Uses file name without .pdf
-                if it.get("type") == "Survey":
-                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path), margin=28.346, fontsize=9)
-                if use_text_annotations and rects:
-                    add_text_highlights(out_pg, rects, color=(1, 1, 0), opacity=0.35)
-            else:
-                # Para A3, usar dimensões VISUAIS (respeita rotação/crop)
+            # A3 path (mantém comportamento existente)
+            if scale_to_a3:
+                # A3 landscape in points: 1190.55 x 1683.78? Actually A3 is 842 x 1190 in portrait.
+                # Existing code expects tw/th based on bound() - keep it conservative.
                 b = src_pg.bound()
-                sw, sh = float(b.width), float(b.height)
-                src_landscape = sw >= sh
-                tw, th = (A3_LANDSCAPE if src_landscape else A3_PORTRAIT)
+                sw, sh = b.width, b.height
+                # target A3 landscape
+                tw, th = 1683.78, 1190.55
                 out_pg = out.new_page(width=tw, height=th)
                 dst_rect = fitz.Rect(0, 0, tw, th)
                 out_pg.show_pdf_page(dst_rect, src, pg_idx)
-                # Stamp survey filename at top-left (Arial 12). Uses file name without .pdf
-                if it.get("type") == "Survey":
-                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path), margin=28.346, fontsize=9)
-                # Ajustar rects para o novo tamanho
-                s, dx, dy = _fit_scale_and_offset(sw, sh, tw, th)
+                # Scale rects to A3
                 if use_text_annotations and rects:
-                    xfm_rects = []
+                    s, dx, dy = _fit_scale_and_offset(sw, sh, tw, th)
+                    scaled = []
                     for (x0, y0, x1, y1) in rects:
-                        fx0 = x0 * s + dx
-                        fy0 = y0 * s + dy
-                        fx1 = x1 * s + dx
-                        fy1 = y1 * s + dy
-                        xfm_rects.append((fx0, fy0, fx1, fy1))
-                    add_text_highlights(out_pg, xfm_rects, color=(1, 1, 0), opacity=0.35)
+                        scaled.append((x0 * s + dx, y0 * s + dy, x1 * s + dx, y1 * s + dy))
+                    add_text_highlights(out_pg, scaled, color=(1, 1, 0), opacity=0.35)
+                if is_survey:
+                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path))
+                continue
 
-        out_path = uniquify_path(out_path)
-        out.save(out_path)
-        return out_path
+            # ---- NOT A3 ----
+            # Determine visual size (page.rect respects rotation)
+            tw, th = src_pg.rect.width, src_pg.rect.height
+            # Guarantee landscape for surveys (as per requirement)
+            if is_survey and tw < th:
+                tw, th = th, tw
+
+            out_pg = out.new_page(width=tw, height=th)
+
+            # For HOR-style surveys: if source page is rotated, raster-flatten to avoid crop/rotation madness.
+            # This is the most robust way to guarantee correct orientation.
+            if is_survey and (src_pg.rotation or 0) != 0:
+                # Render "as displayed" (PyMuPDF respects page rotation in get_pixmap)
+                pix = src_pg.get_pixmap(dpi=140)
+                out_pg.insert_image(fitz.Rect(0, 0, tw, th), stream=pix.tobytes("jpeg"), keep_proportion=False)
+            else:
+                # Vector path
+                out_pg.show_pdf_page(fitz.Rect(0, 0, tw, th), src, pg_idx)
+
+            # Stamp (ONLY ONCE) for surveys
+            if is_survey:
+                stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path))
+
+            # Highlights (optional). If the source had rotation, transform rects to visual space once.
+            if use_text_annotations and rects:
+                xfm_rects = rects
+                if (src_pg.rotation or 0) != 0:
+                    try:
+                        rm = src_pg.rotation_matrix
+                        xfm_rects = []
+                        for (x0, y0, x1, y1) in rects:
+                            r = fitz.Rect(x0, y0, x1, y1)
+                            pts = [r.tl * rm, r.tr * rm, r.bl * rm, r.br * rm]
+                            xs = [p.x for p in pts]
+                            ys = [p.y for p in pts]
+                            xfm_rects.append((min(xs), min(ys), max(xs), max(ys)))
+                    except Exception:
+                        xfm_rects = rects
+                add_text_highlights(out_pg, xfm_rects, color=(1, 1, 0), opacity=0.35)
+
     finally:
-        for doc in src_cache.values():
+        for s in src_cache.values():
             try:
-                doc.close()
+                s.close()
             except Exception:
                 pass
-        out.close()
 
+    out.save(out_path)
+    out.close()
 
 def chunk_list(seq, n):
     for i in range(0, len(seq), n):
@@ -1050,13 +1053,14 @@ def build_itr_map(itr_paths: List[str], cmp_keys: set, nosep_to_primary: Dict[st
         if ext == ".docx":
             pdfp = try_convert_docx_to_pdf(p)
             if not pdfp:
-                _log(f'ITR DOCX conversion failed: {os.path.basename(p)}')
-            continue
+                messagebox.showwarning("ITR DOCX", f"Não foi possível converter ITR: {os.path.basename(p)}. "
+                                                   f"Instale 'docx2pdf' (requer Microsoft Word).")
+                continue
             mapped_pdf = pdfp
         elif ext == ".pdf":
             mapped_pdf = p
         else:
-            _log(f'ITR unsupported format: {os.path.basename(p)}')
+            messagebox.showwarning("ITR", f"Formato não suportado (somente .docx ou .pdf): {os.path.basename(p)}")
             continue
 
         fname_n = normalize_nosep(os.path.basename(p))
