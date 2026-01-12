@@ -379,7 +379,7 @@ def scan_pdf_for_rects_fallback(
                             if rkey not in rect_key_set:
                                 rect_key_set.add(rkey)
                                 
-if survey_full_line:
+                                if survey_full_line:
                                     spans = _survey_line_span_rects(words_norm_list, (x0, y0, x1, y1))
                                     for (sx0, sy0, sx1, sy1) in spans:
                                         rkey2 = (round(sx0, 2), round(sy0, 2), round(sx1, 2), round(sy1, 2))
@@ -414,7 +414,7 @@ if survey_full_line:
                             code_pages[s].add(page.number)
                             matched.add(s)
                             
-if survey_full_line:
+                            if survey_full_line:
                                 rx0, ry0, rx1, ry1 = rects_run[0]
                                 spans = _survey_line_span_rects(words_norm_list, (rx0, ry0, rx1, ry1))
                                 for (sx0, sy0, sx1, sy1) in spans:
@@ -501,7 +501,7 @@ def scan_pdf_for_rects_ac(
                 code_pages[key].add(page.number)
                 matched.add(key)
                 
-if survey_full_line:
+                if survey_full_line:
                     x0, y0, x1, y1 = rects[ws]
                     spans = _survey_line_span_rects(words_norm_list, (x0, y0, x1, y1))
                     for (sx0, sy0, sx1, sy1) in spans:
