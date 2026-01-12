@@ -2167,18 +2167,6 @@ class HighlighterApp(tk.Tk):
 
         return end
 
-    def _generate_cover_sheet_pdf(self, out_dir, root_name, week_number, external_df=None, matched_pretty_codes=None, scale_to_a3=False):
-        \"\"\"Deprecated: External DB / Cover Sheet feature removed.\"\"\"
+    def _generate_cover_sheet_pdf(self, *args, **kwargs):
         return None
-
-if __name__ == "__main__":
-    multiprocessing.freeze_support()
-    try:
-        app = HighlighterApp()
-        app.mainloop()
-    except Exception as e:
-        try:
-            messagebox.showerror("Fatal Error", str(e))
-        except Exception:
-            pass
         sys.exit(1)
