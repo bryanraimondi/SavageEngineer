@@ -520,7 +520,7 @@ def add_text_highlights(page, rects, color=(1, 1, 0), opacity=0.35):
 
 
 
-def stamp_filename_top_left(page, filename: str, margin_pt: float = 6.0, fontsize: float = 9.0):
+def stamp_filename_top_left(page, filename: str, margin: float = 6.0, fontsize: float = 9.0):
     """Stamp survey filename (without .pdf) at top-left.
 
     Requirements:
@@ -536,8 +536,8 @@ def stamp_filename_top_left(page, filename: str, margin_pt: float = 6.0, fontsiz
         if not name:
             return
 
-        x = float(margin_pt)
-        y = float(margin_pt) + float(fontsize)
+        x = float(margin)
+        y = float(margin) + float(fontsize)
 
         arial = r"C:\\Windows\\Fonts\\arial.ttf"
         if os.path.exists(arial):
