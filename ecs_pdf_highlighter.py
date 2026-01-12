@@ -1,3 +1,65 @@
+# =========================================================
+# EARLY STARTUP LOGGER (MUST BE FIRST THING IN THE FILE)
+# Creates startup.log next to the .exe (when frozen) or next to the .py
+# =========================================================
+import os
+import sys
+import traceback
+from datetime import datetime
+
+def _get_app_dir() -> str:
+    """Return directory for logs: exe dir when frozen, else script dir."""
+    try:
+        if getattr(sys, "frozen", False) and hasattr(sys, "executable"):
+            return os.path.dirname(os.path.abspath(sys.executable))
+        return os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        return os.getcwd()
+
+_APP_DIR = _get_app_dir()
+_STARTUP_LOG = os.path.join(_APP_DIR, "startup.log")
+
+def _log(line: str) -> None:
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(_STARTUP_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {line}\n")
+    except Exception:
+        pass
+
+def _log_exception(prefix: str, exc: BaseException) -> None:
+    try:
+        _log(f"{prefix}: {repr(exc)}")
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        for ln in tb.splitlines():
+            _log(ln)
+    except Exception:
+        pass
+
+def _early_bootstrap() -> None:
+    _log("==== APP START ====")
+    _log(f"sys.version={sys.version}")
+    _log(f"frozen={getattr(sys, 'frozen', False)}")
+    _log(f"executable={getattr(sys, 'executable', None)}")
+    _log(f"cwd={os.getcwd()}")
+    _log(f"app_dir={_APP_DIR}")
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        _log(f"_MEIPASS={meipass}")
+
+    def _excepthook(exc_type, exc, tb):
+        try:
+            _log("UNCAUGHT EXCEPTION (sys.excepthook)")
+            tb_txt = "".join(traceback.format_exception(exc_type, exc, tb))
+            for ln in tb_txt.splitlines():
+                _log(ln)
+        except Exception:
+            pass
+
+    sys.excepthook = _excepthook
+
+_early_bootstrap()
+
 import os
 import re
 import sys
@@ -2172,7 +2234,16 @@ class HighlighterApp(tk.Tk):
 
 # --- ENTRY POINT ---
 if __name__ == "__main__":
-    import multiprocessing
-    multiprocessing.freeze_support()
-    app = HighlighterApp()
-    app.mainloop()
+    try:
+        _log("Entering __main__")
+        import multiprocessing
+        multiprocessing.freeze_support()
+        _log("freeze_support() OK")
+
+        app = HighlighterApp()
+        _log("HighlighterApp created; entering mainloop()")
+        app.mainloop()
+        _log("Exited mainloop() normally")
+    except Exception as e:
+        _log_exception("FATAL STARTUP ERROR", e)
+        raise
