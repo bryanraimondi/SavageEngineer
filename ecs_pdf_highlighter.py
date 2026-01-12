@@ -263,60 +263,43 @@ def build_aho_automaton(cmp_keys_nosep):
 
 
 # ====================== Survey: highlight linha inteira ======================
-def _survey_line_span_rects(words_norm_list, target_rect, y_tol: float = 2.5, gap_tol: float = 8.0, margin: float = 1.5):
-    """Return a list of rects that cover the whole *text line* for Survey PDFs.
+def _survey_line_span_rects(words_norm_list, target_rect, y_tol: float = 2.5, margin: float = 1.5):
+    """Return rects that cover the *entire table row* (but not full-page width).
 
-    Why this exists:
-      - PDF Highlight annotations are meant to sit over text quads.
-      - A single huge full-width rect can render poorly in some viewers.
+    Why:
+      - A single full-page-width highlight can render poorly in some viewers.
+      - A set of per-word rects can miss the 'gaps' between table columns.
     Strategy:
-      1) Find all words on the same line (by Y center / vertical overlap)
-      2) Expand Y slightly (margin)
-      3) Merge neighboring word rects into spans (gap_tol) to reduce annotation count
-    Returned rects are tuples: (x0, y0, x1, y1).
+      1) Collect all words belonging to the same row (by Y center / vertical overlap).
+      2) Compute row Y bounds.
+      3) Compute row X bounds from min/max X across those words.
+      4) Return ONE rect spanning min_x..max_x (expanded slightly).
     """
     try:
         tx0, ty0, tx1, ty1 = target_rect
         tcy = (ty0 + ty1) * 0.5
 
-        line_rects = []
+        row = []
         for (x0, y0, x1, y1, _norm, _raw) in (words_norm_list or []):
             cy = (y0 + y1) * 0.5
-            # same line by center
             if abs(cy - tcy) <= y_tol:
-                line_rects.append((x0, y0, x1, y1))
+                row.append((x0, y0, x1, y1))
                 continue
-            # or strong vertical overlap
             ov = min(ty1, y1) - max(ty0, y0)
             if ov > 0 and ov >= 0.5 * min((ty1 - ty0), (y1 - y0)):
-                line_rects.append((x0, y0, x1, y1))
+                row.append((x0, y0, x1, y1))
 
-        if not line_rects:
-            # fallback: highlight only the matched rect
+        if not row:
             return [target_rect]
 
-        y0 = min(r[1] for r in line_rects) - margin
-        y1 = max(r[3] for r in line_rects) + margin
-        y0 = max(0.0, y0)
+        y0 = max(0.0, min(r[1] for r in row) - margin)
+        y1 = max(r[3] for r in row) + margin
+        x0 = max(0.0, min(r[0] for r in row) - margin)
+        x1 = max(r[2] for r in row) + margin
 
-        # Merge into spans by X gap
-        line_rects.sort(key=lambda r: (r[0], r[2]))
-        spans = []
-        cx0, _, cx1, _ = line_rects[0]
-        for (x0, _y0, x1, _y1) in line_rects[1:]:
-            if x0 - cx1 <= gap_tol:
-                cx1 = max(cx1, x1)
-            else:
-                spans.append((float(cx0), float(y0), float(cx1), float(y1)))
-                cx0, cx1 = x0, x1
-        spans.append((float(cx0), float(y0), float(cx1), float(y1)))
-
-        # Defensive: drop absurd spans (NaN/negative)
-        clean = []
-        for (sx0, sy0, sx1, sy1) in spans:
-            if sx1 > sx0 and sy1 > sy0:
-                clean.append((sx0, sy0, sx1, sy1))
-        return clean or [target_rect]
+        if x1 <= x0 or y1 <= y0:
+            return [target_rect]
+        return [(float(x0), float(y0), float(x1), float(y1))]
     except Exception:
         return [target_rect]
 # ============================ Scanners de PDF ===========================
@@ -1345,7 +1328,6 @@ class HighlighterApp(tk.Tk):
         self.pages_per_file_var = tk.IntVar(value=20)
         self.only_highlighted_var = tk.BooleanVar(value=True)
         self.review_pages_var = tk.BooleanVar(value=True)
-        self.ignore_lead_digit_var = tk.BooleanVar(value=False)
         self.highlight_all_var = tk.BooleanVar(value=True)
         self.use_text_annots_var = tk.BooleanVar(value=True)
         self.turbo_var = tk.BooleanVar(value=True)
@@ -1459,7 +1441,6 @@ class HighlighterApp(tk.Tk):
         fr_opts = ttk.Frame(root_frame); fr_opts.pack(fill="x", **pad)
         ttk.Checkbutton(fr_opts, text="Only keep highlighted pages", variable=self.only_highlighted_var).pack(side="left")
         ttk.Checkbutton(fr_opts, text="Review pages before saving", variable=self.review_pages_var).pack(side="left", padx=12)
-        ttk.Checkbutton(fr_opts, text="Ignore leading digit in PDF codes", variable=self.ignore_lead_digit_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Highlight every occurrence", variable=self.highlight_all_var).pack(side="left", padx=12)
         ttk.Checkbutton(fr_opts, text="Use text highlight annotations", variable=self.use_text_annots_var).pack(side="left", padx=12)
 
@@ -1640,7 +1621,6 @@ class HighlighterApp(tk.Tk):
         args = (
             week, rootname, list(excels), list(self.drawing_pdfs), list(self.survey_pdfs), list(self.itr_paths), out_dir,
             int(self.pages_per_file_var.get()),
-            bool(self.ignore_lead_digit_var.get()),
             bool(self.highlight_all_var.get()),
             bool(self.use_text_annots_var.get()),
             bool(self.turbo_var.get()),
@@ -1666,7 +1646,7 @@ class HighlighterApp(tk.Tk):
     # ===== background worker =====
     def _worker(
         self, week_number, root_name, excel_paths, drawing_paths, survey_paths, itr_paths, out_dir, pages_per_file,
-        ignore_leading_digit, highlight_all_occurrences, use_text_annotations,
+        highlight_all_occurrences, use_text_annotations,
         turbo_mode, parallel_mode, treat_survey, survey_size_limit_bytes,
         dedupe_pages, dedupe_surveys,
         keep_latest_survey_rev, keep_latest_non_survey_rev
@@ -2028,11 +2008,7 @@ class HighlighterApp(tk.Tk):
                 bld = infer_building_from_code(code_pretty)
             else:
                 bld = "UNKWN"
-            building_buckets[bld].append({
-                "pdf_path": pdf_path,
-                "page_idx": pg,
-                "rects": rects or []
-            })
+            building_buckets[bld].append({"pdf_path": pdf_path, "page_idx": pg, "rects": rects or [], "type": unit_type, "display": os.path.basename(pdf_path)})
 
         for (pdf_path, pg, code_pretty, rects, unit_type) in ordered_kept:
             add_unit_if_ok(pdf_path, pg, rects, code_pretty or "", unit_type or "Drawing")
