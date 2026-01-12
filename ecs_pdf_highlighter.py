@@ -520,13 +520,13 @@ def add_text_highlights(page, rects, color=(1, 1, 0), opacity=0.35):
 
 
 
-def stamp_filename_top_left(page, filename: str, margin: float = 6.0, fontsize: float = 9.0):
+def stamp_filename_top_left(page, filename: str, margin: float = 28.346, fontsize: float = 9.0):
     """Stamp survey filename (without .pdf) at top-left.
 
     Requirements:
       - Font size = 9
-      - Margin = 0.2 cm (~6 pt)
-      - No white background box
+      - Margin = 10 mm from edge (≈ 28.346 pt)
+      - No background box
     Uses Arial if available, else Helvetica.
     """
     if not filename:
@@ -585,6 +585,20 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_
                 # Copia a página exatamente como está (mantém rotação/crop/coords)
                 out.insert_pdf(src, from_page=pg_idx, to_page=pg_idx)
                 out_pg = out.load_page(out.page_count - 1)
+                # --- Survey orientation normalization ---
+                if it.get("type") == "Survey":
+                    try:
+                        # If the page is portrait with rotation 0, rotate for landscape display
+                        if out_pg.rotation == 0 and out_pg.rect.height > out_pg.rect.width:
+                            out_pg.set_rotation(90)
+                        # If the page has rotation 90/270, align cropbox so text coordinates stay consistent
+                        if out_pg.rotation in (90, 270):
+                            w = float(out_pg.rect.height)
+                            h = float(out_pg.rect.width)
+                            out_pg.set_cropbox(fitz.Rect(0, 0, w, h))
+                    except Exception:
+                        pass
+
                 # Stamp survey filename at top-left (Arial 12). Uses file name without .pdf
                 if it.get("type") == "Survey":
                     stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path), margin=100, fontsize=12)
@@ -2064,16 +2078,7 @@ class HighlighterApp(tk.Tk):
         summary_csv = self._write_summary_csv(out_dir, root_name, week_number, rows)
         self._write_not_surveyed_csv(out_dir, root_name, week_number,
                                      [original_map.get(p, p) for p in missing_primary])
-
-        # Cover Sheet (se DB externa carregada)
-        try:
-                matched_pretty = [original_map.get(p, p) for p in sorted(found_primary)]
-                cover_path = self._generate_cover_sheet_pdf(out_dir, root_name, week_number,
-                                                            scale_to_a3=False)
-                if cover_path:
-                    self.lbl_status.config(text=f"Cover Sheet saved: {os.path.basename(cover_path)}")
-        except Exception as e:
-            messagebox.showwarning("Cover Sheet", f"Falha ao gerar Cover Sheet:\n{e}")
+        # Cover Sheet generation disabled (feature removed)
 
         SummaryDialog(self, rows, len(missing_primary), summary_csv)
 
@@ -2162,77 +2167,10 @@ class HighlighterApp(tk.Tk):
 
         return end
 
-    def _generate_cover_sheet_pdf(self, out_dir, root_name, week_number, external_df, matched_pretty_codes, scale_to_a3=False):
-        if external_df is None or external_df.empty or not matched_pretty_codes:
-            return None
-        cols_candidate = [c for c in external_df.columns if str(c).strip().lower() in ("ecs code", "ecs codes")]
-        if not cols_candidate:
-            return None
-        ecs_col = cols_candidate[0]
-
-        matched_norm = {normalize_base(c) for c in matched_pretty_codes if c}
-        filt_rows = []
-        for _, row in external_df.iterrows():
-            raw = "" if pd.isna(row[ecs_col]) else str(row[ecs_col])
-            candidates = [t.strip() for t in re.split(r"[,;\n/\t ]+", raw) if t.strip()]
-            if any(normalize_base(t) in matched_norm for t in candidates):
-                filt_rows.append(dict(row))
-        if not filt_rows:
-            return None
-        df_full = pd.DataFrame(filt_rows)
-
-        # Seleção de colunas por letras
-        wanted_letters = ["B", "G", "H", "I", "J", "K", "L", "N", "O", "P", "Q", "S", "T", "U"]
-        idxs = _excel_letters_to_indices(wanted_letters, df_full)
-        if not idxs:
-            return None
-        df = df_full.iloc[:, idxs].copy()
-        df.columns = [str(c).strip() for c in df.columns]
-
-        tag = sanitize_filename(root_name) or "Job"
-        cover_path = os.path.join(out_dir, f"{tag}_Cover Sheet_WK{week_number}.pdf")
-        cover_path = uniquify_path(cover_path)
-        tw, th = (A3_PORTRAIT if scale_to_a3 else (595.0, 842.0))  # A4 retrato
-
-        calibri_ttf = _find_calibri_fontfile()
-        font_kwargs = _text_font_kwargs(calibri_ttf)
-
-        doc = fitz.open()
-        try:
-            remaining = df.copy()
-            while len(remaining) > 0:
-                page = doc.new_page(width=tw, height=th)
-                title = f"{tag} — Cover Sheet — WK{week_number}"
-                page.insert_text(
-                    fitz.Point(36, 24),
-                    title,
-                    fontsize=12,
-                    **font_kwargs,
-                )
-                page.draw_line(fitz.Point(36, 28), fitz.Point(tw - 36, 28), color=(0, 0, 0), width=0.7)
-
-                drawn = self._draw_table_page(
-                    page,
-                    remaining,
-                    margin=36,
-                    row_h=18,
-                    header_fill=(0.92, 0.92, 0.92),
-                    fontfile=calibri_ttf,
-                    fontsize=10,
-                )
-                if drawn <= 0:
-                    break
-                remaining = remaining.iloc[drawn:].reset_index(drop=True)
-            if doc.page_count > 0:
-                doc.save(cover_path)
-                return cover_path
-        finally:
-            doc.close()
+    def _generate_cover_sheet_pdf(self, out_dir, root_name, week_number, external_df=None, matched_pretty_codes=None, scale_to_a3=False):
+        \"\"\"Deprecated: External DB / Cover Sheet feature removed.\"\"\"
         return None
 
-
-
-# ================================ main ==================================
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     try:
