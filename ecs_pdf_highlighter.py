@@ -162,6 +162,74 @@ def build_compare_index(ecs_primary, ignore_leading_digit):
     return cmp_keys, nosep_to_primary, max_code_len
 
 
+def build_contextual_indexes(ecs_primary_all: set):
+    """
+    Contextual ECS matching rules:
+
+    - Surveys: unit-aware -> match FULL normalized code only (e.g. '1hk10st4072')
+    - Drawings: unitless -> match WITHOUT the leading unit digit (e.g. 'hk10st4072')
+      plus a leading-dash variant (e.g. '-hk10st4072') to match drawings that show codes with a leading '-'.
+
+    - EXCEPTION: HG systems (0HG/1HG/9HG):
+        * Drawings are unit-aware for HG -> match FULL code (e.g. '1hg0101zl...')
+        * BUT if the drawing shows a leading '-' (e.g. '-hg0101zl...'), it can match ANY unit.
+          In that case we allow '-'+remainder and map it to ALL HG primaries that share the remainder.
+
+    Returns:
+        cmp_keys_survey: set[str]
+        cmp_keys_drawing: set[str]
+        cmp_to_primaries: dict[str, list[str]]  (one cmp-key can map to multiple unit-specific primaries)
+        max_code_len: int
+    """
+    cmp_survey = set()
+    cmp_drawing = set()
+    cmp_to_primaries: Dict[str, List[str]] = {}
+
+    def _add_map(k: str, primary: str, target_set: set):
+        if not k:
+            return
+        target_set.add(k)
+        cmp_to_primaries.setdefault(k, [])
+        if primary not in cmp_to_primaries[k]:
+            cmp_to_primaries[k].append(primary)
+
+    for primary in ecs_primary_all:
+        full = normalize_nosep(primary)
+        if not full:
+            continue
+
+        # Survey: always unit-aware (full code)
+        _add_map(full, primary, cmp_survey)
+
+        # Determine HG (e.g. 0HG/1HG/9HG)
+        is_hg = bool(len(full) >= 3 and full[0].isdigit() and full[1:3] == "hg")
+
+        # Build remainder (strip leading unit digit if present)
+        if primary and str(primary)[0].isdigit():
+            remainder = normalize_nosep(str(primary)[1:])
+        else:
+            remainder = full
+
+        remainder = (remainder or "").lstrip("-")
+        if not remainder:
+            continue
+
+        if is_hg:
+            # HG drawings must match the unit (full code)
+            _add_map(full, primary, cmp_drawing)
+            # But leading '-' in drawings can match any unit
+            _add_map("-" + remainder, primary, cmp_drawing)
+        else:
+            # Non-HG drawings are unitless
+            _add_map(remainder, primary, cmp_drawing)
+            _add_map("-" + remainder, primary, cmp_drawing)
+
+    max_code_len = 0
+    if cmp_survey or cmp_drawing:
+        max_code_len = max((len(k) for k in (cmp_survey | cmp_drawing)), default=0)
+    return cmp_survey, cmp_drawing, cmp_to_primaries, max_code_len
+
+
 def build_prefixes_and_firstchars(cmp_keys_nosep):
     prefixes = set()
     first_chars = set()
@@ -667,24 +735,40 @@ def is_summary_like(pdf_path, page_idx, codes_on_page, threshold=15, neighbor_mi
 
 
 # -------- Escolha da última revisão (survey & handbooks/desenhos) --------
-_REV_LET_RE = re.compile(r'(?:^|[^A-Z0-9])REV\s*([A-Z])(?:[^A-Z0-9]|$)', re.IGNORECASE)
+_REV_LET_RE = re.compile(r'(?:^|[^A-Z0-9])REV\s*([A-Z]{1,3})(?:[^A-Z0-9]|$)', re.IGNORECASE)
 _REV_NUM_RE = re.compile(r'(?:^|[^0-9])REV\s*([0-9]{1,3})(?:[^0-9]|$)', re.IGNORECASE)
-_TAIL_LET_RE = re.compile(r'([_\-])([A-Z])(?:\.pdf)?$', re.IGNORECASE)
+_TAIL_LET_RE = re.compile(r'([_\-])([A-Z]{1,3})(?:\.pdf)?$', re.IGNORECASE)
 
+
+
+def _rev_letters_to_int(s: str) -> int:
+    """Convert Excel-style revision letters to an integer: A=1, ..., Z=26, AA=27, AB=28, ..."""
+    if not s:
+        return 0
+    s = re.sub(r'[^A-Z]', '', str(s).upper())
+    if not s:
+        return 0
+    val = 0
+    for ch in s:
+        if 'A' <= ch <= 'Z':
+            val = val * 26 + (ord(ch) - ord('A') + 1)
+    return val
 
 def _parse_revision_from_name(name: str) -> int:
     if not name:
         return 0
     m = _REV_LET_RE.search(name)
     if m:
-        return 1000 + (ord(m.group(1).upper()) - ord('A'))
+        # Letters: A..Z, AA.. etc (Excel-style ordering)
+        return 1000 + _rev_letters_to_int(m.group(1))
     m = _REV_NUM_RE.search(name)
     if m:
         return int(m.group(1))
     m = _TAIL_LET_RE.search(os.path.splitext(name)[0])
     if m:
-        return 1000 + (ord(m.group(2).upper()) - ord('A'))
+        return 1000 + _rev_letters_to_int(m.group(2))
     return 0
+
 
 
 def _strip_revision_tokens(name: str) -> str:
@@ -1573,9 +1657,13 @@ class HighlighterApp(tk.Tk):
                 post("error", "No ECS codes found in the selected Excel files.")
                 return
             self.ecs_original_map = dict(original_map_all)
-            cmp_keys, nosep_to_primary, _max_len = build_compare_index(ecs_primary_all, ignore_leading_digit)
-            self.nosep_to_primary = dict(nosep_to_primary)
-            self.ecs_cmp_keys = set(cmp_keys)
+            cmp_keys_survey, cmp_keys_drawing, cmp_to_primaries, _max_len = build_contextual_indexes(ecs_primary_all)
+            nosep_to_primary = {k: (v[0] if isinstance(v, list) and v else v) for k, v in cmp_to_primaries.items()}
+            self.cmp_to_primaries = dict(cmp_to_primaries)
+            self.nosep_to_primary = dict(nosep_to_primary)  # legacy single-primary map (first), for UI/ITR mapping
+            self.ecs_cmp_keys_survey = set(cmp_keys_survey)
+            self.ecs_cmp_keys_drawing = set(cmp_keys_drawing)
+            self.ecs_cmp_keys = set(cmp_keys_survey) | set(cmp_keys_drawing)
 
             # 2) Filtrar revisões
             if keep_latest_survey_rev:
@@ -1594,7 +1682,7 @@ class HighlighterApp(tk.Tk):
 
             # 3) Mapear ITRs (docx/pdf) por código
             try:
-                itr_map = build_itr_map(list(itr_paths), cmp_keys, nosep_to_primary)
+                itr_map = build_itr_map(list(itr_paths), (set(cmp_keys_survey) | set(cmp_keys_drawing)), nosep_to_primary)
             except Exception:
                 itr_map = {}
             self.itr_map = itr_map  # primary_code -> {'pdf_path','pages'}
@@ -1603,9 +1691,10 @@ class HighlighterApp(tk.Tk):
             tasks = []
             for pdf in combined_pdfs:
                 is_survey_task = (pdf in survey_set)
+                cmp_list = sorted(list(cmp_keys_survey if is_survey_task else cmp_keys_drawing))
                 tasks.append((
                     pdf,
-                    sorted(list(cmp_keys)),
+                    cmp_list,
                     bool(turbo_mode and _HAS_AC),
                     bool(highlight_all_occurrences),
                     bool(is_survey_task),
@@ -1669,8 +1758,9 @@ class HighlighterApp(tk.Tk):
                     "code_rects_by_page": code_rects_by_page,
                     "page_codes": {
                         int(p): sorted({
-                            self.ecs_original_map.get(self.nosep_to_primary.get(cmp_key, cmp_key), cmp_key)
+                            self.ecs_original_map.get(primary, primary)
                             for cmp_key, pglist in code_pages.items() if int(p) in pglist
+                            for primary in self.cmp_to_primaries.get(cmp_key, [self.nosep_to_primary.get(cmp_key, cmp_key)])
                         })
                         for p in hit_pages
                     },
@@ -1692,6 +1782,7 @@ class HighlighterApp(tk.Tk):
                 "ecs_primary": sorted(list(ecs_primary_all)),
                 "original_map": dict(original_map_all),
                 "nosep_to_primary": dict(nosep_to_primary),
+                "cmp_to_primaries": dict(cmp_to_primaries),
                 "agg_code_file_pages": agg_serializable,
                 "pages_per_file": int(pages_per_file),
                 "treat_survey": bool(treat_survey),
@@ -1737,6 +1828,7 @@ class HighlighterApp(tk.Tk):
         ecs_primary = set(bundle.get("ecs_primary", []))
         original_map = dict(bundle.get("original_map", {}))
         nosep_to_primary = dict(bundle.get("nosep_to_primary", {}))
+        cmp_to_primaries = dict(bundle.get("cmp_to_primaries", {}))
         agg_code_file_pages = dict(bundle.get("agg_code_file_pages", {}))
         pages_per_file = max(1, int(bundle.get("pages_per_file", 20)))
         treat_survey = bool(bundle.get("treat_survey", True))
@@ -1938,9 +2030,10 @@ class HighlighterApp(tk.Tk):
         # --------- Resumo por código ----------
         primary_file_pages = defaultdict(lambda: defaultdict(set))
         for cmp_key, file_map in agg_code_file_pages.items():
-            primary = nosep_to_primary.get(cmp_key, cmp_key)
+            primaries = cmp_to_primaries.get(cmp_key, [nosep_to_primary.get(cmp_key, cmp_key)])
             for fn, pages in file_map.items():
-                primary_file_pages[primary][fn] = set(pages)
+                for primary in primaries:
+                    primary_file_pages[primary][fn] |= set(pages)
 
         rows = []
         found_primary = set()
