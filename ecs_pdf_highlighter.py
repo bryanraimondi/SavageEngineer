@@ -263,43 +263,54 @@ def build_aho_automaton(cmp_keys_nosep):
 
 
 # ====================== Survey: highlight linha inteira ======================
-def _survey_line_span_rects(words_norm_list, target_rect, y_tol: float = 2.5, margin: float = 1.5):
-    """Return rects that cover the *entire table row* (but not full-page width).
+def _survey_line_span_rects(words_norm_list, target_rect, y_tol: float = 2.5, gap_tol: float = 7.0, margin: float = 1.5):
+    """Return rects that cover the *text line* for Survey PDFs (Adobe-like).
 
     Why:
-      - A single full-page-width highlight can render poorly in some viewers.
-      - A set of per-word rects can miss the 'gaps' between table columns.
+      - A single huge full-width row rectangle can render oddly in some viewers.
+      - Highlighting only the matched word is too narrow.
     Strategy:
-      1) Collect all words belonging to the same row (by Y center / vertical overlap).
-      2) Compute row Y bounds.
-      3) Compute row X bounds from min/max X across those words.
-      4) Return ONE rect spanning min_x..max_x (expanded slightly).
+      1) Collect all words on the same row (by Y center / vertical overlap).
+      2) Compute row Y bounds (with small margin).
+      3) Merge neighboring word rects into spans (gap_tol) to reduce annotation count.
+         We intentionally do NOT bridge large gaps between table columns (keeps it text-like).
     """
     try:
         tx0, ty0, tx1, ty1 = target_rect
         tcy = (ty0 + ty1) * 0.5
 
-        row = []
+        row_rects = []
         for (x0, y0, x1, y1, _norm, _raw) in (words_norm_list or []):
             cy = (y0 + y1) * 0.5
             if abs(cy - tcy) <= y_tol:
-                row.append((x0, y0, x1, y1))
+                row_rects.append((x0, y0, x1, y1))
                 continue
             ov = min(ty1, y1) - max(ty0, y0)
             if ov > 0 and ov >= 0.5 * min((ty1 - ty0), (y1 - y0)):
-                row.append((x0, y0, x1, y1))
+                row_rects.append((x0, y0, x1, y1))
 
-        if not row:
+        if not row_rects:
             return [target_rect]
 
-        y0 = max(0.0, min(r[1] for r in row) - margin)
-        y1 = max(r[3] for r in row) + margin
-        x0 = max(0.0, min(r[0] for r in row) - margin)
-        x1 = max(r[2] for r in row) + margin
+        y0 = max(0.0, min(r[1] for r in row_rects) - margin)
+        y1 = max(r[3] for r in row_rects) + margin
 
-        if x1 <= x0 or y1 <= y0:
-            return [target_rect]
-        return [(float(x0), float(y0), float(x1), float(y1))]
+        row_rects.sort(key=lambda r: (r[0], r[2]))
+        spans = []
+        cx0, _, cx1, _ = row_rects[0]
+        for (x0, _y0, x1, _y1) in row_rects[1:]:
+            if x0 - cx1 <= gap_tol:
+                cx1 = max(cx1, x1)
+            else:
+                spans.append((float(cx0), float(y0), float(cx1), float(y1)))
+                cx0, cx1 = x0, x1
+        spans.append((float(cx0), float(y0), float(cx1), float(y1)))
+
+        clean = []
+        for (sx0, sy0, sx1, sy1) in spans:
+            if sx1 > sx0 and sy1 > sy0:
+                clean.append((sx0, sy0, sx1, sy1))
+        return clean or [target_rect]
     except Exception:
         return [target_rect]
 # ============================ Scanners de PDF ===========================
@@ -525,18 +536,57 @@ def add_text_highlights(page, rects, color=(1, 1, 0), opacity=0.35):
 
 
 
-def stamp_filename_top_left(page, filename: str, margin=100, box_w=800, box_h=40, fontsize=12):
-    """Stamp survey filename (without .pdf) at top-left. Uses Arial if available, else Helvetica."""
+def stamp_filename_top_left(page, filename: str, margin=24, box_h=18, fontsize=9):
+    """Stamp survey filename (without .pdf) on the page, avoiding overlap with content.
+
+    Behavior:
+    - Prefer TOP-LEFT inside a small safe margin (printer-friendly).
+    - If there isn't enough whitespace at the top (table starts at the very top),
+      stamp at BOTTOM-LEFT instead.
+    - Uses Arial if available on Windows, else Helvetica.
+
+    Notes:
+    - margin is in points (72pt = 1 inch). Default 24pt ~ 0.33 in.
+    - box_h default 18pt is suitable for fontsize 9.
+    """
     if not filename:
         return
     try:
         name = os.path.splitext(os.path.basename(str(filename)))[0]
         if not name:
             return
-        r = page.rect
-        box = fitz.Rect(margin, margin, min(r.width - margin, margin + box_w), margin + box_h)
 
-        arial = r"C:\Windows\Fonts\arial.ttf"
+        r = page.rect
+
+        # Detect how much free space exists at the top by looking at the highest word.
+        words = page.get_text("words", sort=True) or []
+        min_y = None
+        if words:
+            try:
+                min_y = min(float(w[1]) for w in words if len(w) >= 2)
+            except Exception:
+                min_y = None
+
+        # If content starts too close to the top, stamp at bottom-left.
+        place_top = True
+        if min_y is not None and min_y <= (margin + box_h + 2):
+            place_top = False
+
+        box_w = max(100.0, float(r.width) - (2 * margin))
+        if place_top:
+            y0 = float(margin)
+        else:
+            y0 = max(float(margin), float(r.height) - float(margin) - float(box_h))
+
+        box = fitz.Rect(margin, y0, margin + box_w, y0 + box_h)
+
+        # Subtle white backdrop to keep the stamp readable
+        try:
+            page.draw_rect(box, color=None, fill=(1, 1, 1), fill_opacity=0.65, overlay=True)
+        except Exception:
+            pass
+
+        arial = r"C:\\Windows\\Fonts\\arial.ttf"
         if os.path.exists(arial):
             page.insert_textbox(box, name, fontsize=fontsize, fontfile=arial, align=fitz.TEXT_ALIGN_LEFT)
         else:
