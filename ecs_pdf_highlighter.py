@@ -582,13 +582,12 @@ def add_text_highlights(page, rects, color=(1, 1, 0), opacity=0.35):
 
 
 
-def stamp_filename_top_left(page, filename: str, x_margin: float = 28.346, y_margin: float = 12.0, fontsize: float = 9.0):
-    """Stamp survey filename (without .pdf) at top-left header band.
+def stamp_filename_top_left(page, filename: str, margin: float = 28.346, fontsize: float = 9.0):
+    """Stamp survey filename (without .pdf) at top-left.
 
     Requirements:
       - Font size = 9
-      - X margin = 10 mm from left edge (≈ 28.346 pt)
-      - Y position = fixed header band (default y_margin=12 pt + fontsize) to match the red-bar area
+      - Margin = 10 mm from edge (≈ 28.346 pt)
       - No background box
     Uses Arial if available, else Helvetica.
     """
@@ -599,10 +598,8 @@ def stamp_filename_top_left(page, filename: str, x_margin: float = 28.346, y_mar
         if not name:
             return
 
-        x = float(x_margin)
-        # Place text in the header safe-zone (red bar area): closer to top edge than 10mm.
-        # y_margin is the top margin to the TOP of the text; PyMuPDF uses the baseline, so add fontsize.
-        y = float(y_margin) + float(fontsize)
+        x = float(margin)
+        y = float(margin) + float(fontsize)
 
         arial = r"C:\\Windows\\Fonts\\arial.ttf"
         if os.path.exists(arial):
@@ -626,25 +623,6 @@ def _fit_scale_and_offset(src_w, src_h, dst_w, dst_h):
     return s, dx, dy
 
 
-def _rotate_rects_90_cw(rects, src_w, src_h):
-    """Rotate rectangles 90 degrees clockwise from a src (w,h) space to dst (h,w)."""
-    if not rects:
-        return rects
-    out = []
-    for (x0, y0, x1, y1) in rects:
-        # Normalize ordering just in case
-        if x1 < x0:
-            x0, x1 = x1, x0
-        if y1 < y0:
-            y0, y1 = y1, y0
-        nx0 = src_h - y1
-        ny0 = x0
-        nx1 = src_h - y0
-        ny1 = x1
-        out.append((nx0, ny0, nx1, ny1))
-    return out
-
-
 def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_to_a3=False):
     """
     Insere as páginas EXATAMENTE na ordem dada por page_units (sem agrupar por PDF).
@@ -666,33 +644,56 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_
             src_pg = src.load_page(pg_idx)
 
             if not scale_to_a3:
-                # Drawings: copy page as-is (keeps rotation/crop/coords)
-                if it.get("type") != "Survey":
+                if it.get("type") == "Survey":
+                    # =========================================================
+                    # Survey NORMALIZATION (HOR fix)
+                    # - HOR files often come as A4 portrait mediabox with rotation=90
+                    # - Using insert_pdf keeps rotation metadata and causes "sideways" pages
+                    # - We "flatten" the page by rendering it onto a new page with rotation cancelled
+                    #   and using the VISUAL page size (src_pg.rect).
+                    # =========================================================
+                    sw, sh = float(src_pg.rect.width), float(src_pg.rect.height)
+                    out_pg = out.new_page(width=sw, height=sh)
+                    dst_rect = fitz.Rect(0, 0, sw, sh)
+                    rot_cancel = (360 - int(src_pg.rotation or 0)) % 360
+                    out_pg.show_pdf_page(dst_rect, src, pg_idx, rotate=rot_cancel)
+
+                    # Transform rects from unrotated coords -> visual coords (rotated view)
+                    xfm_rects = rects
+                    if use_text_annotations and rects and (src_pg.rotation or 0):
+                        try:
+                            rm = src_pg.rotation_matrix
+                            xfm_rects = []
+                            for (x0, y0, x1, y1) in rects:
+                                r = fitz.Rect(x0, y0, x1, y1)
+                                # transform 4 corners, then bbox
+                                pts = [
+                                    r.tl * rm,
+                                    r.tr * rm,
+                                    r.bl * rm,
+                                    r.br * rm,
+                                ]
+                                xs = [p.x for p in pts]
+                                ys = [p.y for p in pts]
+                                xfm_rects.append((min(xs), min(ys), max(xs), max(ys)))
+                        except Exception:
+                            xfm_rects = rects
+
+                    # Stamp survey filename at top-left (Header band safe zone)
+                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path))
+
+                    if use_text_annotations and xfm_rects:
+                        add_text_highlights(out_pg, xfm_rects, color=(1, 1, 0), opacity=0.35)
+                else:
+                    # Drawings: keep original page exactly (rotation/crop preserved)
                     out.insert_pdf(src, from_page=pg_idx, to_page=pg_idx)
                     out_pg = out.load_page(out.page_count - 1)
-                else:
-                    # Surveys: normalize page to LANDSCAPE *before* any highlight/stamp by rendering
-                    # the visual page into a fresh page with rotation=0 and consistent mediabox/cropbox.
-                    b = src_pg.rect  # visual page rect (respects rotation); more reliable than bound() for HOR
-                    sw, sh = float(b.width), float(b.height)
+                    if use_text_annotations and rects:
+                        add_text_highlights(out_pg, rects, color=(1, 1, 0), opacity=0.35)
 
-                    if sw >= sh:
-                        tw, th = sw, sh
-                        rotate = 0
-                        rects = rects  # no-op
-                    else:
-                        # Force landscape: rotate visual page 90° clockwise into a (h,w) page
-                        tw, th = sh, sw
-                        rotate = 90
-                        rects = _rotate_rects_90_cw(rects, sw, sh)
-
-                    out_pg = out.new_page(width=tw, height=th)
-                    dst_rect = fitz.Rect(0, 0, tw, th)
-                    out_pg.show_pdf_page(dst_rect, src, pg_idx, rotate=rotate)
-
-                # Stamp survey filename at top-left (Arial 9, 10mm). Uses file name without .pdf
+                # Stamp survey filename at top-left (Arial 12). Uses file name without .pdf
                 if it.get("type") == "Survey":
-                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path))
+                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path), margin=100, fontsize=12)
                 if use_text_annotations and rects:
                     add_text_highlights(out_pg, rects, color=(1, 1, 0), opacity=0.35)
             else:
@@ -704,9 +705,9 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_
                 out_pg = out.new_page(width=tw, height=th)
                 dst_rect = fitz.Rect(0, 0, tw, th)
                 out_pg.show_pdf_page(dst_rect, src, pg_idx)
-                # Stamp survey filename at top-left (Arial 9, 10mm). Uses file name without .pdf
+                # Stamp survey filename at top-left (Arial 12). Uses file name without .pdf
                 if it.get("type") == "Survey":
-                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path))
+                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path), margin=100, fontsize=12)
                 # Ajustar rects para o novo tamanho
                 s, dx, dy = _fit_scale_and_offset(sw, sh, tw, th)
                 if use_text_annotations and rects:
