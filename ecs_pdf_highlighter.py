@@ -297,7 +297,6 @@ def build_prefixes_and_firstchars(cmp_keys_nosep):
             prefixes.add(key[:i])
     return prefixes, first_chars
 
-
 # ========================= Turbo (Aho–Corasick) =========================
 try:
     import ahocorasick  # pyahocorasick
@@ -313,10 +312,6 @@ def build_aho_automaton(cmp_keys_nosep):
             A.add_word(k, k)
     A.make_automaton()
     return A
-
-
-
-
 
 # ====================== Survey: highlight linha inteira ======================
 def _survey_line_span_rects(words_norm_list, target_rect, y_tol: float = 8.0, margin: float = 1.5):
@@ -353,168 +348,6 @@ def _survey_line_span_rects(words_norm_list, target_rect, y_tol: float = 8.0, ma
         return [(float(x0), float(y0), float(x1), float(y1))]
     except Exception:
         return [target_rect]
-
-
-# ====================== Tabular PDF: highlight adjacent cells ======================
-def _find_table_row_words(words_norm_list, target_norm, y_tol: float = 5.0):
-    """
-    Find all words on the same table row as the target code in a tabular PDF.
-    
-    For PDFs like "Cut Length Report", words are arranged in table columns.
-    This function finds the target code and returns all words on the same horizontal line.
-    
-    Args:
-        words_norm_list: List of tuples (x0, y0, x1, y1, norm, raw)
-        target_norm: Normalized target code to find (e.g., '9hor01st0001')
-        y_tol: Vertical tolerance for same-row detection
-    
-    Returns:
-        List of word tuples on the same row, or empty list if not found
-    """
-    if not words_norm_list or not target_norm:
-        return []
-    
-    # Find the target word(s)
-    target_words = []
-    for w in words_norm_list:
-        x0, y0, x1, y1, norm, raw = w
-        if target_norm in norm or norm in target_norm:
-            target_words.append(w)
-    
-    if not target_words:
-        # Try matching as substring across adjacent words
-        for i, w in enumerate(words_norm_list):
-            combined = w[4]
-            if i + 1 < len(words_norm_list):
-                combined += words_norm_list[i + 1][4]
-            if target_norm in combined:
-                target_words.append(w)
-                break
-    
-    if not target_words:
-        return []
-    
-    # Use the first found target to determine the row
-    tx0, ty0, tx1, ty1, _, _ = target_words[0]
-    tcy = (ty0 + ty1) * 0.5
-    
-    # Collect all words on the same row
-    row_words = []
-    for w in words_norm_list:
-        x0, y0, x1, y1, norm, raw = w
-        cy = (y0 + y1) * 0.5
-        # Check if on same row (within y_tol)
-        if abs(cy - tcy) <= y_tol:
-            row_words.append(w)
-    
-    # Sort by x position (left to right)
-    row_words.sort(key=lambda w: w[0])
-    return row_words
-
-
-def _get_adjacent_values_from_row(row_words, target_norm, include_before=1, include_after=10):
-    """
-    Extract adjacent values from a table row relative to the target code.
-    
-    Args:
-        row_words: List of word tuples sorted by x position
-        target_norm: Normalized target code
-        include_before: Number of columns to include before the target
-        include_after: Number of columns to include after the target
-    
-    Returns:
-        Tuple of (adjacent_words, target_idx) where adjacent_words is a list of 
-        (x0, y0, x1, y1, norm, raw) tuples
-    """
-    if not row_words:
-        return [], -1
-    
-    # Find target index
-    target_idx = -1
-    for i, w in enumerate(row_words):
-        if target_norm in w[4] or w[4] in target_norm:
-            target_idx = i
-            break
-    
-    if target_idx == -1:
-        # Try combined match
-        for i in range(len(row_words) - 1):
-            combined = row_words[i][4] + row_words[i + 1][4]
-            if target_norm in combined:
-                target_idx = i
-                break
-    
-    if target_idx == -1:
-        return row_words, -1  # Return all if target not found
-    
-    # Get adjacent words
-    start = max(0, target_idx - include_before)
-    end = min(len(row_words), target_idx + include_after + 1)
-    
-    return row_words[start:end], target_idx
-
-
-def _highlight_table_row_rects(words_norm_list, target_norm, margin: float = 2.0, y_tol: float = 5.0):
-    """
-    Generate highlight rectangles for a table row containing the target code.
-    
-    This creates individual rectangles for each cell in the row, which works
-    better for tabular PDFs than a single spanning rectangle.
-    
-    Args:
-        words_norm_list: List of word tuples (x0, y0, x1, y1, norm, raw)
-        target_norm: Normalized target code to find
-        margin: Padding around each word rectangle
-        y_tol: Vertical tolerance for row detection
-    
-    Returns:
-        List of (x0, y0, x1, y1) rectangles for highlighting
-    """
-    row_words = _find_table_row_words(words_norm_list, target_norm, y_tol)
-    if not row_words:
-        return []
-    
-    adjacent_words, _ = _get_adjacent_values_from_row(row_words, target_norm)
-    if not adjacent_words:
-        return []
-    
-    # Create a single encompassing rectangle for the entire row
-    x0 = min(w[0] for w in adjacent_words) - margin
-    y0 = min(w[1] for w in adjacent_words) - margin
-    x1 = max(w[2] for w in adjacent_words) + margin
-    y1 = max(w[3] for w in adjacent_words) + margin
-    
-    return [(max(0.0, x0), max(0.0, y0), x1, y1)]
-
-
-def _extract_adjacent_text_values(words_norm_list, target_norm, y_tol: float = 5.0):
-    """
-    Extract the actual text values adjacent to a target code in a table row.
-    
-    Useful for debugging and validation.
-    
-    Args:
-        words_norm_list: List of word tuples
-        target_norm: Normalized target code
-        y_tol: Vertical tolerance
-    
-    Returns:
-        Dict with 'raw_values' (list of raw text), 'normalized' (list of normalized),
-        and 'target_found' (bool)
-    """
-    row_words = _find_table_row_words(words_norm_list, target_norm, y_tol)
-    if not row_words:
-        return {'raw_values': [], 'normalized': [], 'target_found': False}
-    
-    adjacent_words, target_idx = _get_adjacent_values_from_row(row_words, target_norm)
-    
-    return {
-        'raw_values': [w[5] for w in adjacent_words],
-        'normalized': [w[4] for w in adjacent_words],
-        'target_found': target_idx >= 0
-    }
-
-
 
 # ============================ Scanners de PDF ===========================
 def scan_pdf_for_rects_fallback(
@@ -793,7 +626,124 @@ def stamp_filename_top_left(page, filename: str, margin: float = 28.346, fontsiz
             page.insert_text((x, y), name, fontsize=fontsize, fontname="helv")
     except Exception:
         pass
+def survey_row_highlight_rect(page: fitz.Page, ecs_code_pretty: str,
+                              y_tol: float = 3.0, pad: float = 1.2,
+                              header_tokens=None,
+                              max_concat_tokens: int = 3) -> "fitz.Rect | None":
+    """
+    Return ONE highlight rectangle for the *table row* that contains ecs_code_pretty.
 
+    Hard rules:
+      - NO rotation/orientation normalization (works in page's native coordinate space).
+      - Exact match of ECS code after normalize_nosep (no prefix/substring matching).
+      - Handles codes split across 2-3 adjacent tokens on the same line.
+      - Assumes text reading direction is left->right.
+
+    Strategy:
+      1) Extract words: (x0,y0,x1,y1,text,block,line,wordno)
+      2) Group words by (block,line) (stable for tabular PDFs).
+      3) Find the row where:
+           - any single token == target
+           OR
+           - concatenation of 2..max_concat_tokens adjacent tokens == target
+      4) Compute row span rectangle across the table width (within that row),
+         optionally clamped to table area inferred from header.
+    """
+
+    if not ecs_code_pretty:
+        return None
+
+    target = normalize_nosep(ecs_code_pretty)
+    if not target:
+        return None
+
+    words = page.get_text("words", sort=True)
+    if not words:
+        return None
+
+    # Convert to a lighter structure and group by (block,line)
+    lines = {}
+    for w in words:
+        x0, y0, x1, y1, txt, bno, lno, wno = w
+        n = normalize_nosep(txt or "")
+        if not n:
+            continue
+        lines.setdefault((bno, lno), []).append((float(x0), float(y0), float(x1), float(y1), n, txt))
+
+    # Ensure left->right ordering within each line
+    for k in list(lines.keys()):
+        lines[k].sort(key=lambda t: (t[0], t[1]))  # x0 then y0
+
+    # --- Optional: infer table bounds from header words to avoid highlighting outside table ---
+    # This is NOT orientation-based. It's just a clamp to "table region".
+    if header_tokens is None:
+        header_tokens = {"revision", "ecs", "code", "support", "size", "location", "design", "length"}
+
+    # Find approximate header bottom (y) and table x-span (x0..x1) from words below header
+    header_y_bottom = None
+    for ws in lines.values():
+        for x0, y0, x1, y1, n, raw in ws:
+            if normalize_nosep(raw).lower() in {normalize_nosep(t) for t in header_tokens}:
+                header_y_bottom = max(header_y_bottom or 0.0, y1)
+
+    # words below header -> estimate table x span
+    table_x0, table_x1 = page.rect.x0, page.rect.x1
+    below = []
+    if header_y_bottom is not None:
+        for ws in lines.values():
+            for x0, y0, x1, y1, n, raw in ws:
+                if y0 > header_y_bottom + 2:
+                    below.append((x0, x1))
+    if below:
+        table_x0 = min(a for a, b in below)
+        table_x1 = max(b for a, b in below)
+
+    # --- Find the row that contains the target ---
+    def _row_matches(ws):
+        norms = [t[4] for t in ws]  # normalized tokens
+        # 1) exact single token
+        if any(n == target for n in norms):
+            return True
+        # 2) exact concatenation of adjacent tokens
+        N = len(norms)
+        for i in range(N):
+            acc = norms[i]
+            if acc == target:
+                return True
+            for j in range(i + 1, min(N, i + max_concat_tokens)):
+                acc += norms[j]
+                if acc == target:
+                    return True
+        return False
+
+    target_row = None
+    for ws in lines.values():
+        if _row_matches(ws):
+            target_row = ws
+            break
+
+    if not target_row:
+        return None
+
+    # Compute row y-span from that line
+    y0 = min(t[1] for t in target_row) - pad
+    y1 = max(t[3] for t in target_row) + pad
+
+    # Compute x-span:
+    # For "adjacent values" we highlight across the whole table row (table_x0..table_x1)
+    x0 = table_x0
+    x1 = table_x1
+
+    # Clamp to page
+    x0 = max(page.rect.x0, x0)
+    x1 = min(page.rect.x1, x1)
+    y0 = max(page.rect.y0, y0)
+    y1 = min(page.rect.y1, y1)
+
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    return fitz.Rect(x0, y0, x1, y1)
 
 def combine_pages_to_new(out_path, page_units, use_text_annotations=True):
     """
@@ -2341,7 +2291,7 @@ class HighlighterApp(tk.Tk):
                                   for fn, pages in sorted(primary_file_pages[primary].items()))
             rows.append({"code": pretty, "total_pages": total_pages, "breakdown": breakdown})
 
-        missing_primary = sorted(list(ecs_primary_all - found_primary))
+        missing_primary = sorted(list(ecs_primary - found_primary))
         summary_csv = self._write_summary_csv(out_dir, root_name, week_number, rows)
         self._write_not_surveyed_csv(out_dir, root_name, week_number,
                                      [original_map_all.get(p, p) for p in missing_primary])
