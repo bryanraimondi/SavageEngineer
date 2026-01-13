@@ -582,13 +582,12 @@ def add_text_highlights(page, rects, color=(1, 1, 0), opacity=0.35):
 
 
 
-def stamp_filename_top_left(page, filename: str, x_margin: float = 28.346, y_margin: float = 12.0, fontsize: float = 9.0):
-    """Stamp survey filename (without .pdf) at top-left header band.
+def stamp_filename_top_left(page, filename: str, margin: float = 28.346, fontsize: float = 9.0):
+    """Stamp survey filename (without .pdf) at top-left.
 
     Requirements:
       - Font size = 9
-      - X margin = 10 mm from left edge (≈ 28.346 pt)
-      - Y position = fixed header band (default y_margin=12 pt + fontsize) to match the red-bar area
+      - Margin = 10 mm from edge (≈ 28.346 pt)
       - No background box
     Uses Arial if available, else Helvetica.
     """
@@ -599,10 +598,8 @@ def stamp_filename_top_left(page, filename: str, x_margin: float = 28.346, y_mar
         if not name:
             return
 
-        x = float(x_margin)
-        # Place text in the header safe-zone (red bar area): closer to top edge than 10mm.
-        # y_margin is the top margin to the TOP of the text; PyMuPDF uses the baseline, so add fontsize.
-        y = float(y_margin) + float(fontsize)
+        x = float(margin)
+        y = float(margin) + float(fontsize)
 
         arial = r"C:\\Windows\\Fonts\\arial.ttf"
         if os.path.exists(arial):
@@ -626,193 +623,114 @@ def _fit_scale_and_offset(src_w, src_h, dst_w, dst_h):
     return s, dx, dy
 
 
-def _rotate_rects_90_cw(rects, src_w, src_h):
-    """Rotate rectangles 90 degrees clockwise from a src (w,h) space to dst (h,w)."""
-    if not rects:
-        return rects
-    out = []
-    for (x0, y0, x1, y1) in rects:
-        # Normalize ordering just in case
-        if x1 < x0:
-            x0, x1 = x1, x0
-        if y1 < y0:
-            y0, y1 = y1, y0
-        nx0 = src_h - y1
-        ny0 = x0
-        nx1 = src_h - y0
-        ny1 = x1
-        out.append((nx0, ny0, nx1, ny1))
-    return out
-
-
-
-def survey_row_highlight_rect(page: fitz.Page, ecs_code_pretty: str,
-                              y_tol: float = 3.0, pad: float = 1.2,
-                              max_concat_tokens: int = 3) -> "fitz.Rect | None":
-    """Return ONE rectangle covering the *table row* that contains the ECS code.
-
-    Rules:
-      - NO rotation / orientation normalization. Uses page's native coordinate space.
-      - Exact match on normalize_nosep token (no prefix/substring matching).
-      - Handles codes split across 2-3 adjacent tokens on the same (block,line).
-      - Assumes reading direction is left->right.
-
-    The returned rect spans the table width inferred from words below the header.
+def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_to_a3=False):
     """
-    if not ecs_code_pretty:
-        return None
-    target = normalize_nosep(ecs_code_pretty)
-    if not target:
-        return None
-
-    words = page.get_text("words", sort=True)
-    if not words:
-        return None
-
-    # Group by (block,line)
-    lines = {}
-    for w in words:
-        x0, y0, x1, y1, txt, bno, lno, wno = w
-        n = normalize_nosep(txt or "")
-        if not n:
-            continue
-        lines.setdefault((bno, lno), []).append((float(x0), float(y0), float(x1), float(y1), n, txt))
-
-    if not lines:
-        return None
-
-    for k in list(lines.keys()):
-        lines[k].sort(key=lambda t: (t[0], t[1]))  # left->right
-
-    # Infer table X span using words below header (heuristic but layout-based, not orientation-based)
-    header_tokens = {normalize_nosep(t) for t in ("Revision", "ECS", "Code", "Support", "Size", "Location", "Design", "Length")}
-    header_y_bottom = None
-    for ws in lines.values():
-        for x0, y0, x1, y1, n, raw in ws:
-            if normalize_nosep(raw) in header_tokens:
-                header_y_bottom = max(header_y_bottom or 0.0, y1)
-
-    table_x0, table_x1 = page.rect.x0, page.rect.x1
-    below = []
-    if header_y_bottom is not None:
-        for ws in lines.values():
-            for x0, y0, x1, y1, n, raw in ws:
-                if y0 > header_y_bottom + 2:
-                    below.append((x0, x1))
-    if below:
-        table_x0 = min(a for a, b in below)
-        table_x1 = max(b for a, b in below)
-
-    def row_matches(ws):
-        norms = [t[4] for t in ws]
-        # exact token
-        if any(n == target for n in norms):
-            return True
-        # exact concat of adjacent tokens
-        N = len(norms)
-        for i in range(N):
-            acc = norms[i]
-            if acc == target:
-                return True
-            for j in range(i + 1, min(N, i + max_concat_tokens)):
-                acc += norms[j]
-                if acc == target:
-                    return True
-        return False
-
-    target_row = None
-    for ws in lines.values():
-        if row_matches(ws):
-            target_row = ws
-            break
-    if not target_row:
-        return None
-
-    y0 = min(t[1] for t in target_row) - pad
-    y1 = max(t[3] for t in target_row) + pad
-
-    # Clamp
-    x0 = max(page.rect.x0, table_x0)
-    x1 = min(page.rect.x1, table_x1)
-    y0 = max(page.rect.y0, y0)
-    y1 = min(page.rect.y1, y1)
-
-    if x1 <= x0 or y1 <= y0:
-        return None
-    return fitz.Rect(x0, y0, x1, y1)
-
-
-def combine_pages_to_new(out_path, page_units, use_text_annotations=True):
-    """Combine pages into a single output PDF.
-
-    HARD RULES:
-      - NEVER rotate / normalize orientation / cropbox/mediabox.
-      - Preserve the source page as-is (including rotation metadata) via insert_pdf().
-      - Surveys: highlight the *table row* containing the ECS code (exact match),
-        using survey_row_highlight_rect(); if user adjusted during Review, use unit['rects'] override.
-      - Stamp: applied ONLY on Surveys and ONLY ONCE.
+    Insere as páginas EXATAMENTE na ordem dada por page_units (sem agrupar por PDF).
+    Cada unit: { 'pdf_path', 'page_idx', 'rects' }
+    Corrigido: evita rotação inesperada usando insert_pdf no modo "tamanho original" e
+    usa bound() para decidir orientação quando escala para A3.
     """
     out = fitz.open()
     src_cache = {}
-
-    def _open_src(p):
-        if p not in src_cache:
-            src_cache[p] = fitz.open(p)
-        return src_cache[p]
-
     try:
         for it in page_units:
             pdf_path = it["pdf_path"]
             pg_idx = it["page_idx"]
-            rects = it.get("rects") or []
-            is_survey = (it.get("type") == "Survey")
-            code_pretty = (it.get("code_pretty") or "").strip()
+            rects = it.get("rects", [])
 
-            src = _open_src(pdf_path)
+            if pdf_path not in src_cache:
+                src_cache[pdf_path] = fitz.open(pdf_path)
+            src = src_cache[pdf_path]
             src_pg = src.load_page(pg_idx)
 
-            # Copy page as-is (preserve rotation metadata)
-            out.insert_pdf(src, from_page=pg_idx, to_page=pg_idx)
-            out_pg = out.load_page(out.page_count - 1)
+            if not scale_to_a3:
+                if it.get("type") == "Survey":
+                    # =========================================================
+                    # Survey NORMALIZATION (HOR fix)
+                    # - HOR files often come as A4 portrait mediabox with rotation=90
+                    # - Using insert_pdf keeps rotation metadata and causes "sideways" pages
+                    # - We "flatten" the page by rendering it onto a new page with rotation cancelled
+                    #   and using the VISUAL page size (src_pg.rect).
+                    # =========================================================
+                    sw, sh = float(src_pg.rect.width), float(src_pg.rect.height)
+                    out_pg = out.new_page(width=sw, height=sh)
+                    dst_rect = fitz.Rect(0, 0, sw, sh)
+                    rot_cancel = (360 - int(src_pg.rotation or 0)) % 360
+                    out_pg.show_pdf_page(dst_rect, src, pg_idx, rotate=rot_cancel)
 
-            # Stamp once for surveys
-            if is_survey:
-                stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path))
+                    # Transform rects from unrotated coords -> visual coords (rotated view)
+                    xfm_rects = rects
+                    if use_text_annotations and rects and (src_pg.rotation or 0):
+                        try:
+                            rm = src_pg.rotation_matrix
+                            xfm_rects = []
+                            for (x0, y0, x1, y1) in rects:
+                                r = fitz.Rect(x0, y0, x1, y1)
+                                # transform 4 corners, then bbox
+                                pts = [
+                                    r.tl * rm,
+                                    r.tr * rm,
+                                    r.bl * rm,
+                                    r.br * rm,
+                                ]
+                                xs = [p.x for p in pts]
+                                ys = [p.y for p in pts]
+                                xfm_rects.append((min(xs), min(ys), max(xs), max(ys)))
+                        except Exception:
+                            xfm_rects = rects
 
-            # Highlights
-            if not use_text_annotations:
-                continue
+                    # Stamp survey filename at top-left (Header band safe zone)
+                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path))
 
-            if is_survey and code_pretty:
-                # Use manual override if present, else compute
-                r0 = None
-                if rects:
-                    try:
-                        r0 = fitz.Rect(*rects[0])
-                    except Exception:
-                        r0 = None
-                if r0 is None:
-                    r0 = survey_row_highlight_rect(src_pg, code_pretty)
+                    if use_text_annotations and xfm_rects:
+                        add_text_highlights(out_pg, xfm_rects, color=(1, 1, 0), opacity=0.35)
+                else:
+                    # Drawings: keep original page exactly (rotation/crop preserved)
+                    out.insert_pdf(src, from_page=pg_idx, to_page=pg_idx)
+                    out_pg = out.load_page(out.page_count - 1)
+                    if use_text_annotations and rects:
+                        add_text_highlights(out_pg, rects, color=(1, 1, 0), opacity=0.35)
 
-                if r0:
-                    a = out_pg.add_rect_annot(r0)
-                    a.set_colors(stroke=None, fill=(1, 0.75, 0))
-                    a.set_opacity(0.35)
-                    a.update()
+                # Stamp survey filename at top-left (Arial 12). Uses file name without .pdf
+                if it.get("type") == "Survey":
+                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path), margin=100, fontsize=12)
+                if use_text_annotations and rects:
+                    add_text_highlights(out_pg, rects, color=(1, 1, 0), opacity=0.35)
+            else:
+                # Para A3, usar dimensões VISUAIS (respeita rotação/crop)
+                b = src_pg.bound()
+                sw, sh = float(b.width), float(b.height)
+                src_landscape = sw >= sh
+                tw, th = (A3_LANDSCAPE if src_landscape else A3_PORTRAIT)
+                out_pg = out.new_page(width=tw, height=th)
+                dst_rect = fitz.Rect(0, 0, tw, th)
+                out_pg.show_pdf_page(dst_rect, src, pg_idx)
+                # Stamp survey filename at top-left (Arial 12). Uses file name without .pdf
+                if it.get("type") == "Survey":
+                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path), margin=100, fontsize=12)
+                # Ajustar rects para o novo tamanho
+                s, dx, dy = _fit_scale_and_offset(sw, sh, tw, th)
+                if use_text_annotations and rects:
+                    xfm_rects = []
+                    for (x0, y0, x1, y1) in rects:
+                        fx0 = x0 * s + dx
+                        fy0 = y0 * s + dy
+                        fx1 = x1 * s + dx
+                        fy1 = y1 * s + dy
+                        xfm_rects.append((fx0, fy0, fx1, fy1))
+                    add_text_highlights(out_pg, xfm_rects, color=(1, 1, 0), opacity=0.35)
 
-            elif rects:
-                # Drawings: keep existing highlight behaviour (rects already provided)
-                add_text_highlights(out_pg, rects, color=(1, 1, 0), opacity=0.35)
-
+        out_path = uniquify_path(out_path)
+        out.save(out_path)
+        return out_path
     finally:
-        for d in src_cache.values():
+        for doc in src_cache.values():
             try:
-                d.close()
+                doc.close()
             except Exception:
                 pass
+        out.close()
 
-    out.save(out_path)
-    out.close()
 
 def chunk_list(seq, n):
     for i in range(0, len(seq), n):
@@ -1252,21 +1170,10 @@ class ReviewDialog(tk.Toplevel):
 
         self._preview_img = None
         self._zoom = 1.25
-        self._edit_mode = False
-        self._overlay_items = []
-        self._drag_mode = None
-        self._drag_start = None
-        self._cur_rect_pdf = None
-        # canvas editing bindings (active only in edit mode)
-        self.canvas.bind("<ButtonPress-1>", self._on_canvas_down)
-        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_up)
         controls = ttk.Frame(right)
         controls.pack(fill="x", pady=(6, 0))
         ttk.Button(controls, text="Zoom -", command=lambda: self._change_zoom(-0.15)).pack(side="left")
         ttk.Button(controls, text="Zoom +", command=lambda: self._change_zoom(+0.15)).pack(side="left", padx=6)
-        ttk.Button(controls, text="Edit highlight", command=self._toggle_edit).pack(side="left", padx=10)
-        ttk.Button(controls, text="Reset", command=self._reset_highlight).pack(side="left")
         self.stat = ttk.Label(controls, text="—")
         self.stat.pack(side="right")
 
@@ -1367,8 +1274,6 @@ class ReviewDialog(tk.Toplevel):
         self._rebuild_tree(self.units)
 
     def _ok(self):
-        # persist current highlight edit before closing
-        self._save_current_override()
         # devolve sequência final nas unidades marcadas como keep
         seq = []
         for i, it in enumerate(self.units):
@@ -1386,8 +1291,6 @@ class ReviewDialog(tk.Toplevel):
         self._preview_selected()
 
     def _preview_selected(self, event=None):
-        # save any edited highlight for the previously selected row
-        self._save_current_override()
         sel = self.tree.selection()
         if not sel:
             return
@@ -1409,218 +1312,16 @@ class ReviewDialog(tk.Toplevel):
                 mat = fitz.Matrix(z, z)
                 pix = pg.get_pixmap(matrix=mat, alpha=False)
                 png_bytes = pix.tobytes("png")
-                # Prepare default highlight overlay for Surveys
-                self._page_width_pdf = float(pg.rect.width)
-                self._page_height_pdf = float(pg.rect.height)
-                rect_pdf = None
-                try:
-                    if it.get('type') == 'Survey':
-                        # use override if exists
-                        rlist = it.get('rects') or []
-                        if rlist:
-                            rect_pdf = tuple(map(float, rlist[0]))
-                        elif it.get('code_pretty'):
-                            r = survey_row_highlight_rect(pg, it.get('code_pretty'))
-                            if r:
-                                rect_pdf = (r.x0, r.y0, r.x1, r.y1)
-                except Exception:
-                    rect_pdf = None
-                self._cur_rect_pdf = rect_pdf
                 b64 = base64.b64encode(png_bytes).decode("ascii")
                 img = tk.PhotoImage(data=b64)
                 self._preview_img = img
                 self.canvas.delete("all")
                 self.canvas.create_image(0, 0, anchor="nw", image=img)
                 self.canvas.config(scrollregion=(0, 0, img.width(), img.height()))
-                # Draw highlight overlay (if any)
-                self._draw_overlay(self._cur_rect_pdf)
         except Exception as e:
             self.canvas.delete("all")
             self.canvas.create_text(10, 10, anchor="nw", fill="white",
                                     text=f"Preview error:\n{e}")
-
-
-
-    # -------- Highlight edit helpers --------
-    def _toggle_edit(self):
-        self._edit_mode = not getattr(self, "_edit_mode", False)
-        # Update status text quickly
-        mode = "EDIT" if self._edit_mode else "VIEW"
-        try:
-            self.stat.config(text=f"{self.stat.cget('text')}  [{mode}]")
-        except Exception:
-            pass
-
-    def _reset_highlight(self):
-        # Remove override for current unit (if any) and redraw calculated overlay
-        sel = self.tree.selection()
-        if not sel:
-            return
-        iid = sel[0]
-        try:
-            pos = self._row_iids.index(iid)
-        except ValueError:
-            return
-        it = self.units[pos]
-        it["rects"] = []
-        self._cur_rect_pdf = None
-        self._preview_selected()
-
-    def _clear_overlay(self):
-        for item in getattr(self, "_overlay_items", []):
-            try:
-                self.canvas.delete(item)
-            except Exception:
-                pass
-        self._overlay_items = []
-
-    def _draw_overlay(self, rect_pdf):
-        # Draw overlay rectangle + corner handles in canvas coordinates
-        self._clear_overlay()
-        if not rect_pdf:
-            return
-        z = getattr(self, "_zoom", 1.25)
-        x0, y0, x1, y1 = rect_pdf
-        cx0, cy0, cx1, cy1 = x0 * z, y0 * z, x1 * z, y1 * z
-
-        # main rectangle
-        r_id = self.canvas.create_rectangle(cx0, cy0, cx1, cy1, outline="#ffcc00", width=2)
-        self._overlay_items.append(r_id)
-
-        # handles
-        hs = 6  # half-size
-        handles = {
-            "nw": (cx0, cy0),
-            "ne": (cx1, cy0),
-            "sw": (cx0, cy1),
-            "se": (cx1, cy1),
-        }
-        for tag, (hx, hy) in handles.items():
-            hid = self.canvas.create_rectangle(hx-hs, hy-hs, hx+hs, hy+hs, outline="#ffcc00", fill="#ffcc00", tags=("handle", tag))
-            self._overlay_items.append(hid)
-
-    def _save_current_override(self):
-        # Persist edited rect into current unit["rects"] as PDF coords
-        if not getattr(self, "_cur_rect_pdf", None):
-            return
-        sel = self.tree.selection()
-        if not sel:
-            return
-        iid = sel[0]
-        try:
-            pos = self._row_iids.index(iid)
-        except ValueError:
-            return
-        it = self.units[pos]
-        # Only surveys have editable highlight
-        if it.get("type") != "Survey":
-            return
-        x0, y0, x1, y1 = self._cur_rect_pdf
-        # normalize
-        x0, x1 = sorted([float(x0), float(x1)])
-        y0, y1 = sorted([float(y0), float(y1)])
-        it["rects"] = [(x0, y0, x1, y1)]
-
-    def _canvas_xy(self, event):
-        # Convert event coords to canvas coords considering scroll
-        return (self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
-
-    def _hit_test_handle(self, x, y):
-        # return handle tag if near a handle
-        items = self.canvas.find_withtag("handle")
-        for it in items:
-            bbox = self.canvas.bbox(it)
-            if bbox and bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3]:
-                tags = self.canvas.gettags(it)
-                # tags includes ("handle", "nw") etc.
-                for t in tags:
-                    if t in ("nw", "ne", "sw", "se"):
-                        return t
-        return None
-
-    def _on_canvas_down(self, event):
-        if not getattr(self, "_edit_mode", False):
-            return
-        if not getattr(self, "_cur_rect_pdf", None):
-            return
-        x, y = self._canvas_xy(event)
-        handle = self._hit_test_handle(x, y)
-        if handle:
-            self._drag_mode = handle
-        else:
-            # inside rect? then move
-            z = getattr(self, "_zoom", 1.25)
-            x0, y0, x1, y1 = self._cur_rect_pdf
-            cx0, cy0, cx1, cy1 = x0*z, y0*z, x1*z, y1*z
-            if cx0 <= x <= cx1 and cy0 <= y <= cy1:
-                self._drag_mode = "move"
-            else:
-                self._drag_mode = None
-                return
-        self._drag_start = (x, y, *self._cur_rect_pdf)
-
-    def _on_canvas_drag(self, event):
-        if not getattr(self, "_edit_mode", False):
-            return
-        if not self._drag_mode or not self._drag_start:
-            return
-        x, y = self._canvas_xy(event)
-        sx, sy, x0, y0, x1, y1 = self._drag_start
-        z = getattr(self, "_zoom", 1.25)
-
-        dx = (x - sx) / z
-        dy = (y - sy) / z
-
-        mode = self._drag_mode
-        nx0, ny0, nx1, ny1 = x0, y0, x1, y1
-
-        if mode == "move":
-            nx0, nx1 = x0 + dx, x1 + dx
-            ny0, ny1 = y0 + dy, y1 + dy
-        elif mode == "nw":
-            nx0, ny0 = x0 + dx, y0 + dy
-        elif mode == "ne":
-            nx1, ny0 = x1 + dx, y0 + dy
-        elif mode == "sw":
-            nx0, ny1 = x0 + dx, y1 + dy
-        elif mode == "se":
-            nx1, ny1 = x1 + dx, y1 + dy
-
-        # constrain minimum size
-        min_w, min_h = 10.0, 6.0
-        if (nx1 - nx0) < min_w:
-            if mode in ("nw", "sw"):
-                nx0 = nx1 - min_w
-            elif mode in ("ne", "se"):
-                nx1 = nx0 + min_w
-        if (ny1 - ny0) < min_h:
-            if mode in ("nw", "ne"):
-                ny0 = ny1 - min_h
-            elif mode in ("sw", "se"):
-                ny1 = ny0 + min_h
-
-        # clamp to page bounds if we have them
-        try:
-            pw = getattr(self, "_page_width_pdf", None)
-            ph = getattr(self, "_page_height_pdf", None)
-            if pw and ph:
-                nx0 = max(0.0, min(pw, nx0))
-                nx1 = max(0.0, min(pw, nx1))
-                ny0 = max(0.0, min(ph, ny0))
-                ny1 = max(0.0, min(ph, ny1))
-        except Exception:
-            pass
-
-        self._cur_rect_pdf = (nx0, ny0, nx1, ny1)
-        self._draw_overlay(self._cur_rect_pdf)
-
-    def _on_canvas_up(self, event):
-        if not getattr(self, "_edit_mode", False):
-            return
-        # persist rect into unit rects
-        self._save_current_override()
-        self._drag_mode = None
-        self._drag_start = None
 
 
 # ============================ UI: Summary Dialog ========================
@@ -2433,7 +2134,8 @@ class HighlighterApp(tk.Tk):
                 out_path = os.path.join(out_dir, fname)
                 try:
                     final_path = combine_pages_to_new(out_path, chunk,
-                                                      use_text_annotations=use_text_annotations)
+                                                      use_text_annotations=use_text_annotations,
+                                                      scale_to_a3=False)
                     if final_path:
                         saved_files.append(final_path)
                 except Exception as e:
