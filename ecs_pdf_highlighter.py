@@ -666,48 +666,43 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_
                             xfm_rects = []
                             for (x0, y0, x1, y1) in rects:
                                 r = fitz.Rect(x0, y0, x1, y1)
-                                # transform 4 corners, then bbox
-                                pts = [
-                                    r.tl * rm,
-                                    r.tr * rm,
-                                    r.bl * rm,
-                                    r.br * rm,
-                                ]
+                                pts = [r.tl * rm, r.tr * rm, r.bl * rm, r.br * rm]
                                 xs = [p.x for p in pts]
                                 ys = [p.y for p in pts]
                                 xfm_rects.append((min(xs), min(ys), max(xs), max(ys)))
                         except Exception:
                             xfm_rects = rects
 
-                    # Stamp survey filename at top-left (Header band safe zone)
+                    # ✅ Stamp (ONLY ONCE) — keep your validated settings (margin=10mm, fontsize=9)
                     stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path))
 
+                    # ✅ Highlight (ONLY ONCE)
                     if use_text_annotations and xfm_rects:
                         add_text_highlights(out_pg, xfm_rects, color=(1, 1, 0), opacity=0.35)
+
                 else:
                     # Drawings: keep original page exactly (rotation/crop preserved)
                     out.insert_pdf(src, from_page=pg_idx, to_page=pg_idx)
                     out_pg = out.load_page(out.page_count - 1)
+
                     if use_text_annotations and rects:
                         add_text_highlights(out_pg, rects, color=(1, 1, 0), opacity=0.35)
 
-                # Stamp survey filename at top-left (Arial 12). Uses file name without .pdf
-                if it.get("type") == "Survey":
-                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path), margin=100, fontsize=12)
-                if use_text_annotations and rects:
-                    add_text_highlights(out_pg, rects, color=(1, 1, 0), opacity=0.35)
             else:
                 # Para A3, usar dimensões VISUAIS (respeita rotação/crop)
                 b = src_pg.bound()
                 sw, sh = float(b.width), float(b.height)
                 src_landscape = sw >= sh
                 tw, th = (A3_LANDSCAPE if src_landscape else A3_PORTRAIT)
+
                 out_pg = out.new_page(width=tw, height=th)
                 dst_rect = fitz.Rect(0, 0, tw, th)
                 out_pg.show_pdf_page(dst_rect, src, pg_idx)
-                # Stamp survey filename at top-left (Arial 12). Uses file name without .pdf
+
+                # ✅ Stamp (ONLY ONCE) for surveys — keep validated settings
                 if it.get("type") == "Survey":
-                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path), margin=100, fontsize=12)
+                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path))
+
                 # Ajustar rects para o novo tamanho
                 s, dx, dy = _fit_scale_and_offset(sw, sh, tw, th)
                 if use_text_annotations and rects:
