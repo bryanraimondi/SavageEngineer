@@ -353,6 +353,169 @@ def _survey_line_span_rects(words_norm_list, target_rect, y_tol: float = 8.0, ma
         return [(float(x0), float(y0), float(x1), float(y1))]
     except Exception:
         return [target_rect]
+
+
+# ====================== Tabular PDF: highlight adjacent cells ======================
+def _find_table_row_words(words_norm_list, target_norm, y_tol: float = 5.0):
+    """
+    Find all words on the same table row as the target code in a tabular PDF.
+    
+    For PDFs like "Cut Length Report", words are arranged in table columns.
+    This function finds the target code and returns all words on the same horizontal line.
+    
+    Args:
+        words_norm_list: List of tuples (x0, y0, x1, y1, norm, raw)
+        target_norm: Normalized target code to find (e.g., '9hor01st0001')
+        y_tol: Vertical tolerance for same-row detection
+    
+    Returns:
+        List of word tuples on the same row, or empty list if not found
+    """
+    if not words_norm_list or not target_norm:
+        return []
+    
+    # Find the target word(s)
+    target_words = []
+    for w in words_norm_list:
+        x0, y0, x1, y1, norm, raw = w
+        if target_norm in norm or norm in target_norm:
+            target_words.append(w)
+    
+    if not target_words:
+        # Try matching as substring across adjacent words
+        for i, w in enumerate(words_norm_list):
+            combined = w[4]
+            if i + 1 < len(words_norm_list):
+                combined += words_norm_list[i + 1][4]
+            if target_norm in combined:
+                target_words.append(w)
+                break
+    
+    if not target_words:
+        return []
+    
+    # Use the first found target to determine the row
+    tx0, ty0, tx1, ty1, _, _ = target_words[0]
+    tcy = (ty0 + ty1) * 0.5
+    
+    # Collect all words on the same row
+    row_words = []
+    for w in words_norm_list:
+        x0, y0, x1, y1, norm, raw = w
+        cy = (y0 + y1) * 0.5
+        # Check if on same row (within y_tol)
+        if abs(cy - tcy) <= y_tol:
+            row_words.append(w)
+    
+    # Sort by x position (left to right)
+    row_words.sort(key=lambda w: w[0])
+    return row_words
+
+
+def _get_adjacent_values_from_row(row_words, target_norm, include_before=1, include_after=10):
+    """
+    Extract adjacent values from a table row relative to the target code.
+    
+    Args:
+        row_words: List of word tuples sorted by x position
+        target_norm: Normalized target code
+        include_before: Number of columns to include before the target
+        include_after: Number of columns to include after the target
+    
+    Returns:
+        Tuple of (adjacent_words, target_idx) where adjacent_words is a list of 
+        (x0, y0, x1, y1, norm, raw) tuples
+    """
+    if not row_words:
+        return [], -1
+    
+    # Find target index
+    target_idx = -1
+    for i, w in enumerate(row_words):
+        if target_norm in w[4] or w[4] in target_norm:
+            target_idx = i
+            break
+    
+    if target_idx == -1:
+        # Try combined match
+        for i in range(len(row_words) - 1):
+            combined = row_words[i][4] + row_words[i + 1][4]
+            if target_norm in combined:
+                target_idx = i
+                break
+    
+    if target_idx == -1:
+        return row_words, -1  # Return all if target not found
+    
+    # Get adjacent words
+    start = max(0, target_idx - include_before)
+    end = min(len(row_words), target_idx + include_after + 1)
+    
+    return row_words[start:end], target_idx
+
+
+def _highlight_table_row_rects(words_norm_list, target_norm, margin: float = 2.0, y_tol: float = 5.0):
+    """
+    Generate highlight rectangles for a table row containing the target code.
+    
+    This creates individual rectangles for each cell in the row, which works
+    better for tabular PDFs than a single spanning rectangle.
+    
+    Args:
+        words_norm_list: List of word tuples (x0, y0, x1, y1, norm, raw)
+        target_norm: Normalized target code to find
+        margin: Padding around each word rectangle
+        y_tol: Vertical tolerance for row detection
+    
+    Returns:
+        List of (x0, y0, x1, y1) rectangles for highlighting
+    """
+    row_words = _find_table_row_words(words_norm_list, target_norm, y_tol)
+    if not row_words:
+        return []
+    
+    adjacent_words, _ = _get_adjacent_values_from_row(row_words, target_norm)
+    if not adjacent_words:
+        return []
+    
+    # Create a single encompassing rectangle for the entire row
+    x0 = min(w[0] for w in adjacent_words) - margin
+    y0 = min(w[1] for w in adjacent_words) - margin
+    x1 = max(w[2] for w in adjacent_words) + margin
+    y1 = max(w[3] for w in adjacent_words) + margin
+    
+    return [(max(0.0, x0), max(0.0, y0), x1, y1)]
+
+
+def _extract_adjacent_text_values(words_norm_list, target_norm, y_tol: float = 5.0):
+    """
+    Extract the actual text values adjacent to a target code in a table row.
+    
+    Useful for debugging and validation.
+    
+    Args:
+        words_norm_list: List of word tuples
+        target_norm: Normalized target code
+        y_tol: Vertical tolerance
+    
+    Returns:
+        Dict with 'raw_values' (list of raw text), 'normalized' (list of normalized),
+        and 'target_found' (bool)
+    """
+    row_words = _find_table_row_words(words_norm_list, target_norm, y_tol)
+    if not row_words:
+        return {'raw_values': [], 'normalized': [], 'target_found': False}
+    
+    adjacent_words, target_idx = _get_adjacent_values_from_row(row_words, target_norm)
+    
+    return {
+        'raw_values': [w[5] for w in adjacent_words],
+        'normalized': [w[4] for w in adjacent_words],
+        'target_found': target_idx >= 0
+    }
+
+
+
 # ============================ Scanners de PDF ===========================
 def scan_pdf_for_rects_fallback(
     pdf_path,
@@ -362,9 +525,15 @@ def scan_pdf_for_rects_fallback(
     highlight_all_occurrences=False,
     survey_full_line=False,
     prefixes=None,
-    first_chars=None
+    first_chars=None,
+    use_tabular_mode=False
 ):
-    """Fallback (por palavras + janela multi-palavra + fallback por texto corrido)."""
+    """Fallback (por palavras + janela multi-palavra + fallback por texto corrido).
+    
+    Args:
+        use_tabular_mode: If True, uses enhanced table row detection for PDFs
+                          with tabular data like Cut Length Reports.
+    """
     if prefixes is None:
         prefixes, first_chars = build_prefixes_and_firstchars(cmp_keys_nosep)
     if first_chars is None:
@@ -413,8 +582,14 @@ def scan_pdf_for_rects_fallback(
                             if rkey not in rect_key_set:
                                 rect_key_set.add(rkey)
                                 
-                                if survey_full_line:
-                                    spans = _survey_line_span_rects(words_norm_list, (x0, y0, x1, y1))
+                                if survey_full_line or use_tabular_mode:
+                                    # Use enhanced tabular mode for better row detection
+                                    if use_tabular_mode:
+                                        spans = _highlight_table_row_rects(words_norm_list, k)
+                                        if not spans:
+                                            spans = _survey_line_span_rects(words_norm_list, (x0, y0, x1, y1))
+                                    else:
+                                        spans = _survey_line_span_rects(words_norm_list, (x0, y0, x1, y1))
                                     for (sx0, sy0, sx1, sy1) in spans:
                                         rkey2 = (round(sx0, 2), round(sy0, 2), round(sx1, 2), round(sy1, 2))
                                         if rkey2 not in rect_key_set:
@@ -448,9 +623,14 @@ def scan_pdf_for_rects_fallback(
                             code_pages[s].add(page.number)
                             matched.add(s)
                             
-                            if survey_full_line:
+                            if survey_full_line or use_tabular_mode:
                                 rx0, ry0, rx1, ry1 = rects_run[0]
-                                spans = _survey_line_span_rects(words_norm_list, (rx0, ry0, rx1, ry1))
+                                if use_tabular_mode:
+                                    spans = _highlight_table_row_rects(words_norm_list, s)
+                                    if not spans:
+                                        spans = _survey_line_span_rects(words_norm_list, (rx0, ry0, rx1, ry1))
+                                else:
+                                    spans = _survey_line_span_rects(words_norm_list, (rx0, ry0, rx1, ry1))
                                 for (sx0, sy0, sx1, sy1) in spans:
                                     rkey2 = (round(sx0, 2), round(sy0, 2), round(sx1, 2), round(sy1, 2))
                                     if rkey2 not in rect_key_set:
@@ -488,9 +668,15 @@ def scan_pdf_for_rects_ac(
     automaton,
     cancel_flag,
     highlight_all_occurrences=False,
-    survey_full_line=False
+    survey_full_line=False,
+    use_tabular_mode=False
 ):
-    """Scanner Aho–Corasick (por palavras)."""
+    """Scanner Aho–Corasick (por palavras).
+    
+    Args:
+        use_tabular_mode: If True, uses enhanced table row detection for PDFs
+                          with tabular data like Cut Length Reports.
+    """
     doc = fitz.open(pdf_path)
     hits = 0
     matched = set()
@@ -535,9 +721,14 @@ def scan_pdf_for_rects_ac(
                 code_pages[key].add(page.number)
                 matched.add(key)
                 
-                if survey_full_line:
+                if survey_full_line or use_tabular_mode:
                     x0, y0, x1, y1 = rects[ws]
-                    spans = _survey_line_span_rects(words_norm_list, (x0, y0, x1, y1))
+                    if use_tabular_mode:
+                        spans = _highlight_table_row_rects(words_norm_list, key)
+                        if not spans:
+                            spans = _survey_line_span_rects(words_norm_list, (x0, y0, x1, y1))
+                    else:
+                        spans = _survey_line_span_rects(words_norm_list, (x0, y0, x1, y1))
                     for (sx0, sy0, sx1, sy1) in spans:
                         rkey2 = (round(sx0, 2), round(sy0, 2), round(sx1, 2), round(sy1, 2))
                         if rkey2 not in rect_key_set:
@@ -948,7 +1139,8 @@ def _process_pdf_task(args):
         cmp_keys_list,
         use_ac,
         highlight_all_occurrences,
-        survey_full_line
+        survey_full_line,
+        use_tabular_mode  # New parameter for enhanced table row detection
     ) = args
     cancel_flag = _DummyCancel()
     cmp_keys = set(cmp_keys_list)
@@ -960,7 +1152,8 @@ def _process_pdf_task(args):
                 automaton=automaton,
                 cancel_flag=cancel_flag,
                 highlight_all_occurrences=highlight_all_occurrences,
-                survey_full_line=bool(survey_full_line)
+                survey_full_line=bool(survey_full_line),
+                use_tabular_mode=bool(use_tabular_mode)
             )
         else:
             prefixes, first_chars = build_prefixes_and_firstchars(cmp_keys)
@@ -973,7 +1166,8 @@ def _process_pdf_task(args):
                 highlight_all_occurrences=highlight_all_occurrences,
                 survey_full_line=bool(survey_full_line),
                 prefixes=prefixes,
-                first_chars=first_chars
+                first_chars=first_chars,
+                use_tabular_mode=bool(use_tabular_mode)
             )
 
         rects_by_page_ser = {int(k): [tuple(r) for r in v] for k, v in rects_by_page.items()}
@@ -1796,12 +1990,15 @@ class HighlighterApp(tk.Tk):
             for pdf in combined_pdfs:
                 is_survey_task = (pdf in survey_set)
                 cmp_list = sorted(list(cmp_keys_survey if is_survey_task else cmp_keys_drawing))
+                # Enable tabular mode for survey PDFs (Cut Length Reports) for better row detection
+                use_tabular = is_survey_task and treat_survey
                 tasks.append((
                     pdf,
                     cmp_list,
                     bool(turbo_mode and _HAS_AC),
                     bool(highlight_all_occurrences),
                     bool(is_survey_task),
+                    bool(use_tabular),  # New: enable tabular mode for survey PDFs
                 ))
 
             results = []
