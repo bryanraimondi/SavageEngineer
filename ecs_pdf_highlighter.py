@@ -60,9 +60,7 @@ def _early_bootstrap() -> None:
 
 _early_bootstrap()
 
-import os
 import re
-import sys
 import base64
 import hashlib
 import threading
@@ -2115,7 +2113,7 @@ class HighlighterApp(tk.Tk):
                 out_path = os.path.join(out_dir, fname)
                 try:
                     final_path = combine_pages_to_new(out_path, chunk,
-                                                      use_text_annotations=use_text_annotations,
+                                                      use_text_annotations=use_text_annotations)
                     if final_path:
                         saved_files.append(final_path)
                 except Exception as e:
@@ -2141,15 +2139,15 @@ class HighlighterApp(tk.Tk):
         for primary in sorted(primary_file_pages.keys()):
             total_pages = sum(len(pages) for pages in primary_file_pages[primary].values())
             found_primary.add(primary)
-            pretty = original_map.get(primary, primary)
+            pretty = original_map_all.get(primary, primary)
             breakdown = "; ".join(f"{fn}:{len(sorted(list(pages)))}"
                                   for fn, pages in sorted(primary_file_pages[primary].items()))
             rows.append({"code": pretty, "total_pages": total_pages, "breakdown": breakdown})
 
-        missing_primary = sorted(list(ecs_primary - found_primary))
+        missing_primary = sorted(list(ecs_primary_all - found_primary))
         summary_csv = self._write_summary_csv(out_dir, root_name, week_number, rows)
         self._write_not_surveyed_csv(out_dir, root_name, week_number,
-                                     [original_map.get(p, p) for p in missing_primary])
+                                     [original_map_all.get(p, p) for p in missing_primary])
         # Cover Sheet generation disabled (feature removed)
 
         SummaryDialog(self, rows, len(missing_primary), summary_csv)
