@@ -84,10 +84,6 @@ from typing import List, Dict, Optional
 DASH_CHARS = "-\u2010\u2011\u2012\u2013\u2014\u2212"  # -, ‐, -, ‒, –, —, −
 _STRIP_EDGE_PUNCT = re.compile(r'^[\s\"\'\(\)\[\]\{\}:;,.–—\-]+|[\s\"\'\(\)\[\]\{\}:;,.–—\-]+$')
 
-# A3 (72 pt/in)
-A3_PORTRAIT = (842.0, 1191.0)
-A3_LANDSCAPE = (1191.0, 842.0)
-
 # “Summary-like”
 SUMMARY_KEYWORDS = [
     "summary", "contents", "index", "bill of materials", "bom",
@@ -610,26 +606,18 @@ def stamp_filename_top_left(page, filename: str, margin: float = 28.346, fontsiz
         pass
 
 
-def _fit_scale_and_offset(src_w, src_h, dst_w, dst_h):
-    if src_w <= 0 or src_h <= 0:
-        return 1.0, 0.0, 0.0
-    sx = dst_w / src_w
-    sy = dst_h / src_h
-    s = min(sx, sy)
-    new_w = src_w * s
-    new_h = src_h * s
-    dx = (dst_w - new_w) * 0.5
-    dy = (dst_h - new_h) * 0.5
-    return s, dx, dy
-
-
-def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_to_a3=False):
+def combine_pages_to_new(out_path, page_units, use_text_annotations=True):
     """
-    Insere páginas na ordem de page_units.
-    IMPORTANT:
-      - Surveys: normaliza para landscape ANTES de highlight/stamp.
-      - HOR (rotation/cropbox inconsistentes): flatten via raster (pixmap) quando a página vem rotacionada.
-      - Stamp: aplicado UMA vez somente em Surveys, na safe-zone do header (barra vermelha).
+    NOTE: A3 scaling support removed for simplicity and robustness.
+    Combine pages into a single output PDF.
+
+    HARD RULES:
+      - DO NOT apply any rotation / orientation normalization to surveys.
+      - For non-A3 outputs, preserve the source page *as-is* (including rotation metadata).
+        We do this by using out.insert_pdf(...), not show_pdf_page().
+      - Surveys: highlight the full ROW containing the ECS code (reading direction left->right).
+        Matching is EXACT on normalized token (no prefix matching).
+      - Stamp is applied ONLY on Surveys and ONLY ONCE (position already validated by user).
     """
     out = fitz.open()
     src_cache = {}
@@ -639,88 +627,92 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True, scale_
             src_cache[p] = fitz.open(p)
         return src_cache[p]
 
+    def _norm(s: str) -> str:
+        return normalize_nosep(s or "")
+
+    def _find_survey_row_words_for_code(pg: fitz.Page, code_pretty: str):
+        target = _norm(code_pretty)
+        if not target:
+            return None
+        words = pg.get_text("words")
+        if not words:
+            return None
+
+        lines = {}
+        for w in words:
+            lines.setdefault((w[5], w[6]), []).append(w)
+        for k in list(lines.keys()):
+            lines[k].sort(key=lambda x: (x[0], x[1]))  # left->right
+
+        # 1) exact single word
+        for ws in lines.values():
+            for w in ws:
+                if _norm(str(w[4])) == target:
+                    return ws
+
+        # 2) concat 2-3 adjacent words (same row) for split codes
+        for ws in lines.values():
+            norms = [_norm(str(w[4])) for w in ws]
+            n = len(ws)
+            for i in range(n):
+                if i+1 < n and norms[i] and norms[i+1] and (norms[i] + norms[i+1]) == target:
+                    return ws
+                if i+2 < n and norms[i] and norms[i+1] and norms[i+2] and (norms[i] + norms[i+1] + norms[i+2]) == target:
+                    return ws
+        return None
+
+    def _add_row_highlight_from_words(dst_pg: fitz.Page, ws, color=(1, 0.75, 0), opacity=0.35):
+        try:
+            quads = []
+            for (x0, y0, x1, y1, _t, _b, _l, _wno) in ws:
+                r = fitz.Rect(float(x0), float(y0), float(x1), float(y1))
+                if r.width > 0.5 and r.height > 0.5:
+                    quads.append(fitz.Quad(r))
+            if not quads:
+                return
+            a = dst_pg.add_highlight_annot(quads)
+            a.set_colors(stroke=color)
+            a.set_opacity(opacity)
+            a.update()
+        except Exception:
+            return
+
     try:
         for it in page_units:
             pdf_path = it["pdf_path"]
             pg_idx = it["page_idx"]
-            rects = it.get("rects", [])
+            rects = it.get("rects", []) or []
             is_survey = (it.get("type") == "Survey")
+            code_pretty = (it.get("code_pretty") or "").strip()
 
             src = _open_src(pdf_path)
             src_pg = src.load_page(pg_idx)
 
-            # A3 path (mantém comportamento existente)
-            if scale_to_a3:
-                # A3 landscape in points: 1190.55 x 1683.78? Actually A3 is 842 x 1190 in portrait.
-                # Existing code expects tw/th based on bound() - keep it conservative.
-                b = src_pg.bound()
-                sw, sh = b.width, b.height
-                # target A3 landscape
-                tw, th = 1683.78, 1190.55
-                out_pg = out.new_page(width=tw, height=th)
-                dst_rect = fitz.Rect(0, 0, tw, th)
-                out_pg.show_pdf_page(dst_rect, src, pg_idx)
-                # Scale rects to A3
-                if use_text_annotations and rects:
-                    s, dx, dy = _fit_scale_and_offset(sw, sh, tw, th)
-                    scaled = []
-                    for (x0, y0, x1, y1) in rects:
-                        scaled.append((x0 * s + dx, y0 * s + dy, x1 * s + dx, y1 * s + dy))
-                    add_text_highlights(out_pg, scaled, color=(1, 1, 0), opacity=0.35)
-                if is_survey:
-                    stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path))
-                continue
+            # A3 scaling path: keep existing scaling logic (can use show_pdf_page)
+            # NON-A3: preserve page metadata (including rotation) by inserting the page as-is.
+            out.insert_pdf(src, from_page=pg_idx, to_page=pg_idx)
+            out_pg = out.load_page(out.page_count - 1)
 
-            # ---- NOT A3 ----
-            # Determine visual size (page.rect respects rotation)
-            tw, th = src_pg.rect.width, src_pg.rect.height
-            # Guarantee landscape for surveys (as per requirement)
-            if is_survey and tw < th:
-                tw, th = th, tw
-
-            out_pg = out.new_page(width=tw, height=th)
-
-            # For HOR-style surveys: if source page is rotated, raster-flatten to avoid crop/rotation madness.
-            # This is the most robust way to guarantee correct orientation.
-            if is_survey and (src_pg.rotation or 0) != 0:
-                # Render "as displayed" (PyMuPDF respects page rotation in get_pixmap)
-                pix = src_pg.get_pixmap(dpi=140)
-                out_pg.insert_image(fitz.Rect(0, 0, tw, th), stream=pix.tobytes("jpeg"), keep_proportion=False)
-            else:
-                # Vector path
-                out_pg.show_pdf_page(fitz.Rect(0, 0, tw, th), src, pg_idx)
-
-            # Stamp (ONLY ONCE) for surveys
             if is_survey:
                 stamp_filename_top_left(out_pg, it.get("display") or os.path.basename(pdf_path))
 
-            # Highlights (optional). If the source had rotation, transform rects to visual space once.
-            if use_text_annotations and rects:
-                xfm_rects = rects
-                if (src_pg.rotation or 0) != 0:
-                    try:
-                        rm = src_pg.rotation_matrix
-                        xfm_rects = []
-                        for (x0, y0, x1, y1) in rects:
-                            r = fitz.Rect(x0, y0, x1, y1)
-                            pts = [r.tl * rm, r.tr * rm, r.bl * rm, r.br * rm]
-                            xs = [p.x for p in pts]
-                            ys = [p.y for p in pts]
-                            xfm_rects.append((min(xs), min(ys), max(xs), max(ys)))
-                    except Exception:
-                        xfm_rects = rects
-                add_text_highlights(out_pg, xfm_rects, color=(1, 1, 0), opacity=0.35)
+            if use_text_annotations:
+                if is_survey and code_pretty:
+                    ws = _find_survey_row_words_for_code(src_pg, code_pretty)
+                    if ws:
+                        _add_row_highlight_from_words(out_pg, ws, color=(1, 0.75, 0), opacity=0.35)
+                elif rects:
+                    add_text_highlights(out_pg, rects, color=(1, 1, 0), opacity=0.35)
 
     finally:
-        for s in src_cache.values():
+        for d in src_cache.values():
             try:
-                s.close()
+                d.close()
             except Exception:
                 pass
 
     out.save(out_path)
     out.close()
-
 def chunk_list(seq, n):
     for i in range(0, len(seq), n):
         yield seq[i:i+n]
@@ -2124,7 +2116,6 @@ class HighlighterApp(tk.Tk):
                 try:
                     final_path = combine_pages_to_new(out_path, chunk,
                                                       use_text_annotations=use_text_annotations,
-                                                      scale_to_a3=False)
                     if final_path:
                         saved_files.append(final_path)
                 except Exception as e:
