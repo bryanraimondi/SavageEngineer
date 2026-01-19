@@ -627,7 +627,16 @@ class HighlighterApp(tk.Tk):
                     self.lbl_status.config(text="Error")
                     messagebox.showerror("Error", str(payload))
                 elif msg_type == "review_data":
-                    self._finalize_and_save(payload)
+                    try:
+                        _log("Opening Review window (review_data received)")
+                        self._finalize_and_save(payload)
+                    except Exception as e:
+                        _log_exception("FINALIZE/REVIEW ERROR", e)
+                        self.lbl_status.config(text="Error")
+                        try:
+                            messagebox.showerror("Error", str(e))
+                        except Exception:
+                            pass
                 elif msg_type == "done":
                     pass
         except queue.Empty:
@@ -766,17 +775,14 @@ class HighlighterApp(tk.Tk):
                         emitted = True
                     has_remaining = has_remaining or bool(buckets["S"] or buckets["D"] or (not used_itr_for_code[c] and buckets["ITR"]))
 
-        used_review = bool(self.review_pages_var.get())
-        if used_review:
-            dlg = ReviewDialog(self, review_units)
-            self.wait_window(dlg)
-            if dlg.selection is None:
-                self.lbl_status.config(text="Review canceled.")
-                return
-            ordered_kept = dlg.selection.get("sequence", [])
-        else:
-            ordered_kept = [(it["pdf_path"], it["page_idx"], it.get("code_pretty"), it.get("rects", []), it.get("type", "Drawing"))
-                            for it in review_units]
+        # Review is mandatory by project requirement.
+        # If the user closes/cancels the dialog, we abort saving.
+        dlg = ReviewDialog(self, review_units)
+        self.wait_window(dlg)
+        if dlg.selection is None:
+            self.lbl_status.config(text="Review canceled.")
+            return
+        ordered_kept = dlg.selection.get("sequence", [])
 
         # 4) Aplicar dedupe e salvar
         building_buckets = defaultdict(list)

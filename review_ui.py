@@ -14,6 +14,11 @@ class ReviewDialog(tk.Toplevel):
     def __init__(self, master, units):
         super().__init__(master)
         self.title("Review pages — interleaved S–D–ITR by code")
+        try:
+            if len(units) == 0:
+                print("[ReviewDialog] Opened with 0 units")
+        except Exception:
+            pass
         self.geometry("1200x740")
         self.minsize(1080, 660)
         # NOTE: Do not call transient() here; it disables minimize/maximize on Windows.
