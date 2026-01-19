@@ -18,6 +18,15 @@ class ReviewDialog(tk.Toplevel):
         self.minsize(1080, 660)
         # NOTE: Do not call transient() here; it disables minimize/maximize on Windows.
         self.grab_set()
+        # Bring the dialog to the front (Windows may open Toplevel behind the main window)
+        try:
+            self.lift()
+            self.focus_force()
+            self.attributes("-topmost", True)
+            self.after(250, lambda: self.attributes("-topmost", False))
+        except Exception:
+            pass
+
 
         self.units = list(units)  # lista de dicts (display, pdf_path, page_idx, code_pretty, rects, type)
         self.keep_idx = set(range(len(self.units)))

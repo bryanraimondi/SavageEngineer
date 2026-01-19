@@ -283,6 +283,21 @@ def _process_pdf_task(args):
         highlight_all_occurrences,
         survey_full_line
     ) = args
+    # Guard: skip empty/placeholder PDFs (PyMuPDF raises 'Cannot open empty file')
+    try:
+        if os.path.getsize(pdf_path) == 0:
+            return {
+                "pdf_path": pdf_path,
+                "display": os.path.basename(pdf_path),
+                "error": "File is 0 bytes (empty PDF). Skipped."
+            }
+    except OSError as e:
+        return {
+            "pdf_path": pdf_path,
+            "display": os.path.basename(pdf_path),
+            "error": f"Cannot stat file: {e}"
+        }
+
     cancel_flag = _DummyCancel()
     cmp_keys = set(cmp_keys_list)
     try:
