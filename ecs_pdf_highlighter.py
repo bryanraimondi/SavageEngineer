@@ -73,6 +73,8 @@ import pandas as pd
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+from collections import defaultdict, deque
+
 from rules import (
     load_table_with_dynamic_header, extract_ecs_codes_from_df, build_contextual_indexes,
     select_latest_revisions_any, sanitize_filename, uniquify_path, is_summary_keyword_page,
