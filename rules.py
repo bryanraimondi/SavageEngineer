@@ -8,9 +8,9 @@ import pandas as pd
 DASH_CHARS = "-\u2010\u2011\u2012\u2013\u2014\u2212"  # -, ‐, -, ‒, –, —, −
 _STRIP_EDGE_PUNCT = re.compile(r'^[\s\"\'\(\)\[\]\{\}:;,.–—\-]+|[\s\"\'\(\)\[\]\{\}:;,.–—\-]+$')
 
-# A3 (72 pt/in)
-A3_PORTRAIT = (842.0, 1191.0)
-A3_LANDSCAPE = (1191.0, 842.0)
+# Regex usado para inferir edifício (FIX v6)
+_FIRST_LETTERS = re.compile(r'^[A-Za-z]+')
+
 
 # “Summary-like”
 SUMMARY_KEYWORDS = [
@@ -149,27 +149,9 @@ def build_compare_index(ecs_primary, ignore_leading_digit):
 
 
 def build_contextual_indexes(ecs_primary_all: set):
-    """
-    Contextual ECS matching rules:
-
-    - Surveys: unit-aware -> match FULL normalized code only (e.g. '1hk10st4072')
-    - Drawings: unitless -> match WITHOUT the leading unit digit (e.g. 'hk10st4072')
-      plus a leading-dash variant (e.g. '-hk10st4072') to match drawings that show codes with a leading '-'.
-
-    - EXCEPTION: HG systems (0HG/1HG/9HG):
-        * Drawings are unit-aware for HG -> match FULL code (e.g. '1hg0101zl...')
-        * BUT if the drawing shows a leading '-' (e.g. '-hg0101zl...'), it can match ANY unit.
-          In that case we allow '-'+remainder and map it to ALL HG primaries that share the remainder.
-
-    Returns:
-        cmp_keys_survey: set[str]
-        cmp_keys_drawing: set[str]
-        cmp_to_primaries: dict[str, list[str]]  (one cmp-key can map to multiple unit-specific primaries)
-        max_code_len: int
-    """
     cmp_survey = set()
     cmp_drawing = set()
-    cmp_to_primaries: Dict[str, List[str]] = {}
+    cmp_to_primaries = {}
 
     def _add_map(k: str, primary: str, target_set: set):
         if not k:
@@ -184,13 +166,10 @@ def build_contextual_indexes(ecs_primary_all: set):
         if not full:
             continue
 
-        # Survey: always unit-aware (full code)
         _add_map(full, primary, cmp_survey)
 
-        # Determine HG (e.g. 0HG/1HG/9HG)
         is_hg = bool(len(full) >= 3 and full[0].isdigit() and full[1:3] == "hg")
 
-        # Build remainder (strip leading unit digit if present)
         if primary and str(primary)[0].isdigit():
             remainder = normalize_nosep(str(primary)[1:])
         else:
@@ -201,12 +180,9 @@ def build_contextual_indexes(ecs_primary_all: set):
             continue
 
         if is_hg:
-            # HG drawings must match the unit (full code)
             _add_map(full, primary, cmp_drawing)
-            # But leading '-' in drawings can match any unit
             _add_map("-" + remainder, primary, cmp_drawing)
         else:
-            # Non-HG drawings are unitless
             _add_map(remainder, primary, cmp_drawing)
             _add_map("-" + remainder, primary, cmp_drawing)
 
@@ -235,7 +211,6 @@ def infer_building_from_code(pretty_code: str) -> str:
     if not s:
         return "UNKWN"
     s_no = re.sub(r'[^0-9A-Za-z\-]', '', s)
-    # Regra simples: se tiver hífen cedo, 2 letras; senão 3 letras
     t = re.sub(r'^[0-9\-]+', '', s_no)
     m2 = _FIRST_LETTERS.match(t)
     if not m2:
@@ -332,9 +307,6 @@ def looks_like_summary_by_neighbors(codes_on_page_pretty, neighbor_min_hits=3):
 
 
 def is_summary_like(pdf_path, page_idx, codes_on_page, threshold=15, neighbor_min_hits=3):
-    """
-    Heurística para páginas 'summary' (não usada para surveys).
-    """
     try:
         if codes_on_page and looks_like_summary_by_neighbors(codes_on_page, neighbor_min_hits=neighbor_min_hits):
             return True
@@ -351,15 +323,13 @@ def is_summary_like(pdf_path, page_idx, codes_on_page, threshold=15, neighbor_mi
     return False
 
 
-# -------- Escolha da última revisão (survey & handbooks/desenhos) --------
+# -------- Escolha da última revisão --------
 _REV_LET_RE = re.compile(r'(?:^|[^A-Z0-9])REV\s*([A-Z]{1,3})(?:[^A-Z0-9]|$)', re.IGNORECASE)
 _REV_NUM_RE = re.compile(r'(?:^|[^0-9])REV\s*([0-9]{1,3})(?:[^0-9]|$)', re.IGNORECASE)
 _TAIL_LET_RE = re.compile(r'([_\-])([A-Z]{1,3})(?:\.pdf)?$', re.IGNORECASE)
 
 
-
 def _rev_letters_to_int(s: str) -> int:
-    """Convert Excel-style revision letters to an integer: A=1, ..., Z=26, AA=27, AB=28, ..."""
     if not s:
         return 0
     s = re.sub(r'[^A-Z]', '', str(s).upper())
@@ -367,16 +337,15 @@ def _rev_letters_to_int(s: str) -> int:
         return 0
     val = 0
     for ch in s:
-        if 'A' <= ch <= 'Z':
-            val = val * 26 + (ord(ch) - ord('A') + 1)
+        val = val * 26 + (ord(ch) - ord('A') + 1)
     return val
+
 
 def _parse_revision_from_name(name: str) -> int:
     if not name:
         return 0
     m = _REV_LET_RE.search(name)
     if m:
-        # Letters: A..Z, AA.. etc (Excel-style ordering)
         return 1000 + _rev_letters_to_int(m.group(1))
     m = _REV_NUM_RE.search(name)
     if m:
@@ -385,7 +354,6 @@ def _parse_revision_from_name(name: str) -> int:
     if m:
         return 1000 + _rev_letters_to_int(m.group(2))
     return 0
-
 
 
 def _strip_revision_tokens(name: str) -> str:
@@ -431,10 +399,7 @@ def select_latest_non_survey_revisions(pdf_paths: list) -> list:
     return out
 
 
-
-
 def select_latest_revisions_any(pdf_paths: list) -> list:
-    """Keep only the latest REV per base filename (generic, no survey/drawing classification)."""
     groups = {}
     for p in pdf_paths:
         fname = os.path.basename(p)
@@ -447,9 +412,8 @@ def select_latest_revisions_any(pdf_paths: list) -> list:
     out = sorted(set(out), key=lambda x: os.path.basename(x).lower())
     return out
 
+
 # ========================== Tarefa do worker (MP) =======================
-
-
 def chunk_list(seq, n):
     for i in range(0, len(seq), n):
         yield seq[i:i+n]
