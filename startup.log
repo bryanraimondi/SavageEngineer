@@ -1,0 +1,18 @@
+[2026-01-17 11:50:22] ==== APP START ====
+[2026-01-17 11:50:22] sys.version=3.11.2 (main, Apr 28 2025, 14:11:48) [GCC 12.2.0]
+[2026-01-17 11:50:22] frozen=False
+[2026-01-17 11:50:22] executable=/opt/pyvenv/bin/python
+[2026-01-17 11:50:22] cwd=/home/oai
+[2026-01-17 11:50:22] app_dir=/mnt/data/refactor
+[2026-01-17 11:51:36] ==== APP START ====
+[2026-01-17 11:51:36] sys.version=3.11.2 (main, Apr 28 2025, 14:11:48) [GCC 12.2.0]
+[2026-01-17 11:51:36] frozen=False
+[2026-01-17 11:51:36] executable=/opt/pyvenv/bin/python
+[2026-01-17 11:51:36] cwd=/home/oai
+[2026-01-17 11:51:36] app_dir=/mnt/data/refactor
+[2026-01-17 11:51:54] ==== APP START ====
+[2026-01-17 11:51:54] sys.version=3.11.2 (main, Apr 28 2025, 14:11:48) [GCC 12.2.0]
+[2026-01-17 11:51:54] frozen=False
+[2026-01-17 11:51:54] executable=/opt/pyvenv/bin/python
+[2026-01-17 11:51:54] cwd=/home/oai
+[2026-01-17 11:51:54] app_dir=/mnt/data/refactor
