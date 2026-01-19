@@ -141,22 +141,26 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True):
             if not use_text_annotations:
                 continue
 
-            if is_survey and code_pretty:
-                # Use manual override if present, else compute
-                r0 = None
+            if is_survey:
+                # Surveys: if user provided manual override rects, apply ALL of them (supports combined surveys).
+                # Otherwise compute a single row band for the code (if provided).
                 if rects:
-                    try:
-                        r0 = fitz.Rect(*rects[0])
-                    except Exception:
-                        r0 = None
-                if r0 is None:
+                    for r in rects:
+                        try:
+                            rr = fitz.Rect(*r)
+                            a = out_pg.add_rect_annot(rr)
+                            a.set_colors(stroke=None, fill=(1, 0.75, 0))
+                            a.set_opacity(0.35)
+                            a.update()
+                        except Exception:
+                            pass
+                elif code_pretty:
                     r0 = survey_row_highlight_rect(src_pg, code_pretty)
-
-                if r0:
-                    a = out_pg.add_rect_annot(r0)
-                    a.set_colors(stroke=None, fill=(1, 0.75, 0))
-                    a.set_opacity(0.35)
-                    a.update()
+                    if r0:
+                        a = out_pg.add_rect_annot(r0)
+                        a.set_colors(stroke=None, fill=(1, 0.75, 0))
+                        a.set_opacity(0.35)
+                        a.update()
 
             elif rects:
                 # Drawings: keep existing highlight behaviour (rects already provided)

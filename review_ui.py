@@ -16,11 +16,14 @@ class ReviewDialog(tk.Toplevel):
         self.title("Review pages — interleaved S–D–ITR by code")
         self.geometry("1200x740")
         self.minsize(1080, 660)
-        self.transient(master)
+        # NOTE: Do not call transient() here; it disables minimize/maximize on Windows.
         self.grab_set()
 
         self.units = list(units)  # lista de dicts (display, pdf_path, page_idx, code_pretty, rects, type)
         self.keep_idx = set(range(len(self.units)))
+        # If enabled, surveys that are on the same PDF page will be combined into a single output page.
+        # Review remains per-code (easier to validate), but output can be deduplicated for printing.
+        self.combine_surveys_same_page_var = tk.BooleanVar(value=False)
 
         paned = ttk.Panedwindow(self, orient="horizontal")
         paned.pack(fill="both", expand=True, padx=8, pady=8)
@@ -101,6 +104,13 @@ class ReviewDialog(tk.Toplevel):
         btns.pack(fill="x", padx=8, pady=(6, 8))
         ttk.Button(btns, text="Select All", command=self._select_all).pack(side="left")
         ttk.Button(btns, text="Clear All", command=self._clear_all).pack(side="left", padx=6)
+        ttk.Button(btns, text="Toggle Selected", command=self._toggle_selected_btn).pack(side="left", padx=6)
+        ttk.Checkbutton(
+            btns,
+            text="Combine surveys on same page",
+            variable=self.combine_surveys_same_page_var
+        ).pack(side="left", padx=10)
+
         ttk.Button(btns, text="OK", command=self._ok).pack(side="right")
         ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right", padx=6)
 
@@ -185,8 +195,29 @@ class ReviewDialog(tk.Toplevel):
             self.keep_idx.add(pos)
             self.tree.set(iid, "keep", "[x]")
 
+    def _toggle_selected_btn(self):
+        """Toggle keep/unkeep for the currently selected row (no mouse event required)."""
+        sel = self.tree.selection()
+        iid = sel[0] if sel else self.tree.focus()
+        if not iid:
+            return
+        try:
+            pos = self._row_iids.index(iid)
+        except ValueError:
+            return
+        if pos in self.keep_idx:
+            self.keep_idx.remove(pos)
+            self.tree.set(iid, "keep", "[ ]")
+        else:
+            self.keep_idx.add(pos)
+            self.tree.set(iid, "keep", "[x]")
+
+
     def _select_all(self):
         self.keep_idx = set(range(len(self.units)))
+        # If enabled, surveys that are on the same PDF page will be combined into a single output page.
+        # Review remains per-code (easier to validate), but output can be deduplicated for printing.
+        self.combine_surveys_same_page_var = tk.BooleanVar(value=False)
         self._rebuild_tree(self.units)
 
     def _clear_all(self):
@@ -194,13 +225,54 @@ class ReviewDialog(tk.Toplevel):
         self._rebuild_tree(self.units)
 
     def _ok(self):
-        # persist current highlight edit before closing
-        self._save_current_override()
-        # devolve sequência final nas unidades marcadas como keep
+        # Build final sequence in the order shown in the Review (keep only checked items).
         seq = []
         for i, it in enumerate(self.units):
             if i in self.keep_idx:
-                seq.append((it["pdf_path"], it["page_idx"], it.get("code_pretty"), it.get("rects", []), it.get("type", "Drawing")))
+                seq.append((
+                    it["pdf_path"],
+                    it["page_idx"],
+                    it.get("code_pretty"),
+                    it.get("rects", []),
+                    it.get("type", "Drawing")
+                ))
+
+        # Optional: combine surveys that point to the same PDF page into a single output page.
+        # This does NOT change the Review (still per-code), only the final output sequence.
+        if bool(self.combine_surveys_same_page_var.get()):
+            combined = []
+            survey_groups = {}  # (pdf_path, page_idx) -> {"rects": [...], "display": ..., "type": "Survey"}
+            for (pdf_path, page_idx, code_pretty, rects, typ) in seq:
+                if typ == "Survey":
+                    key = (pdf_path, page_idx)
+                    g = survey_groups.setdefault(key, {"rects": []})
+                    # Merge rectangles (can be empty; empty means "compute later", but when combining we prefer explicit rects)
+                    if rects:
+                        for r in rects:
+                            try:
+                                t = tuple(map(float, r))
+                                if len(t) == 4 and t not in g["rects"]:
+                                    g["rects"].append(t)
+                            except Exception:
+                                pass
+                else:
+                    combined.append((pdf_path, page_idx, code_pretty, rects, typ))
+
+            # Append merged surveys back in a stable order (first appearance order in seq)
+            seen = set()
+            for (pdf_path, page_idx, code_pretty, rects, typ) in seq:
+                if typ != "Survey":
+                    continue
+                key = (pdf_path, page_idx)
+                if key in seen:
+                    continue
+                seen.add(key)
+                g = survey_groups.get(key, {"rects": []})
+                # For combined surveys we can leave code_pretty empty; rects drive the highlights.
+                combined.append((pdf_path, page_idx, "", g["rects"], "Survey"))
+
+            seq = combined
+
         self.selection = {"sequence": seq}
         self.destroy()
 
@@ -457,7 +529,7 @@ class SummaryDialog(tk.Toplevel):
         self.title("Match Summary")
         self.geometry("900x520")
         self.minsize(860, 480)
-        self.transient(master)
+        # NOTE: Do not call transient() here; it disables minimize/maximize on Windows.
         self.grab_set()
 
         info = ttk.Label(self, text=f"Codes not found: {not_found_count} \n Summary CSV: {summary_csv_path}")
