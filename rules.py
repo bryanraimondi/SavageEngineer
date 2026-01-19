@@ -1,6 +1,7 @@
 import os, re, hashlib
 from collections import defaultdict, deque
 import fitz
+import pandas as pd
 
 
 # ======================= Normalização & utilitários =======================
