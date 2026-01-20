@@ -712,23 +712,21 @@ class HighlighterApp(tk.Tk):
                             per_code_rects = rects_by_page.get(pg, [])
                         _push_unit(pdf_path, display, pg, unit_type, pretty, per_code_rects)
                 else:
-                    # ECS-based fallback: recover codes from code_rects_by_page keys
+                    # ECS-based fallback: if page_codes is empty, recover codes from code_rects_by_page keys.
+                    # This keeps grouping logic based on the ECS matches (NOT filename).
                     page_code_dict = code_rects_by_page.get(pg, {}) or {}
 
                     if page_code_dict:
                         for cmp_key in sorted(page_code_dict.keys()):
                             per_code_rects = page_code_dict.get(cmp_key, [])
-
                             primaries = self.cmp_to_primaries.get(
                                 cmp_key,
                                 [self.nosep_to_primary.get(cmp_key, cmp_key)]
                             )
-
                             pretty_list = sorted({
                                 self.ecs_original_map.get(primary, primary)
                                 for primary in primaries
                             })
-
                             for pretty in pretty_list:
                                 _push_unit(
                                     pdf_path,
@@ -861,9 +859,13 @@ class HighlighterApp(tk.Tk):
                                                       use_text_annotations=use_text_annotations)
                     if final_path:
                         saved_files.append(final_path)
+                    _log(f"[SAVE_DONE] building={bld} part={part_idx} pages={len(chunk)} path={out_path}")
                 except Exception as e:
+                    _log_exception(f"[SAVE_FAIL] building={bld} part={part_idx} path={out_path}", e)
                     messagebox.showerror("Combine", f"Could not save {fname}:\n{e}")
                 part_idx += 1
+
+        _log(f"[SAVE_SUMMARY] total_files={len(saved_files)} files={saved_files}")
 
         if saved_files:
             self.lbl_status.config(text=f"Saved {len(saved_files)} file(s)")
@@ -896,6 +898,8 @@ class HighlighterApp(tk.Tk):
         # Cover Sheet generation disabled (feature removed)
 
         SummaryDialog(self, rows, len(missing_primary), summary_csv)
+
+        _log("[FINALIZE] _finalize_and_save completed")
 
     # ===== CSVs & Cover =====
     def _write_summary_csv(self, out_dir, root_name, week_number, rows):
