@@ -712,8 +712,35 @@ class HighlighterApp(tk.Tk):
                             per_code_rects = rects_by_page.get(pg, [])
                         _push_unit(pdf_path, display, pg, unit_type, pretty, per_code_rects)
                 else:
-                    rects = rects_by_page.get(pg, [])
-                    _push_unit(pdf_path, display, pg, unit_type, "", rects)
+                    # ECS-based fallback: recover codes from code_rects_by_page keys
+                    page_code_dict = code_rects_by_page.get(pg, {}) or {}
+
+                    if page_code_dict:
+                        for cmp_key in sorted(page_code_dict.keys()):
+                            per_code_rects = page_code_dict.get(cmp_key, [])
+
+                            primaries = self.cmp_to_primaries.get(
+                                cmp_key,
+                                [self.nosep_to_primary.get(cmp_key, cmp_key)]
+                            )
+
+                            pretty_list = sorted({
+                                self.ecs_original_map.get(primary, primary)
+                                for primary in primaries
+                            })
+
+                            for pretty in pretty_list:
+                                _push_unit(
+                                    pdf_path,
+                                    display,
+                                    pg,
+                                    unit_type,
+                                    pretty,
+                                    per_code_rects or rects_by_page.get(pg, [])
+                                )
+                    else:
+                        rects = rects_by_page.get(pg, [])
+                        _push_unit(pdf_path, display, pg, unit_type, "", rects)
 
         # 2) Acrescentar ITRs por código
         per_building_per_code = defaultdict(lambda: defaultdict(lambda: {"S": deque(), "D": deque(), "ITR": []}))
