@@ -4,6 +4,75 @@ from typing import Optional
 from rules import normalize_nosep
 
 
+def stamp_filename_top_left(page: fitz.Page, text: str, fontsize: float = 12.0):
+    """
+    Stamp the given text at the top-left corner of the page.
+
+    Minimal, robust implementation:
+      - No rotation/orientation normalization
+      - Uses the page's native coordinate space
+      - Best-effort insertion (never crashes the pipeline)
+    """
+    try:
+        if not text:
+            return
+
+        # Small margins from the top-left of the page rect
+        x = page.rect.x0 + 12
+        y = page.rect.y0 + 18
+
+        # Use built-in PDF base font (Helvetica) as a safe default.
+        # (Arial is not guaranteed to exist inside PDF fonts.)
+        page.insert_text(
+            (x, y),
+            str(text),
+            fontsize=fontsize,
+            fontname="helv",
+            color=(0, 0, 0),
+            overlay=True
+        )
+    except Exception:
+        # Never let stamping break saving
+        return
+
+
+def add_text_highlights(page: fitz.Page, rects, color=(1, 1, 0), opacity: float = 0.35):
+    """
+    Add highlight annotations to a page using rectangles.
+
+    rects is expected to be an iterable of:
+      - (x0, y0, x1, y1)
+      - or fitz.Rect
+      - or dict-like with keys: x0,y0,x1,y1
+
+    Minimal, tolerant implementation: skips invalid rectangles, never raises.
+    """
+    if not rects:
+        return
+
+    for r in rects:
+        try:
+            if isinstance(r, fitz.Rect):
+                rr = r
+            elif isinstance(r, (list, tuple)) and len(r) == 4:
+                rr = fitz.Rect(float(r[0]), float(r[1]), float(r[2]), float(r[3]))
+            elif isinstance(r, dict):
+                rr = fitz.Rect(float(r["x0"]), float(r["y0"]), float(r["x1"]), float(r["y1"]))
+            else:
+                continue
+
+            if rr.is_empty or rr.width <= 0 or rr.height <= 0:
+                continue
+
+            a = page.add_rect_annot(rr)
+            a.set_colors(stroke=None, fill=color)
+            a.set_opacity(opacity)
+            a.update()
+        except Exception:
+            # Skip bad rects
+            continue
+
+
 def survey_row_highlight_rect(page: fitz.Page, ecs_code_pretty: str,
                               y_tol: float = 3.0, pad: float = 1.2,
                               max_concat_tokens: int = 3) -> "fitz.Rect | None":
@@ -176,8 +245,7 @@ def combine_pages_to_new(out_path, page_units, use_text_annotations=True):
     out.save(out_path)
     out.close()
 
+
 def chunk_list(seq, n):
     for i in range(0, len(seq), n):
         yield seq[i:i+n]
-
-
