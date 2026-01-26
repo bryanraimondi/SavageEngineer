@@ -740,6 +740,19 @@ class HighlighterApp(tk.Tk):
                         rects = rects_by_page.get(pg, [])
                         _push_unit(pdf_path, display, pg, unit_type, "", rects)
 
+        
+        # ---- Building lookup by (pdf_path, page_idx, type) to avoid UNKWN outputs ----
+        # Some units may reach the save stage with code_pretty empty (e.g., combined survey highlights).
+        # We still want Surveys/Drawings to be bucketed by building based on the ECS matches detected earlier.
+        bld_by_page = defaultdict(set)  # (pdf_path, page_idx, type) -> {building}
+        try:
+            for bld, _lst in units_by_building.items():
+                for _it in _lst:
+                    k = (_it.get("pdf_path"), int(_it.get("page_idx", -1)), _it.get("type"))
+                    bld_by_page[k].add(bld)
+        except Exception:
+            bld_by_page = defaultdict(set)
+
         # 2) Acrescentar ITRs por código
         per_building_per_code = defaultdict(lambda: defaultdict(lambda: {"S": deque(), "D": deque(), "ITR": []}))
 
@@ -835,11 +848,37 @@ class HighlighterApp(tk.Tk):
                         return
                     seen_hashes.add(fpsum)
 
+            # Determine building(s)
+            blds = set()
             if code_pretty:
-                bld = infer_building_from_code(code_pretty)
+                blds.add(infer_building_from_code(code_pretty))
             else:
-                bld = "UNKWN"
-            building_buckets[bld].append({"pdf_path": pdf_path, "page_idx": pg, "rects": rects or [], "type": unit_type, "display": os.path.basename(pdf_path)})
+                # Fallback to previously detected building(s) for this exact page/type
+                try:
+                    k = (pdf_path, int(pg), unit_type)
+                    blds |= set(bld_by_page.get(k, set()))
+                except Exception:
+                    pass
+
+            # If we still can't determine building, do NOT create an UNKWN output.
+            # We log and skip instead.
+            if not blds:
+                try:
+                    _log(f"[SKIP_NO_BUILDING] type={unit_type} file={os.path.basename(pdf_path)} page={int(pg)+1}")
+                except Exception:
+                    pass
+                return
+
+            # Add to each building bucket (if multiple, page will be duplicated across outputs)
+            for bld in sorted(blds):
+                building_buckets[bld].append({
+                    "pdf_path": pdf_path,
+                    "page_idx": pg,
+                    "rects": rects or [],
+                    "type": unit_type,
+                    "display": os.path.basename(pdf_path),
+                })
+
 
         for (pdf_path, pg, code_pretty, rects, unit_type) in ordered_kept:
             add_unit_if_ok(pdf_path, pg, rects, code_pretty or "", unit_type or "Drawing")
@@ -857,8 +896,8 @@ class HighlighterApp(tk.Tk):
                 try:
                     final_path = combine_pages_to_new(out_path, chunk,
                                                       use_text_annotations=use_text_annotations)
-                    if final_path:
-                        saved_files.append(final_path)
+                    # pdf_ops.combine_pages_to_new may not return a path; we still saved to out_path.
+                    saved_files.append(final_path or out_path)
                     _log(f"[SAVE_DONE] building={bld} part={part_idx} pages={len(chunk)} path={out_path}")
                 except Exception as e:
                     _log_exception(f"[SAVE_FAIL] building={bld} part={part_idx} path={out_path}", e)
