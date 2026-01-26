@@ -913,30 +913,81 @@ class HighlighterApp(tk.Tk):
             self.lbl_status.config(text="No output files saved.")
 
         # --------- Resumo por código ----------
-        primary_file_pages = defaultdict(lambda: defaultdict(set))
+        # Split summary into Survey vs Drawing
+        # We classify each source file using the processed list and the survey_set.
+        display_is_survey = {}
+        try:
+            for _p in processed:
+                _disp = _p.get("display")
+                _path = _p.get("pdf_path")
+                if _disp and _path:
+                    display_is_survey[_disp] = (_path in survey_set)
+        except Exception:
+            display_is_survey = {}
+
+        # Build primary -> (survey file pages) and (drawing file pages)
+        primary_file_pages_survey = defaultdict(lambda: defaultdict(set))
+        primary_file_pages_drawing = defaultdict(lambda: defaultdict(set))
+
         for cmp_key, file_map in agg_code_file_pages.items():
             primaries = cmp_to_primaries.get(cmp_key, [nosep_to_primary.get(cmp_key, cmp_key)])
             for fn, pages in file_map.items():
+                is_surv = bool(display_is_survey.get(fn, False))
                 for primary in primaries:
-                    primary_file_pages[primary][fn] |= set(pages)
+                    if is_surv:
+                        primary_file_pages_survey[primary][fn] |= set(pages)
+                    else:
+                        primary_file_pages_drawing[primary][fn] |= set(pages)
 
-        rows = []
+        # Prepare CSV rows (new format)
+        csv_rows = []
         found_primary = set()
-        for primary in sorted(primary_file_pages.keys()):
-            total_pages = sum(len(pages) for pages in primary_file_pages[primary].values())
+
+        all_primaries = set(primary_file_pages_survey.keys()) | set(primary_file_pages_drawing.keys())
+        for primary in sorted(all_primaries):
             found_primary.add(primary)
             pretty = original_map.get(primary, primary)
-            breakdown = "; ".join(f"{fn}:{len(sorted(list(pages)))}"
-                                  for fn, pages in sorted(primary_file_pages[primary].items()))
-            rows.append({"code": pretty, "total_pages": total_pages, "breakdown": breakdown})
+
+            surv_total = sum(len(pages) for pages in primary_file_pages_survey[primary].values())
+            draw_total = sum(len(pages) for pages in primary_file_pages_drawing[primary].values())
+
+            surv_breakdown = "; ".join(
+                f"{fn}:{len(sorted(list(pages)))}"
+                for fn, pages in sorted(primary_file_pages_survey[primary].items())
+            )
+            draw_breakdown = "; ".join(
+                f"{fn}:{len(sorted(list(pages)))}"
+                for fn, pages in sorted(primary_file_pages_drawing[primary].items())
+            )
+
+            csv_rows.append({
+                "code": pretty,
+                "total_survey_pages": surv_total,
+                "total_drawing_pages": draw_total,
+                "survey_breakdown": surv_breakdown,
+                "drawing_breakdown": draw_breakdown,
+            })
 
         missing_primary = sorted(list(ecs_primary - found_primary))
-        summary_csv = self._write_summary_csv(out_dir, root_name, week_number, rows)
+
+        # Write enhanced summary CSV
+        summary_csv = self._write_summary_csv(out_dir, root_name, week_number, csv_rows)
+
+        # Keep NotSurveyed CSV as before
         self._write_not_surveyed_csv(out_dir, root_name, week_number,
                                      [original_map.get(p, p) for p in missing_primary])
         # Cover Sheet generation disabled (feature removed)
 
-        SummaryDialog(self, rows, len(missing_primary), summary_csv)
+        # Legacy rows for SummaryDialog (so UI doesn't break)
+        legacy_rows = []
+        for r in csv_rows:
+            legacy_rows.append({
+                "code": r["code"],
+                "total_pages": int(r["total_survey_pages"]) + int(r["total_drawing_pages"]),
+                "breakdown": "; ".join([b for b in [r["survey_breakdown"], r["drawing_breakdown"]] if b]),
+            })
+
+        SummaryDialog(self, legacy_rows, len(missing_primary), summary_csv)
 
         _log("[FINALIZE] _finalize_and_save completed")
 
@@ -946,7 +997,11 @@ class HighlighterApp(tk.Tk):
         csv_path = os.path.join(out_dir, f"{tag}_MatchesSummary_WK{week_number}.csv")
         csv_path = uniquify_path(csv_path)
         try:
-            base_df = pd.DataFrame(rows, columns=["code", "total_pages", "breakdown"])
+            base_df = pd.DataFrame(rows)
+            # Ensure consistent column order when available
+            preferred = ["code", "total_survey_pages", "total_drawing_pages", "survey_breakdown", "drawing_breakdown"]
+            cols = [c for c in preferred if c in base_df.columns] + [c for c in base_df.columns if c not in preferred]
+            base_df = base_df[cols]
             base_df.to_csv(csv_path, index=False)
         except Exception as e:
             messagebox.showwarning("CSV", f"Could not save MatchesSummary CSV:\n{e}")
